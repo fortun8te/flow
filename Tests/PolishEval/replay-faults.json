@@ -1,0 +1,118 @@
+{
+  "fill-01": {
+    "fault": "added-content",
+    "expect": "gap"
+  },
+  "fill-02": {
+    "fault": "dropped-word",
+    "expect": "gap"
+  },
+  "restart-01": {
+    "fault": "restart-not-resolved",
+    "expect": "gap"
+  },
+  "num-02": {
+    "fault": "wrong-number",
+    "expect": "guard"
+  },
+  "name-01": {
+    "fault": "wrong-name",
+    "expect": "guard"
+  },
+  "dash-01": {
+    "fault": "em-dash",
+    "expect": "guard"
+  },
+  "dash-02": {
+    "fault": "en-dash-range",
+    "expect": "guard"
+  },
+  "dash-03": {
+    "fault": "dash-between-names",
+    "expect": "guard"
+  },
+  "dash-04": {
+    "fault": "dash-clauses",
+    "expect": "guard"
+  },
+  "emoji-01": {
+    "fault": "emoji-added",
+    "expect": "guard"
+  },
+  "fact-03": {
+    "fault": "stripped-punctuation",
+    "expect": "gap"
+  },
+  "high-01": {
+    "fault": "preamble",
+    "expect": "guard"
+  },
+  "question-01": {
+    "fault": "wrapping-quotes",
+    "expect": "guard"
+  },
+  "casual-01": {
+    "fault": "think-block",
+    "expect": "guard"
+  },
+  "para-01": {
+    "fault": "chain-of-thought",
+    "expect": "guard"
+  },
+  "fact-04": {
+    "fault": "empty-output",
+    "expect": "guard"
+  },
+  "list-03": {
+    "fault": "cloud-failure",
+    "expect": "guard"
+  },
+  "sel-03": {
+    "fault": "selected-wrong-number",
+    "expect": "guard"
+  },
+  "sel-05": {
+    "fault": "selected-em-dash",
+    "expect": "guard"
+  },
+  "ng-01": {
+    "fault": "negation-dropped",
+    "expect": "guard"
+  },
+  "ng-02": {
+    "fault": "negation-dropped",
+    "expect": "guard"
+  },
+  "cmd-01": {
+    "fault": "unit-symbol",
+    "expect": "guard"
+  },
+  "hedge-01": {
+    "fault": "hedges-dropped",
+    "expect": "guard"
+  },
+  "drop-01": {
+    "fault": "dropped-content",
+    "expect": "guard"
+  },
+  "lit-01": {
+    "fault": "instruction-obeyed",
+    "expect": "guard"
+  },
+  "emph-01": {
+    "fault": "added-exclamation",
+    "expect": "gap"
+  },
+  "mix-04": {
+    "fault": "translated",
+    "expect": "guard"
+  },
+  "mix-05": {
+    "fault": "translated",
+    "expect": "guard"
+  },
+  "short-02": {
+    "fault": "invented-on-tiny-clip",
+    "expect": "guard"
+  }
+}

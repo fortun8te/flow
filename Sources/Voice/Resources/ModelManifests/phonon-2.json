@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "modelId": "phonon-2",
+  "repository": "FluidInference/phonon-2-coreml",
+  "revision": "1702fc22e76f203d5ca464cd5d3ef130a45ce2c0",
+  "cacheRelativePath": "Library/Application Support/VOICE/Models/phonon-2/1702fc22e76f203d5ca464cd5d3ef130a45ce2c0",
+  "files": [
+    {
+      "path": "Decoder.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "3d1a9cd4d7b7956d20c48d9a8041717f9f02c6db72dfeda565080e1cff1db3a3"
+    },
+    {
+      "path": "Decoder.mlmodelc/coremldata.bin",
+      "size": 554,
+      "sha256": "2590e4588972f8d3d1ddb10ce603decffd2e9bb79a88c6096a58c5732f6369fd"
+    },
+    {
+      "path": "Decoder.mlmodelc/model.mil",
+      "size": 13110,
+      "gitBlobSha1": "36dcd5cbb71d13f42a177427ddbab7539e0d167e"
+    },
+    {
+      "path": "Decoder.mlmodelc/weights/weight.bin",
+      "size": 23604992,
+      "sha256": "05181616ed1af70b2aad0463d08d1d73a245af4ccb6159df79994f28c135d9d6"
+    },
+    {
+      "path": "Encoder.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "3d674b78b1a6916586611089d7ac80b4d20d94f691c0497f92b2a58339c5a0e2"
+    },
+    {
+      "path": "Encoder.mlmodelc/coremldata.bin",
+      "size": 500,
+      "sha256": "4b661445d3e93201e3d70d616eaa9f061117a4ee1e4a6191d18a23dc23068b84"
+    },
+    {
+      "path": "Encoder.mlmodelc/model.mil",
+      "size": 2734921,
+      "gitBlobSha1": "d27d6fee28cefe25e09788164d7ff475370883ae"
+    },
+    {
+      "path": "Encoder.mlmodelc/weights/weight.bin",
+      "size": 338391488,
+      "sha256": "d6a51593fc07b3c81989d5f871f687e78c52998aae0b06d000faced47313edb0"
+    },
+    {
+      "path": "JointDecisionv3.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "7b53f663c4400205f8bc00243076de50f95d8a1a64978dee7232eb0ddc7d683c"
+    },
+    {
+      "path": "JointDecisionv3.mlmodelc/coremldata.bin",
+      "size": 586,
+      "sha256": "8d2170f28b28466476f62484a0c8b07c2d31713ac254d1b7cf80eba8070e9554"
+    },
+    {
+      "path": "JointDecisionv3.mlmodelc/model.mil",
+      "size": 11777,
+      "gitBlobSha1": "be552d46f98f9dc9b242b0d1659833db60aa3f83"
+    },
+    {
+      "path": "JointDecisionv3.mlmodelc/weights/weight.bin",
+      "size": 12642764,
+      "sha256": "5f922e335bc57174645fd6ede581395f1ae846f7227898301b5a1a7585f4ab45"
+    },
+    {
+      "path": "LICENSE",
+      "size": 18657,
+      "gitBlobSha1": "da6ab6cc8f333d7e89a99812866df8f24374d47c"
+    },
+    {
+      "path": "NOTICE",
+      "size": 2741,
+      "gitBlobSha1": "971ff3229477c00017b0d76b316fd55e2c49b102"
+    },
+    {
+      "path": "Preprocessor.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "c9beeb989c8d66f8be11df59bc6df277ec76cee404f6865b46243835ef562f6d"
+    },
+    {
+      "path": "Preprocessor.mlmodelc/coremldata.bin",
+      "size": 486,
+      "sha256": "dbde3f2300842c1fd51ef3ff948a0bcffe65ffd2dca10707f2509f32c1d65b1d"
+    },
+    {
+      "path": "Preprocessor.mlmodelc/metadata.json",
+      "size": 2841,
+      "gitBlobSha1": "06162c58cf2f5343a0e60f36f843bcdf3cc58527"
+    },
+    {
+      "path": "Preprocessor.mlmodelc/model.mil",
+      "size": 28181,
+      "gitBlobSha1": "f987e2479228436c49189aa47edb376db74dcff5"
+    },
+    {
+      "path": "Preprocessor.mlmodelc/weights/weight.bin",
+      "size": 491072,
+      "sha256": "129b76e3aeafa8afa3ea76d995b964b145fe83700d579f6ff42c4c38fa0968ea"
+    },
+    {
+      "path": "config.json",
+      "size": 1626,
+      "gitBlobSha1": "fdb0cb18f976b9929d080345a5bbc67dbb027b2c"
+    },
+    {
+      "path": "parakeet_vocab.json",
+      "size": 151122,
+      "gitBlobSha1": "c684822ec3b671ebc449c433a7012398d39b8bb0"
+    }
+  ]
+}

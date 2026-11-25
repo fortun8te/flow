@@ -1,0 +1,59 @@
+# Xcode and SwiftPM
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcodeproj/
+*.xcworkspace/xcuserdata/
+build/
+_backups/
+*.app/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Secrets and local configuration
+.env
+.netrc
+*.keychain
+*secret*.json
+*credentials*.json
+Sources/Voice/Services/CerebrasKey.swift
+harness-results.txt
+
+# Private dictation, run records, traces and training data: never commit
+training/results/
+training/**/*.jsonl
+Tests/fixtures/
+*.jsonl
+*.wispr
+*.wispr.*
+samples/
+out/
+runs/
+scripts/**/data/
+
+# Model weights and large binaries
+*.gguf
+*.safetensors
+*.bin
+*.q8
+*.mlmodelc/
+*.mlpackage/
+*.onnx
+*.pt
+*.npz
+*.parquet
+*.zip
+*.m4a
+*.wav
+*.caf
+
+# Office documents and logs
+*.docx
+*.log
+*.profraw

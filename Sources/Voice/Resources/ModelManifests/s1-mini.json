@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "modelId": "s1-mini",
+  "repository": "mlx-community/S1-mini-MLX-4bit",
+  "revision": "5cbd7aec3401144f88a331d385c40b65fd2548eb",
+  "cacheRelativePath": "Library/Caches/models/mlx-community/S1-mini-MLX-4bit",
+  "files": [
+    {
+      "path": "LICENSE",
+      "size": 11878,
+      "gitBlobSha1": "89dfa7c387ca3dad7e2cdf6b6994c41019dee166"
+    },
+    {
+      "path": "chat_template.jinja",
+      "size": 4168,
+      "gitBlobSha1": "01be9b307daa2d425f7c168c9fb145a286e0afb4"
+    },
+    {
+      "path": "config.json",
+      "size": 1021,
+      "gitBlobSha1": "d84361346025704d61594ace3ed05f52ae7ee5b2"
+    },
+    {
+      "path": "generation_config.json",
+      "size": 181,
+      "gitBlobSha1": "82682d87f3a9bec29c675aa223b0d29efa1483f7"
+    },
+    {
+      "path": "model.safetensors",
+      "size": 335450548,
+      "sha256": "284990f04854426d6164d634d8c472d7eb6e79c68f8fd8b4c8a80a4f234276ba"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "size": 49770,
+      "gitBlobSha1": "f7936fe4ed2fbaff8532304570ad07ce6a6aa4be"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 11422650,
+      "sha256": "be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 729,
+      "gitBlobSha1": "0cf1c38eafcebe924b401509a844cd24f2942efe"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "identity": {
+    "kind": "identity",
+    "label": "Do nothing (returns the input)"
+  },
+  "rules": {
+    "kind": "rules_approx",
+    "label": "Rules only (python approximation, not Flow's Swift rules)"
+  },
+  "s1mini": {
+    "kind": "mlx",
+    "label": "S1-mini MLX 4-bit",
+    "model_dir": "~/Library/Caches/models/mlx-community/S1-mini-MLX-4bit",
+    "python": "~/.venvs/flow-train/bin/python",
+    "system": "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text.",
+    "control_line": "[Styling: semi-formal] [Structure: prose] [Context: general]",
+    "max_tokens_rule": "min(1024, max(64, ceil(1.3 x input tokens) + 32))"
+  },
+  "stock": {
+    "kind": "llama",
+    "label": "WhisperNow stock (category271/whispernow-lfm3-1.7b, Q8_0)",
+    "gguf_glob": "~/.cache/huggingface/hub/models--category271--whispernow-lfm3-1.7b/snapshots/*/model-Q8_0.gguf",
+    "template_glob": "~/.cache/huggingface/hub/models--category271--whispernow-lfm3-1.7b/snapshots/*/chat_template.jinja",
+    "control_line": null,
+    "max_tokens_rule": "max(64, ceil(2.5 x words))"
+  },
+  "dose1": {
+    "kind": "llama",
+    "label": "DOSE1 T1 (Q8_0, the file the app serves)",
+    "gguf_glob": "~/Library/Application Support/VOICE/Models/DOSE1/model-Q8_0.gguf",
+    "template_glob": "~/Library/Application Support/VOICE/Models/DOSE1/chat_template.jinja",
+    "expected_sha256": "bdb029d0990b44e3603d4b01dfec1c8cf206f07fd08df0b586cb3c91338ba605",
+    "control_line": null,
+    "max_tokens_rule": "max(64, ceil(2.5 x words))"
+  }
+}
