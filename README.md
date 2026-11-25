@@ -1,8 +1,10 @@
-# FLOW
+# FLOW for macOS
 
-Flow is a local-first macOS menu bar app for dictation, selected-text polish (Opt+1) and meeting capture. Speech recognition, cleanup and the rule passes run on your Mac by default. Cloud cleanup providers exist, but they are opt-in and need your own API keys.
+FLOW is an open-source, local-first voice app for **push-to-talk dictation, selected-text editing, and meeting transcription**. Hold a hotkey to dictate where you're typing, press **Option-1** to polish a selection, or record and search a meeting transcript with speaker labels.
 
-Cleanup checks protect details such as names, numbers and negations. If a rewrite fails a check, Flow falls back to the earlier text.
+Speech recognition and text cleanup run on your Mac by default. Cleanup checks protect details such as names, numbers, and negations. If a rewrite fails a check, FLOW falls back to the earlier text. Optional cloud cleanup uses your own API key.
+
+[Build from source](#quick-start) · [How it works](#architecture) · [Data and privacy](docs/DATA.md) · [Contributing](CONTRIBUTING.md)
 
 ![FLOW Changes card showing suggested edits to an invented draft](docs/screenshots/changes.png)
 
@@ -11,6 +13,22 @@ Cleanup checks protect details such as names, numbers and negations. If a rewrit
 | ![FLOW pill ready](docs/screenshots/ready.png) | ![FLOW pill listening](docs/screenshots/listening.png) | ![FLOW pill polishing selected text](docs/screenshots/polishing.png) |
 
 Rendered offscreen by FLOW with a sample desktop and generated audio levels.
+
+## Quick start
+
+This is a source release. Use **macOS 26 or later** and Xcode with the **Swift 6.2** toolchain. Apple silicon is recommended for the on-device Core ML and MLX models.
+
+```sh
+git clone https://github.com/fortun8te/t5-t5p.git flow-voice
+cd flow-voice
+swift build
+```
+
+For a menu bar app bundle, install [XcodeGen](https://github.com/yonaskolb/XcodeGen), run `xcodegen generate`, and open the generated project. Select the **Voice** scheme and run it from Xcode. The project uses ad-hoc signing by default. macOS may prompt for permissions again after a rebuild. See [project.yml](project.yml) for signing settings.
+
+Grant **Microphone** for dictation and **Accessibility** for pasting and reading back text. Calendar access is optional and supplies meeting titles. The first use of a speech engine may need an internet connection to download its model. [Model setup](docs/ENGINE.md) covers available engines, optional dependencies, and what falls back if a model is unavailable.
+
+If you are exploring the code, start with the [documentation index](docs/README.md). Run `swift test` for the Swift tests. [Contributing](CONTRIBUTING.md) explains fixture-dependent tests and the privacy rules for examples.
 
 ## Features
 
@@ -49,27 +67,6 @@ flowchart LR
 
 The diagram follows the order in `Sources/Voice/Services/DictationTextPreparation.swift` and `Sources/Voice/Services/RecordingCoordinator.swift`. The full stage list, deadlines and fallbacks are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Requirements
-
-- macOS 26 or later (`Package.swift` sets `.macOS("26.0")`).
-- Apple silicon is recommended: the local models run on Core ML and MLX.
-- Xcode with the Swift 6.2 toolchain (`// swift-tools-version: 6.2`).
-- Microphone and Accessibility permissions. Calendar access is optional, for meeting titles.
-- Optional: `llama-server` from llama.cpp for the GGUF cleanup models (DOSE1 and general models). Flow looks for it in the app bundle, then in `~/homebrew/bin`, `/opt/homebrew/bin` and `/usr/local/bin` (`Sources/Voice/Services/WhisperNowTunedPolisher.swift`).
-- Optional: Python 3 with the MLX packages, for the Granite and Moonshine speech servers (`Sources/Voice/Resources/granite_server.py`, `moonshine_server.py`).
-
-## Quick start
-
-From the repository root, build the Swift package with:
-
-```sh
-swift build
-```
-
-See [ENGINE.md](docs/ENGINE.md) for model setup. The package build produces a command-line executable. For a macOS app bundle, see [build-install.sh](scripts/build-install.sh), which installs into `/Applications`.
-
-`project.yml` is an XcodeGen description of the same targets. Run `xcodegen generate` if you prefer an Xcode project. Set `CODE_SIGN_IDENTITY` in `project.yml` to your own signing identity; the default `-` signs ad hoc, and macOS may ask for the permissions again after each rebuild (see the comment in `project.yml`).
-
 ## Models
 
 Flow downloads most speech models on first use. Locations come from the manifests in `Sources/Voice/Resources/ModelManifests/`.
@@ -88,28 +85,22 @@ Flow downloads most speech models on first use. Locations come from the manifest
 
 Cloud cleanup (Cerebras, Groq, Hyperbolic, NVIDIA) is opt-in. Each needs your own API key, which is stored in the macOS Keychain, and the provider's terms apply.
 
-## What is not included
+## Source release and privacy
 
-This export leaves out, on purpose:
+The source release includes the macOS app, the optional [Google Meet Chrome extension](Extension/), training and evaluation tooling, and invented test fixtures. Model weights, audio, private training data, run records, and evaluation outputs stay outside the repository. Some tests skip when their optional fixtures or model assets are absent. The private DOSE1 weights are unavailable in this release, and the app can fall back to S1-mini.
 
-- model weights and quantised binaries, fonts, sounds and app artwork (their licences need checking before redistribution);
-- the word-frequency list used by the typo repair (`words.txt`), whose licence is not yet confirmed;
-- the companion app. Flow can run alone; the optional integration is in `Sources/Voice/Services/FlowCommandListener.swift`;
-- training data, run records and evaluation outputs, all of which hold private text.
+The export also omits bundled fonts, sounds, app artwork, and the optional word-frequency file. FLOW runs standalone, with an optional companion integration in [FlowCommandListener.swift](Sources/Voice/Services/FlowCommandListener.swift). See [third-party notices](THIRD_PARTY.md) for model and asset terms.
 
-Some tests read fixtures that are absent here. Those tests skip themselves when a fixture is missing.
-
-The bundled typo dictionary contains three invented example pairs.
+Run records are local and can contain transcript text. [Data and privacy](docs/DATA.md) explains which files are written, how to disable run records, and what privacy mode does.
 
 ## Documentation
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the dictation, Opt+1 and meeting pipelines, with fallbacks and deadlines.
-- [docs/ENGINE.md](docs/ENGINE.md): speech and cleanup engines, model selection and the local server processes.
-- [docs/DECISION-MODELS.md](docs/DECISION-MODELS.md): every guard, referee and decision model, with its thresholds and why it exists.
-- [docs/DATA.md](docs/DATA.md): what Flow writes to disk, and how to turn it off.
-- [docs/TRAINING.md](docs/TRAINING.md): the training and dataset scripts.
-- [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and contribute without leaking private text.
-- [THIRD_PARTY.md](THIRD_PARTY.md): dependencies, models and their licences.
+- [Architecture](docs/ARCHITECTURE.md) covers the dictation, selected-text polish, and meeting pipelines.
+- [Engines and model setup](docs/ENGINE.md) covers speech and cleanup engines, optional dependencies, and fallback behavior.
+- [Decision models](docs/DECISION-MODELS.md) covers the guards, decisions, and thresholds.
+- [Data and privacy](docs/DATA.md) covers local storage, settings, and what leaves the Mac with optional cloud cleanup.
+- [Training and evaluation](docs/TRAINING.md) covers the benchmark and dataset scripts.
+- [Contributing](CONTRIBUTING.md) covers builds, tests, and the use of invented fixtures.
 
 ## Licence
 

@@ -1,0 +1,13 @@
+# FLOW documentation
+
+FLOW is the local-first macOS voice app in this repository. Start with the [project README](../README.md#quick-start) to build it.
+
+| If you want to understand… | Read |
+| --- | --- |
+| What happens between recording speech and pasting text | [Architecture](ARCHITECTURE.md) |
+| Which speech and cleanup models run, and what happens when a model is missing | [Engines and model setup](ENGINE.md) |
+| How FLOW checks a rewrite before applying it | [Decision models](DECISION-MODELS.md) |
+| What FLOW stores locally and how to control it | [Data and privacy](DATA.md) |
+| How to run the evaluation tools with invented data | [Training and evaluation](TRAINING.md) |
+
+For changes to the project, see [Contributing](../CONTRIBUTING.md). For dependency and model terms, see the [third-party notices](../THIRD_PARTY.md).
