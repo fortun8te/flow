@@ -26,6 +26,8 @@ swift build
 
 For a menu bar app bundle, install [XcodeGen](https://github.com/yonaskolb/XcodeGen), run `xcodegen generate`, and open the generated project. Select the **Voice** scheme and run it from Xcode. The project uses ad-hoc signing by default. macOS may prompt for permissions again after a rebuild. See [project.yml](project.yml) for signing settings.
 
+The helper `scripts/build-install.sh` also builds the app bundle. Add `--install` to install it in `~/Applications` and keep a backup of the previous bundle.
+
 Grant **Microphone** for dictation and **Accessibility** for pasting and reading back text. Calendar access is optional and supplies meeting titles. The first use of a speech engine may need an internet connection to download its model. [Model setup](docs/ENGINE.md) covers available engines, optional dependencies, and what falls back if a model is unavailable.
 
 If you are exploring the code, start with the [documentation index](docs/README.md). Run `swift test` for the Swift tests. [Contributing](CONTRIBUTING.md) explains fixture-dependent tests and the privacy rules for examples.

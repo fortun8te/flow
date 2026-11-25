@@ -100,15 +100,3 @@ targets:
         com.apple.security.device.audio-input: true
         com.apple.security.network.server: true
         com.apple.security.network.client: true
-    info:
-      path: Info.plist
-      properties:
-        LSUIElement: true
-        LSMinimumSystemVersion: "26.0"
-        CFBundleDisplayName: "VOICE"
-        CFBundleName: "VOICE"
-        NSCalendarsFullAccessUsageDescription: "VOICE reads upcoming meetings only when you connect your calendar."
-        NSMicrophoneUsageDescription: "VOICE transcribes your speech to text on-device."
-        NSAppleEventsUsageDescription: "VOICE pastes transcripts at your cursor."
-        NSAccessibilityUsageDescription: "VOICE pastes transcripts at your cursor using accessibility services."
-        NSSpeechRecognitionUsageDescription: "VOICE listens for the wake phrase to start dictation hands-free. Recognition runs on-device."
