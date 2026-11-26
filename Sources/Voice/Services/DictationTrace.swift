@@ -48,7 +48,11 @@ enum DictationTraceLog {
     static var fileURL: URL { directory.appendingPathComponent("dictations.jsonl") }
 
     /// Appends one event. Best effort: a failed write never blocks the paste.
+    private static let writeLock = NSLock()
+
     static func append(_ trace: DictationTrace) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
@@ -114,25 +118,29 @@ enum DictationDeadline {
     /// Unlike a task group, this returns on time even when `work` ignores cancellation.
     /// A late value is dropped.
     static func run<T: Sendable>(seconds: Double, _ work: @escaping @Sendable () async -> T) async -> T? {
-        guard seconds.isFinite, seconds > 0 else { return nil }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
-            let gate = OneShotGate()
-            let operation = Task { await work() }
-            let timer = Task {
-                do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
-                if gate.claim() {
-                    operation.cancel()
-                    continuation.resume(returning: nil)
-                }
-            }
-            Task {
-                let value = await operation.value
-                if gate.claim() {
-                    timer.cancel()
-                    continuation.resume(returning: value)
-                }
-            }
+        guard seconds.isFinite, seconds > 0, !Task.isCancelled else { return nil }
+        // AsyncStream.next() wakes on parent cancellation as well as timeout.
+        // A child that ignores cancellation cannot keep the caller suspended.
+        let (stream, continuation) = AsyncStream<T>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let operation = Task {
+            guard !Task.isCancelled else { return }
+            let result = await work()
+            guard !Task.isCancelled else { return }
+            continuation.yield(result)
+            continuation.finish()
         }
+        let timer = Task {
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            continuation.finish()
+        }
+        defer {
+            operation.cancel()
+            timer.cancel()
+            continuation.finish()
+        }
+        var iterator = stream.makeAsyncIterator()
+        let value = await iterator.next()
+        return Task.isCancelled ? nil : value
     }
 }
 
@@ -213,7 +221,12 @@ enum DictationTrainingLog {
 
     /// Best effort and off the main thread: a failed write never blocks the paste.
     static func append(_ record: DictationTrainingRecord, synchronously: Bool = false) {
+        guard UserDefaults.standard.object(forKey: "flow.saveRunRecords") as? Bool ?? true,
+              !BackgroundActivityGate.privacyMode else { return }
         let work = {
+            // Recheck on the writer queue: a pending write must respect a later opt-out.
+            guard UserDefaults.standard.object(forKey: "flow.saveRunRecords") as? Bool ?? true,
+                  !BackgroundActivityGate.privacyMode else { return }
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                         attributes: [.posixPermissions: 0o700])

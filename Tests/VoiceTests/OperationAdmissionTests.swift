@@ -72,3 +72,38 @@ struct OperationGateTests {
         #expect(gate.current == nil)
     }
 }
+
+/// Exercise the same token retained by the delayed delivery closure.
+@Suite("Overlapping dictation cancellation")
+struct DictationWorkRegistryTests {
+    @MainActor @Test func cancelledTokenDoesNotReviveWhenAnotherRecordingStarts() {
+        let registry = DictationWorkRegistry()
+        let first = registry.begin(UUID())
+        let second = registry.begin(UUID())
+        #expect(registry.activeCount == 2)
+        #expect(registry.cancelLatest(preferred: first.session) === first)
+        let third = registry.begin(UUID())
+        #expect(!first.mayDeliver)
+        #expect(second.mayDeliver && third.mayDeliver)
+        #expect(registry.activeCount == 2)
+        registry.finish(first)
+        registry.finish(first)
+        #expect(registry.activeCount == 2)
+        #expect(!first.mayDeliver)
+    }
+
+    @MainActor @Test func cancellationFallsBackToNewestOutstandingAndExpiryIsLocal() {
+        let registry = DictationWorkRegistry()
+        let first = registry.begin(UUID())
+        let second = registry.begin(UUID())
+        #expect(registry.cancelLatest(preferred: UUID()) === second)
+        #expect(first.mayDeliver && !second.mayDeliver)
+        first.expireDelivery()
+        #expect(!first.mayDeliver)
+        let next = registry.begin(UUID())
+        #expect(next.mayDeliver)
+        registry.cancelAll()
+        #expect(registry.activeCount == 0)
+        #expect(!next.mayDeliver)
+    }
+}

@@ -18,7 +18,7 @@ Apple's paths are case-insensitive, so `VOICE` and `Voice` refer to the same fol
 
 ## Master switch: privacy mode
 
-`voice.privacyMode` is an emergency "all off" switch. `Sources/Voice/App/VoiceApp.swift` describes it as the master kill switch: when it is on, every helper that checks it returns early. Run records are not written, the draft meaning check is off, and recording of meetings does not start. Turn it on from the app's settings.
+`voice.privacyMode` is an emergency "all off" switch. `Sources/Voice/App/VoiceApp.swift` describes it as the master kill switch: when it is on, every helper that checks it returns early. Run records (including the legacy `VOICE/training/dictations.jsonl` training log) are not written, the draft meaning check is off, and recording of meetings does not start. Turn it on from the app's settings.
 
 ## Run records
 
@@ -39,7 +39,7 @@ Later lines link back by `id` for Undo, the "Original" toggle, and edits made st
   ```sh
   defaults write <your bundle identifier> flow.saveRunRecords -bool NO
   ```
-- Privacy mode also stops run records.
+- Privacy mode also stops run records. Both this switch and `flow.saveRunRecords` apply to the legacy training log as well, including queued writes.
 - Secure text fields are recorded without their text (`FlowRunLog.withoutText`).
 - The folder is created with mode 0700 and the file with 0600.
 - The folder is excluded from iCloud and Time Machine backups.

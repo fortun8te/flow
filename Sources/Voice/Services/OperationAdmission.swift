@@ -67,3 +67,54 @@ struct OperationGate: Equatable {
     /// Stops whatever is current (used by Escape).
     mutating func cancel() { current = nil }
 }
+
+/// One immutable session identity, shared by its cleanup and delayed paste callbacks.
+/// Cancellation never resets when another recording begins.
+@MainActor
+final class DictationWorkToken {
+    let session: UUID
+    private(set) var isCancelled = false
+    private(set) var deliveryExpired = false
+    var task: Task<Void, Never>?
+
+    init(session: UUID) { self.session = session }
+
+    var mayDeliver: Bool { !isCancelled && !deliveryExpired }
+
+    func cancel() {
+        isCancelled = true
+        task?.cancel()
+    }
+
+    func expireDelivery() { deliveryExpired = true }
+}
+
+/// Outstanding work in release order. Only finishing this specific token
+/// removes its slot; late completion cannot decrement another session's count.
+@MainActor
+final class DictationWorkRegistry {
+    private var outstanding: [DictationWorkToken] = []
+
+    var activeCount: Int { outstanding.filter { !$0.isCancelled }.count }
+
+    func begin(_ session: UUID) -> DictationWorkToken {
+        let token = DictationWorkToken(session: session)
+        outstanding.append(token)
+        return token
+    }
+
+    @discardableResult
+    func cancelLatest(preferred: UUID) -> DictationWorkToken? {
+        let target = outstanding.last(where: { $0.session == preferred && !$0.isCancelled })
+            ?? outstanding.last(where: { !$0.isCancelled })
+        target?.cancel()
+        return target
+    }
+
+    func cancelAll() { outstanding.forEach { $0.cancel() } }
+
+    func finish(_ token: DictationWorkToken) {
+        outstanding.removeAll { $0 === token }
+        token.task = nil
+    }
+}

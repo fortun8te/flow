@@ -1336,7 +1336,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // dictation must reach the cursor even if they re-pressed the hotkey
     // before the prior pipeline finished pasting. The only legitimate cancel
     // path is app shutdown (and we just let those drop on the floor).
-    private var pendingFinishTask: Task<Void, Never>?
+    private let dictationWork = DictationWorkRegistry()
     // Serializes paste tail-segments so back-to-back completed transcripts
     // land at the cursor in chronological arrival order without trampling
     // each other's clipboard / synthesized-keystroke state. Each finish task
@@ -1527,8 +1527,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.coordinator.audioCapture.stopWritingToFile()
                 FlowOwnership.shared.retainRecoveryReference(capture.audioURL)
             }
-            self.pendingFinishTask?.cancel()
-            self.pasteChain?.cancel()
+            self.dictationWork.cancelAll()
+            self.recordingState.transcribingCount = self.dictationWork.activeCount
             self.coordinator.restoreOutputAudio()
             if self.recordingState.isCapturingMeeting || self.meetingStartTask != nil {
                 if self.recordingState.isCapturingMeeting { self.checkpointMeetingDraft() }
@@ -2247,8 +2247,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cancelDismissTask?.cancel(); cancelDismissTask = nil
         errorDismissTask?.cancel(); errorDismissTask = nil
         undoPasteDismissTask?.cancel(); undoPasteDismissTask = nil
-        pendingFinishTask?.cancel(); pendingFinishTask = nil
-        pasteChain?.cancel(); pasteChain = nil
+        dictationWork.cancelAll()
+        recordingState.transcribingCount = dictationWork.activeCount
+        pasteChain = nil
         if let observer = errorObserver {
             NotificationCenter.default.removeObserver(observer)
             errorObserver = nil
@@ -5624,6 +5625,7 @@ extension AppDelegate: NSWindowDelegate {
         // more CPU burned transcribing — and (b) capture the on-disk audio URL.
         // Unlike before, we do NOT delete this file; it's the user's retained
         // recording.
+        let cancelledSession = recordingState.recordingSessionID
         let claimedForCancel = recordingState.isRecording ? coordinator.claimRecordingSync() : nil
         let retainedAudioURL = claimedForCancel?.audioURL
         // Snapshot the partial transcript we already have RIGHT NOW (sync, on the
@@ -5653,7 +5655,14 @@ extension AppDelegate: NSWindowDelegate {
             // ASR tail AND (crucially) leaves the audio file on disk when there's
             // real speech — RecordingCoordinator only deletes sub-300ms clips.
             // We deliberately do NOT delete the file afterwards.
-            let drained = await self.coordinator.stopRecording(claiming: claimedForCancel)
+            // A cancelled pending start has no claim. Never stop whichever
+            // recording happens to be active when this asynchronous task runs.
+            let drained: [TranscriptSegment]
+            if let claimedForCancel {
+                drained = await self.coordinator.stopRecording(claiming: claimedForCancel)
+            } else {
+                drained = []
+            }
             let drainedText = drained
                 .map { $0.text }
                 .joined(separator: " ")
@@ -5703,6 +5712,8 @@ extension AppDelegate: NSWindowDelegate {
                 print("[VOICE-CANCEL] nothing to retain (no audio file, no partial transcript) — skipping History save")
             }
 
+            // Keep the history row, but do not clear the next recording's preview.
+            guard self.recordingState.recordingSessionID == cancelledSession else { return }
             self.showCancelledToast()
             // After the toast, so its bookkeeping cannot wipe what Undo needs.
             self.recordingState.cancelledText = bestTranscript
@@ -5753,10 +5764,11 @@ extension AppDelegate: NSWindowDelegate {
         // 1. Signal "cancelled" to every guard inside the finish Task. Each
         //    `guard !recordingState.sessionCancelled else { return }` checkpoint
         //    along the polish → paste path will now bail.
-        recordingState.sessionCancelled = true
-        // Scope the cancel to the CURRENT session so an in-flight background
-        // finish task (an older, legitimately-running session) isn't dropped.
-        recordingState.cancelledSessionID = recordingState.recordingSessionID
+        let cancelledWork = dictationWork.cancelLatest(preferred: recordingState.recordingSessionID)
+        if let cancelledWork, cancelledWork.session == recordingState.recordingSessionID {
+            recordingState.sessionCancelled = true
+            recordingState.cancelledSessionID = cancelledWork.session
+        }
 
         // 2. Salvage whatever partial transcript exists RIGHT NOW (before we
         //    cancel the Task, which may still be appending). Mirrors the
@@ -5772,21 +5784,10 @@ extension AppDelegate: NSWindowDelegate {
         let capturedTargetForCancel = targetAppBundleID
         let startedAtForCancel = recordingStartedAt
 
-        // 3. Cancel the streaming Task chain. The Task<Void, Never> doesn't
-        //    propagate `throw`, but `Task.isCancelled` flips true and the
-        //    inline `guard !Task.isCancelled` checks in finishRecording's body
-        //    will short-circuit. Cancelling the paste chain prevents any
-        //    queued post-polish paste from landing.
-        pendingFinishTask?.cancel()
-        pasteChain?.cancel()
-
-        // 4. Tear down live UI state. The defer in finishRecording's Task
-        //    will run on its way out, but for the worst case (the Task is
-        //    blocked on a long Ollama round-trip and won't return for a
-        //    while) we want the pill back to idle immediately. Setting
-        //    transcribingCount = 0 is safe even if the defer also tries to
-        //    decrement it — `max(0, count - 1)` floors it.
-        recordingState.transcribingCount = 0
+        // 3. The target's token cancels its actual task and delayed callbacks.
+        // Never cancel the FIFO barrier: it still owns the preceding paste order.
+        // 4. Other in-flight dictations keep their own count.
+        recordingState.transcribingCount = dictationWork.activeCount
         recordingState.isPolishingSelection = false
         // Kill the in-flight Opt+1 polish-selection task so it can't paste over
         // the user's selection after they pressed ESC.
@@ -5801,7 +5802,7 @@ extension AppDelegate: NSWindowDelegate {
         //    intentionally do NOT include an audioFilePath here — the audio
         //    was already finalized/disposed by the upstream stopRecording
         //    drain (the cancellation point is past the audio-claim stage).
-        if !bestTranscript.isEmpty {
+        if cancelledWork?.session == recordingState.recordingSessionID, !bestTranscript.isEmpty {
             let duration = startedAtForCancel.map { Int(Date().timeIntervalSince($0)) }
             RecentDictations.add(
                 raw: nil,
@@ -5887,7 +5888,6 @@ extension AppDelegate: NSWindowDelegate {
         recordingState.pendingRecordingStart = false
         if wasRecording {
             recordingState.lastRecordingSeconds = started.map { Date().timeIntervalSince($0) } ?? 0
-            recordingState.transcribingCount += 1
             SoundEffects.playStop()
         }
 
@@ -5905,8 +5905,9 @@ extension AppDelegate: NSWindowDelegate {
             print("[VOICE] Too short (\(duration)s) → silent discard")
             // Pass the claim through so stopRecording() still does its drain+cleanup,
             // but the result is discarded since duration is too short.
-            Task { @MainActor in _ = await coordinator.stopRecording(claiming: claimed) }
-            recordingState.transcribingCount = max(0, recordingState.transcribingCount - 1)
+            if let claimed {
+                Task { @MainActor in _ = await coordinator.stopRecording(claiming: claimed) }
+            }
             recordingState.currentTranscript = []
             return
         }
@@ -5915,6 +5916,8 @@ extension AppDelegate: NSWindowDelegate {
         // main actor) so a later Path 2 re-press that calls captureTargetApp()
         // can't repoint this task's paste at the wrong field. Each finish task
         // owns its own copy of where its transcript belongs.
+        let work = dictationWork.begin(mySession)
+        recordingState.transcribingCount = dictationWork.activeCount
         let recoveryID = beginPasteRecoveryWindow()
         let capturedTargetForTask = targetAppBundleID
         // He may have typed in the same field while dictating. Re-read the context
@@ -5946,12 +5949,14 @@ extension AppDelegate: NSWindowDelegate {
         let deliverySlot = DeliverySlot(after: priorDelivery)
         pasteChain = deliverySlot.task
 
-        pendingFinishTask = Task { @MainActor in
-            // GUARANTEED CLEAR: no matter how the task ends — empty
-            // transcript, error, cancellation, hung Ollama — isTranscribing
-            // resets to false. The pill never gets stuck on the loading state.
+        work.task = Task { @MainActor in
+            var deliveryStarted = false
+            // The token remains active until paste/readback finishes, not just cleanup.
             defer {
-                self.recordingState.transcribingCount = max(0, self.recordingState.transcribingCount - 1)
+                if !deliveryStarted {
+                    self.dictationWork.finish(work)
+                    self.recordingState.transcribingCount = self.dictationWork.activeCount
+                }
                 // Ensure live partials are always cleaned up regardless of
                 // which code path triggered finishRecording (silence timeout,
                 // hotkey, or confirm button — all paths end here).
@@ -5969,7 +5974,6 @@ extension AppDelegate: NSWindowDelegate {
                 self.refreshMenuBarIcon()
             }
 
-            var deliveryStarted = false
             defer { if !deliveryStarted { deliverySlot.finish() } }
             // One local training record for this dictation (FlowRunLog): input, every stage, decisions, timings.
             let run = FlowRunCollector(kind: "dictation", id: claimed?.sessionId.uuidString ?? mySession.uuidString,
@@ -6185,7 +6189,7 @@ extension AppDelegate: NSWindowDelegate {
             // the formatter ran, bail before we sink time into Ollama polish.
             // The `defer` above still runs (transcribingCount decrement, live
             // partial cleanup) so the pill flips back to idle cleanly.
-            if Task.isCancelled || recordingState.isCancelled(for: mySession) {
+            if Task.isCancelled || work.isCancelled {
                 run.update { $0.outcome = "cancelled" }
                 print("[VOICE-CANCEL-INFLIGHT] post-formatter cancellation detected — bailing before polish")
                 return
@@ -6330,7 +6334,7 @@ extension AppDelegate: NSWindowDelegate {
                 let optimisticPolishOwnedFormatting = false  // pre-polish — paster runs its rule-based adjuster
                 let optimisticTask: Task<Void, Never> = Task { @MainActor in
                     _ = await priorChain.value
-                    guard !self.recordingState.isCancelled(for: mySession) else { return }
+                    guard !work.isCancelled else { return }
                     var didReactivate = false
                     if let id = snapshotTarget,
                        let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
@@ -6445,7 +6449,7 @@ extension AppDelegate: NSWindowDelegate {
                     }
                 }
             } else {
-                guard !recordingState.isCancelled(for: mySession) else { return }
+                guard !work.isCancelled else { return }
                 let polishDraft: @Sendable (String, Bool) async -> String = { [polishContext, suspectWords, userVocab,
                     capturedFieldContextForTask, capturedRichAppContextForTask, capturedTargetForTask, cleanupForTask, personalityForTask]
                     text, isSection in
@@ -6538,7 +6542,7 @@ extension AppDelegate: NSWindowDelegate {
             // Check the proposed cleanup only within the existing key-up budget.
             // A cold or busy reviewer leaves the ordinary cleanup result in place.
             if (traceModelWillRun || cleanupRoute == "remote-pc"), !editedBySection,
-               !recordingState.isCancelled(for: mySession) {
+               !work.isCancelled {
                 let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
                                                                    words: draftWords)
                 if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText,
@@ -6605,7 +6609,7 @@ extension AppDelegate: NSWindowDelegate {
                 finalText = await DictationReferee.background {
                     DictationReferee.dictationPass(input, isCode: isCode)
                 }
-                guard !Task.isCancelled, !recordingState.isCancelled(for: mySession) else { return }
+                guard !Task.isCancelled, !work.isCancelled else { return }
                 run.stage("tinyfix", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000))
             }
             // tinynext recheck of Parakeet's low-confidence words: a word changes only when a near word reads
@@ -6616,7 +6620,7 @@ extension AppDelegate: NSWindowDelegate {
                 let recheck = await DictationReferee.background {
                     LowConfidenceRecheck.recheck(input, suspects: suspectWords, protectedTerms: userVocab)
                 }
-                guard !Task.isCancelled, !recordingState.isCancelled(for: mySession) else { return }
+                guard !Task.isCancelled, !work.isCancelled else { return }
                 finalText = recheck.text
                 for change in recheck.changes {
                     run.decision("tinynext", "\(change.original) -> \(change.replacement)",
@@ -6640,7 +6644,7 @@ extension AppDelegate: NSWindowDelegate {
             // during the polish round-trip, don't enqueue the paste step.
             // The cancelled-dictation History row was already written by
             // cancelInFlightProcessing(), so we just exit cleanly here.
-            if Task.isCancelled || recordingState.isCancelled(for: mySession) {
+            if Task.isCancelled || work.isCancelled {
                 run.update { $0.outcome = "cancelled" }
                 print("[VOICE-CANCEL-INFLIGHT] post-polish cancellation detected — skipping paste enqueue")
                 return
@@ -6744,13 +6748,22 @@ extension AppDelegate: NSWindowDelegate {
                 $0.settings["autoPaste"] = "\(autoPaste)"
             }
             deliveryStarted = true
-            Task { @MainActor in
-                defer { deliverySlot.finish() }
+            work.task = Task { @MainActor in
+                defer {
+                    deliverySlot.finish()
+                    self.dictationWork.finish(work)
+                    self.recordingState.transcribingCount = self.dictationWork.activeCount
+                    self.scheduleMenuBarIconTimer()
+                    self.refreshMenuBarIcon()
+                }
                 _ = await prior?.value
                 // ESC-cancel checkpoint: unlike the optimistic first paste, the
                 // swap (Cmd+Z undo + repaste) had no early guard — so an ESC
                 // could still trigger an undo/repaste after cancellation. Bail.
-                guard !Task.isCancelled, !self.recordingState.isCancelled(for: mySession) else { return }
+                guard !Task.isCancelled, work.mayDeliver else {
+                    run.finish(outcome: "cancelled", output: nil)
+                    return
+                }
                 let tPasteStart = CFAbsoluteTimeGetCurrent()
                 if optimisticSwapNeeded, let sig = optimisticSig {
                     // SWAP PATH — optimistic paste already ran, try to replace.
@@ -6848,7 +6861,7 @@ extension AppDelegate: NSWindowDelegate {
                 if traceModelWillRun { traceStages["modelMs"] = polishMs }
                 var trace = DictationTrace(
                     engine: traceEngine, engineReady: traceEngineReady, fallbackReason: traceFallback,
-                    level: CleanupLevel.current.rawValue, style: personalityForTask,
+                    level: cleanupForTask, style: personalityForTask,
                     stagesMs: traceStages, pasteVerdict: nil, recordedAt: Date())
                 let traceGate = OneShotGate()
                 // Set when the paste was refused for a secure (password) field. Text from such a dictation is never logged.
@@ -6882,7 +6895,7 @@ extension AppDelegate: NSWindowDelegate {
                     // the audio claim and now (race between finishRecording's async
                     // task and cancelRecording), skip the paste entirely. Audio drain
                     // and cleanup above already ran — only the cursor write is skipped.
-                    guard !self.recordingState.isCancelled(for: mySession) else {
+                    guard !work.isCancelled else {
                         print("[VOICE-HK] finishRecording: session was cancelled — skipping paste")
                         Telemetry.signal("paste.skipped", "cancelled", ["session": mySession])
                         recordPaste("cancelled")
@@ -6905,23 +6918,28 @@ extension AppDelegate: NSWindowDelegate {
                         maySubmit: { [weak self] in
                             guard let self else { return false }
                             return self.recordingState.recordingSessionID == mySession &&
-                                !self.recordingState.isCancelled(for: mySession) &&
+                                work.mayDeliver &&
                                 UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled")
                         },
                         mayDeliver: { [weak self] in
-                            guard let self else { return false }
-                            return !self.recordingState.isCancelled(for: mySession)
+                            guard self != nil else { return false }
+                            return work.mayDeliver
                         },
                         completion: { [weak self] result in
-                            defer { if landedGate.claim() { landed.resume() } }
+                            // A sent event is not a completed delivery: keep the FIFO
+                            // slot until readback has either verified or attempted fallback.
+                            defer {
+                                if result != .eventSent, landedGate.claim() { landed.resume() }
+                            }
                             switch result {
                             case .eventSent:
                                 trace.stagesMs["pasteSentAtMs"] = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
                                 // Wispr plays its paste cue once a dictation is pasted.
                                 SoundEffects.playDone()
                                 // Wispr's auto-cleanup nudge: "Cleaned up! See what's changed".
-                                if let self, let diff = PolishDiff.autoCleanupNudge(raw: rawText, final: finalText,
-                                                                                     level: CleanupLevel.current.rawValue) {
+                                if let self, self.recordingState.recordingSessionID == mySession,
+                                   !work.isCancelled, let diff = PolishDiff.autoCleanupNudge(raw: rawText, final: finalText,
+                                                                                     level: cleanupForTask) {
                                     self.recordingState.polishDiff = diff
                                 }
                             case .skipped:
@@ -6934,6 +6952,7 @@ extension AppDelegate: NSWindowDelegate {
                             // A failed dispatch may report unknown synchronously before
                             // completion. Let the completion record the actual failure.
                             if trace.stagesMs["pasteSentAtMs"] != nil {
+                                defer { if landedGate.claim() { landed.resume() } }
                                 switch verdict {
                                 case .verified: recordPaste("landed"); PillHaptics.pasteConfirmed()
                                 case .notLanded: recordPaste("not-landed")
@@ -6942,7 +6961,7 @@ extension AppDelegate: NSWindowDelegate {
                             }
                             // Learning starts only after the paste is verified in the field.
                             // A sent event is not enough, and unknown or not-landed starts nothing.
-                            guard verdict == .verified, let target = claimed?.pasteTarget else { return }
+                            guard work.mayDeliver, verdict == .verified, let target = claimed?.pasteTarget else { return }
                             CorrectionLearner.shared.track(pastedText: finalText, snapshot: target,
                                                            dictationID: claimed?.sessionId.uuidString)
                         },
@@ -6951,7 +6970,7 @@ extension AppDelegate: NSWindowDelegate {
                             if reason == .secureField { pasteTargetSecure = true }
                             guard let self,
                                   self.recordingState.recordingSessionID == mySession,
-                                  !self.recordingState.isCancelled(for: mySession) else { return }
+                                  !work.isCancelled else { return }
                             if reason == .notConfirmed {
                                 self.showCopiedNotice()
                                 return
@@ -6961,9 +6980,12 @@ extension AppDelegate: NSWindowDelegate {
                     )
                     // Backstop: a paste that never reports back must not hold up the next dictation.
                     Task {
-                        try? await Task.sleep(for: .seconds(3))
+                        do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                        // If readback already ended, this timer must not mutate its token.
+                        guard landedGate.claim() else { return }
+                        work.expireDelivery()
                         recordPaste(trace.stagesMs["pasteSentAtMs"] == nil ? "no-dispatch-result" : "unverified")
-                        if landedGate.claim() { landed.resume() }
+                        landed.resume()
                     }
                     }
                     // Reduced settle — Wispr Flow ships Cmd-V without these.

@@ -355,6 +355,8 @@ class CursorPaster {
                         self?.submissionGeneration == submissionID && mayDeliver?() != false
                             && targetAppStillActive(preparedFor: liveTarget.bundleId)
                     }, onVerdict: { onReadback?(originalFieldMatches ? $0 : .unknown) }, onFailure: { [weak self] in
+                        // Cancelled or expired deliveries must not overwrite a newer clipboard.
+                        guard mayDeliver?() != false else { return }
                         // The restore may already have put the old clipboard back: copy the text again.
                         self?.pendingClipboardRestore = nil
                         Self.keepForManualPaste(text, pasteboard: pasteboard)

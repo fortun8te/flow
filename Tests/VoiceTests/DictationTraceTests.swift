@@ -44,6 +44,38 @@ struct DictationTraceTests {
         #expect(await next.next() == true)
     }
 
+    @Test("Cancelling the caller immediately stops waiting and cancels the model request")
+    func parentCancellationStopsWork() async {
+        let (started, signalStarted) = AsyncStream<Void>.makeStream()
+        let (events, reporter) = AsyncStream<Bool>.makeStream()
+        let task = Task {
+            await DictationDeadline.run(seconds: 10) {
+                signalStarted.yield(())
+                signalStarted.finish()
+                try? await Task.sleep(for: .seconds(5))
+                reporter.yield(Task.isCancelled)
+                reporter.finish()
+                return "late"
+            }
+        }
+        var start = started.makeAsyncIterator()
+        _ = await start.next()
+        let now = ContinuousClock.now
+        task.cancel()
+        let result = await task.value
+        var next = events.makeAsyncIterator()
+        #expect(result == nil)
+        #expect(await next.next() == true)
+        #expect(now.duration(to: .now) < .seconds(1))
+    }
+
+    @Test("A successful optional nil is not a timeout")
+    func optionalNilIsAResult() async {
+        let result: String?? = await DictationDeadline.run(seconds: 1) { Optional<String>.none }
+        #expect(result != nil)
+        #expect(result! == nil)
+    }
+
     @Test("Each trace event is one JSON line with stage times and no text")
     func traceRoundTrip() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
