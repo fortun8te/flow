@@ -6476,10 +6476,11 @@ extension AppDelegate: NSWindowDelegate {
                 // Long dictations try the PC first (RemoteCleanup); its time counts inside the same budgets below.
                 let remoteStarted = ContinuousClock.now
                 if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
+                   longProse || shortBudget >= 0.15,
                    let pcText = await RemoteCleanup.cleanedText(formatted, cleanupLevel: cleanupForTask,
                         userVocabulary: userVocab.isEmpty ? nil : userVocab, personalityStyle: personalityForTask,
                         appContextLabel: capturedRichAppContextForTask ?? Qwen3Polisher.appContextLabel(forBundleID: capturedTargetForTask),
-                        longProse: longProse, timeout: longProse ? 2.4 : max(0.3, shortBudget * 0.6)) {
+                        longProse: longProse, timeout: longProse ? 2.4 : shortBudget * 0.6) {
                     cleanupRoute = "remote-pc"
                     finalText = pcText
                 } else if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
@@ -6618,7 +6619,7 @@ extension AppDelegate: NSWindowDelegate {
                 let started = CFAbsoluteTimeGetCurrent()
                 let input = finalText
                 let recheck = await DictationReferee.background {
-                    LowConfidenceRecheck.recheck(input, suspects: suspectWords, protectedTerms: userVocab)
+                    LowConfidenceRecheck.recheck(input, suspects: parakeetSuspectsAgg, protectedTerms: userVocab)
                 }
                 guard !Task.isCancelled, !work.isCancelled else { return }
                 finalText = recheck.text
@@ -6627,7 +6628,7 @@ extension AppDelegate: NSWindowDelegate {
                                  reason: String(format: "score margin %.3f", change.delta))
                 }
                 run.stage("tinynext", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000),
-                          detail: ["suspects": "\(suspectWords.count)", "changed": "\(recheck.changes.count)"])
+                          detail: ["suspects": "\(Set(parakeetSuspectsAgg).count)", "changed": "\(recheck.changes.count)"])
             }
             if polishContext != .code {
                 finalText = ProperNounVocabulary.applyPreferredSpelling(finalText, terms: preferredWords)

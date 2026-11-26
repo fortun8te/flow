@@ -54,7 +54,8 @@ enum RemoteCleanup {
     @MainActor static func cleanedText(_ text: String, cleanupLevel: String, userVocabulary: [String]?, personalityStyle: String,
                             appContextLabel: String?, longProse: Bool, timeout: TimeInterval,
                             client: Client = sharedClient) async -> String? {
-        guard isEnabled, cleanupLevel != "none", Qwen3Polisher.isEnabled,
+        guard isEnabled, !BackgroundActivityGate.privacyMode, !Task.isCancelled,
+              cleanupLevel != "none", Qwen3Polisher.isEnabled,
               Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue,
               WhisperNowTunedPolisher.usesT4, !WhisperNowTunedPolisher.usesT2Contracts,
               // A general model picked in Companion (24 Nov 2026) is tried locally first; the PC would bypass it.
@@ -63,7 +64,8 @@ enum RemoteCleanup {
         let words = input.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).count
         // Short dictations stay local while the local server is warm: it answers in well under the deadline.
         if words <= minimumWords, await WhisperNowTunedPolisher.shared.isRunning { return nil }
-        guard let base = baseURL, let token = token() else { return nil }
+        guard isEnabled, !BackgroundActivityGate.privacyMode, !Task.isCancelled,
+              let base = baseURL, let token = token() else { return nil }
         return await guardedCleanup(input, client: client, base: base, token: token, timeout: timeout,
                                     userVocabulary: userVocabulary, personalityStyle: personalityStyle,
                                     appContextLabel: appContextLabel)
@@ -72,6 +74,8 @@ enum RemoteCleanup {
     /// The network step and the guards, with the connection passed in so tests can use a fake server.
     static func guardedCleanup(_ input: String, client: Client, base: URL, token: String, timeout: TimeInterval,
                                userVocabulary: [String]?, personalityStyle: String, appContextLabel: String?) async -> String? {
+        guard timeout.isFinite, timeout > 0, !BackgroundActivityGate.privacyMode, !Task.isCancelled else { return nil }
+        let clockStart = ContinuousClock.now
         guard input.count >= 4, input.count <= WhisperNowTunedPolisher.maximumInputCharacters,
               S1MiniPolisher.validateInput(input) == nil, !Qwen3Polisher.isNonEnglish(input) else { return nil }
         guard englishDominant(input) || WhisperNowContentGuard.isNoiseOnly(input) else { return nil }
@@ -82,12 +86,21 @@ enum RemoteCleanup {
                                                          "ms": Int((CFAbsoluteTimeGetCurrent() - started) * 1000),
                                                          "words": input.split(separator: " ").count])
         }
-        guard await client.isHealthy(base: base, token: token) else { report("unavailable"); return nil }
+        let healthLeft = timeout - seconds(since: clockStart)
+        guard await DictationDeadline.run(seconds: min(healthLeft, healthTimeoutSeconds), {
+            await client.isHealthy(base: base, token: token)
+        }) == true else { report("unavailable"); return nil }
         let budget = WhisperNowTunedPolisher.tokenBudget(for: input)
-        guard let raw = await client.clean(WhisperNowTunedPolisher.t4Prompt(input), base: base, token: token,
-                                           maxTokens: budget, timeout: timeout) else {
+        let requestLeft = timeout - seconds(since: clockStart)
+        guard requestLeft > 0, !BackgroundActivityGate.privacyMode, !Task.isCancelled,
+              let raw = await DictationDeadline.run(seconds: requestLeft, {
+                  await client.clean(WhisperNowTunedPolisher.t4Prompt(input), base: base, token: token,
+                                     maxTokens: budget, timeout: requestLeft)
+              }) ?? nil else {
             report("unavailable"); return nil
         }
+        guard !Task.isCancelled, !BackgroundActivityGate.privacyMode,
+              seconds(since: clockStart) < timeout else { return nil }
         let reply = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = reply.lowercased()
         // Same reply rules as the local server: EMPTY and template leaks never reach the paste.
@@ -100,6 +113,8 @@ enum RemoteCleanup {
         guard englishDominant(decision.text) else { report("rejected:language"); return nil }
         let finalText = Qwen3Polisher.applyMinimalPostprocessor(decision.text, userVocabulary: userVocabulary,
                                                                 personalityStyle: personalityStyle, appContextLabel: appContextLabel)
+        guard !Task.isCancelled, !BackgroundActivityGate.privacyMode,
+              seconds(since: clockStart) < timeout else { return nil }
         guard !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { report("rejected:empty"); return nil }
         report("accepted")
         return finalText
@@ -115,7 +130,11 @@ enum RemoteCleanup {
     /// request counts as unhealthy, so a sleeping PC costs one short wait, not one per dictation.
     actor Client {
         private let session: URLSession
-        private var cachedHealth: (at: Date, ok: Bool)?
+        private struct Endpoint: Equatable {
+            let base: URL
+            let token: String
+        }
+        private var cachedHealth: (endpoint: Endpoint, at: Date, ok: Bool)?
 
         init(session: URLSession = Client.liveSession()) {
             self.session = session
@@ -130,7 +149,10 @@ enum RemoteCleanup {
         }
 
         func isHealthy(base: URL, token: String) async -> Bool {
-            if let cached = cachedHealth, Date().timeIntervalSince(cached.at) < RemoteCleanup.healthCacheSeconds {
+            guard !Task.isCancelled else { return false }
+            let endpoint = Endpoint(base: base, token: token)
+            if let cached = cachedHealth, cached.endpoint == endpoint,
+               Date().timeIntervalSince(cached.at) < RemoteCleanup.healthCacheSeconds {
                 return cached.ok
             }
             var request = URLRequest(url: base.appendingPathComponent("health"))
@@ -144,12 +166,17 @@ enum RemoteCleanup {
             } catch {
                 ok = false
             }
-            cachedHealth = (Date(), ok)
+            // Escape/outer deadline cancellation is not evidence of a dead PC.
+            guard !Task.isCancelled else { return false }
+            cachedHealth = (endpoint, Date(), ok)
             return ok
         }
 
         /// One cleanup call. Returns the model's raw text, or nil on any failure or timeout.
         func clean(_ prompt: String, base: URL, token: String, maxTokens: Int, timeout: TimeInterval) async -> String? {
+            guard timeout.isFinite, timeout > 0, !Task.isCancelled,
+                  !BackgroundActivityGate.privacyMode else { return nil }
+            let endpoint = Endpoint(base: base, token: token)
             var request = URLRequest(url: base.appendingPathComponent("v1/cleanup"))
             request.httpMethod = "POST"
             request.timeoutInterval = timeout
@@ -164,12 +191,12 @@ enum RemoteCleanup {
                 guard (response as? HTTPURLResponse)?.statusCode == 200,
                       let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let text = json["text"] as? String else {
-                    cachedHealth = (Date(), false)
+                    if !Task.isCancelled { cachedHealth = (endpoint, Date(), false) }
                     return nil
                 }
-                return text
+                return Task.isCancelled ? nil : text
             } catch {
-                cachedHealth = (Date(), false)
+                if !Task.isCancelled { cachedHealth = (endpoint, Date(), false) }
                 return nil
             }
         }

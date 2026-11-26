@@ -105,6 +105,20 @@ final class RemoteCleanupTests: XCTestCase {
         XCTAssertEqual(FakePCServer.hits.first?.token, token)
     }
 
+    func testChangingEndpointOrTokenDoesNotReuseHealth() async {
+        let client = RemoteCleanup.Client(session: FakePCServer.session())
+        let healthy = await client.isHealthy(base: base, token: token)
+        XCTAssertTrue(healthy)
+        FakePCServer.healthOK = false
+        let changedToken = await client.isHealthy(base: base, token: "replacement-token")
+        XCTAssertFalse(changedToken)
+        FakePCServer.healthOK = true
+        let otherBase = URL(string: "http://other-pc.test:8765")!
+        let changedBase = await client.isHealthy(base: otherBase, token: "replacement-token")
+        XCTAssertTrue(changedBase)
+        XCTAssertEqual(FakePCServer.hits.filter { $0.path == "/health" }.count, 3)
+    }
+
     func testUnhealthyServerIsReportedAndCached() async {
         FakePCServer.healthOK = false
         let client = RemoteCleanup.Client(session: FakePCServer.session())

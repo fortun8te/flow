@@ -85,8 +85,8 @@ enum DictationRetryService {
         let formatted = prepared.command.text
         var finalText = formatted
         if useAssistants {
-            let suspects = Array(Set(segments.compactMap(\.suspectWords).flatMap { $0 }
-                                     + TextFormatter.suspectsForPolish(formatted)))
+            let asrSuspects = segments.compactMap(\.suspectWords).flatMap { $0 }
+            let suspects = Array(Set(asrSuspects + TextFormatter.suspectsForPolish(formatted)))
             let preferred = ProperNounVocabulary.preferredSpellingTerms()
             let vocabulary = Array(Set(preferred + ProperNounVocabulary.current() + CombinedDictionary.terms()))
             finalText = await Qwen3Polisher.shared.polish(
@@ -102,7 +102,7 @@ enum DictationRetryService {
             let preparedText = finalText
             let repaired = await DictationReferee.background {
                 let fixed = DictationReferee.dictationPass(preparedText, isCode: false)
-                return LowConfidenceRecheck.recheck(fixed, suspects: suspects, protectedTerms: vocabulary).text
+                return LowConfidenceRecheck.recheck(fixed, suspects: asrSuspects, protectedTerms: vocabulary).text
             }
             finalText = ProperNounVocabulary.applyPreferredSpelling(repaired, terms: preferred)
         } else {

@@ -37,13 +37,19 @@ enum DraftDecisionGate {
         return (0.50...1.0).contains(probability)
     }
 
+    static func reviewBudget(deadline: ContinuousClock.Instant?, now: ContinuousClock.Instant = .now) -> Duration {
+        guard let deadline else { return timeout }
+        return max(.zero, min(timeout, now.duration(to: deadline)))
+    }
+
     static func shouldKeepOriginal(_ original: String, edited: String, deadline: ContinuousClock.Instant? = nil) async -> Bool {
         guard enabled, !Task.isCancelled,
-              deadline.map({ ContinuousClock.now + timeout <= $0 }) != false,
               needsReview(original: original, edited: edited),
               let bytes = try? JSONEncoder().encode(["original": original, "proposed_copy_edit": edited]) else { return false }
         let state = String(decoding: bytes, as: UTF8.self)
-        let answer = await DraftDecisionModel.shared.decide(state: state, questions: ["meaning": meaningQuestion], timeout: timeout)
+        let budget = reviewBudget(deadline: deadline)
+        guard budget >= .milliseconds(50) else { return false }
+        let answer = await DraftDecisionModel.shared.decide(state: state, questions: ["meaning": meaningQuestion], timeout: budget)
         return !Task.isCancelled && vetoes(changedProbability: answer?["meaning"]?["B"])
     }
 }
