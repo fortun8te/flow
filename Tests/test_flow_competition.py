@@ -268,6 +268,32 @@ class CompetitionTests(unittest.TestCase):
         self.assertFalse(report["gates"]["noCriticalFailures"])
         self.assertEqual(report["candidate"]["criticalCounts"]["changed_number"], 1)
 
+    def test_reviewed_layout_blocks_native_promotion_despite_better_words(self):
+        case = self.cases[0]
+        case.update(target=case["target"] + "\n  - Carry it carefully.  \nDone.", requireExactLayout=True)
+        case["caseHash"] = export.case_hash(case)
+        self.audio_map[0]["caseHash"] = self.audio_map[0]["audioReview"]["caseHash"] = case["caseHash"]
+        self.write_dataset()
+        self.match = self.freeze()
+        self.build_captures()
+        self.change_output("flow", 0, case["target"].replace("\n  -", "\n-"))
+        self.write_capture("flow")
+        report = self.compare()
+        self.assertTrue(report["gates"]["qualityImproved"])
+        self.assertFalse(report["gates"]["noCriticalFailures"])
+        self.assertFalse(report["eligibleForReview"])
+        self.assertEqual(report["candidate"]["criticalCounts"]["changed_layout"], 1)
+        self.assertEqual(report["candidate"]["reviewedLayoutCases"], 1)
+        self.assertEqual(report["candidate"]["exactLayoutRate"], 0)
+        self.assertEqual(report["baseline"]["exactLayoutRate"], 1)
+        self.assertIn(export.digest("reviewed-exact-layout"), report["slices"])
+
+    def test_enabling_strict_layout_requires_new_audio_review_binding(self):
+        self.cases[0]["requireExactLayout"] = True
+        self.cases[0]["caseHash"] = export.case_hash(self.cases[0])
+        with self.assertRaisesRegex(ValueError, "stale reviewed target"):
+            self.freeze()
+
     def test_small_slice_regression_is_not_averaged_away(self):
         self.audio_map[0]["slices"] = ["synthetic-rare-term-slice"]
         self.match = self.freeze(); self.build_captures()

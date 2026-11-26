@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 
 from export_flow_runs import canonical, digest, write_private
-from flow_hillclimb import load_dataset
+from flow_hillclimb import empty_output, load_dataset
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -102,7 +102,7 @@ def request_case(case, endpoint, model, prompt, timeout, max_tokens, opener=None
             raise ValueError("response content is not text")
         if reason != "stop":
             error = "incomplete-response"
-        elif not output.strip():
+        elif empty_output(case, output):
             error = "empty-output"
     except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError, IndexError) as failure:
         # Exception messages can contain server output; the record only needs the class.
@@ -132,7 +132,8 @@ def replay_cases(cases, invoke, protocol, model_id, dataset_id, progress=None):
     for case in cases:
         samples = attempts[case["id"]]
         first = samples[0]
-        failed = any(sample.get("error") or sample.get("finish_reason") != "stop" or not sample["output"].strip() for sample in samples)
+        failed = any(sample.get("error") or sample.get("finish_reason") != "stop" or empty_output(case, sample["output"])
+                     for sample in samples)
         unstable = any(sample["output"] != first["output"] for sample in samples)
         predictions.append({"id": case["id"], "caseHash": case["caseHash"], "output": first["output"],
             "finish_reason": first["finish_reason"], "error": "attempt-failed" if failed else "unstable-output" if unstable else None,

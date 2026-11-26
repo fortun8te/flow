@@ -119,6 +119,8 @@ def freeze(manifest, cases, split, audio_map, protocol, base=Path(".")):
         slices = slices + ["kind:dictation", "app:" + (case.get("app") or "unknown")]
         if case.get("mustContain") or case.get("mustNotContain"):
             slices.append("protected-literals")
+        if case.get("requireExactLayout") is True:
+            slices.append("reviewed-exact-layout")
         slice_names.update({digest(value): value for value in slices})
         frozen.append({"id": case["id"], "caseHash": case["caseHash"], **hashes,
                        "textFamilyID": digest(case["groupID"]), "sliceIDs": sorted({digest(value) for value in slices}),

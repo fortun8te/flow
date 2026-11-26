@@ -55,6 +55,12 @@ Review the source and the proposed target, then create a private JSONL label fil
 
 `mustContain` and `mustNotContain` are optional literal lists. Use them for protected names, identifiers and requirements that automated heuristics cannot infer. They must agree with the reviewed target and become part of the case hash. An altered label cannot silently reuse predictions for the earlier case.
 
+For a case whose line layout has been explicitly reviewed, add `"requireExactLayout": true` to that label. This is a strict, opt-in contract for the target's exact newline characters and their positions between whitespace-separated tokens, boundary blank lines, indentation, Markdown hard-break spaces, and list, heading, quote, checkbox and code-fence prefixes. Ordinary interior word spacing, spelling and case remain separate quality measures. Adding or deleting words before a break moves its position and also requires review under this strict contract. Use it for spoken line/paragraph commands, nested lists, code indentation and existing user formatting; do not enable it automatically on unreviewed observations.
+
+For example, a reviewed target of `"Tasks:\n  - Carry the kettle.  \n  - Lock the door."` can require its indentation and hard breaks even while word accuracy is being improved. A reviewed `"new line"` recording may use `"target": "\n"` only with `"requireExactLayout": true`; empty strings and spaces-only targets remain invalid. All such examples still require the same human review and scope/input binding. The exporter preserves this policy through deduplication and binds it into `caseHash`, so enabling it requires fresh predictions and native audio-review bindings. Existing cases with the flag absent or false keep their prior case hashes.
+
+Both the local hillclimb and native competition reports include `reviewedLayoutCases` and `exactLayoutRate` (`null` when none were reviewed). Any retained attempt that breaks a required layout receives a `changed_layout` critical failure and blocks eligibility, even when word error improves. This adds no automatic labels, training run, model promotion or competitor-performance claim.
+
 ```sh
 python3 scripts/export_flow_runs.py \
   --labels "$HOME/flow-train/reviewed-labels.jsonl" \

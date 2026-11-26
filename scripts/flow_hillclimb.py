@@ -3,7 +3,8 @@
 
 This is an offline promotion gate, not a model downloader or automatic deployment.
 Prediction JSONL rows require id, caseHash, datasetID, modelID, output and finite latencyMs.
-The case hash binds predictions to input + human target + editing mode. Missing,
+The case hash binds input + human target + editing mode and reviewed constraints,
+including opt-in exact structural layout. Missing,
 duplicate, stale or extra predictions fail closed. Use validation while tuning;
 reserve test for the final frozen candidate. No real text is included in reports.
 """
@@ -17,12 +18,13 @@ from pathlib import Path
 import re
 import statistics
 
-from export_flow_runs import EXPORT_SCHEMA, SPLIT_POLICY, canonical, case_hash, digest, write_private
+from export_flow_runs import EXPORT_SCHEMA, SPLIT_POLICY, canonical, case_hash, digest, has_reviewed_target, line_break_payload, write_private
 
 _distance_spec = importlib.util.spec_from_file_location("flow_text_metrics", Path(__file__).resolve().parents[1] / "bench/text_metrics.py")
 _distance_module = importlib.util.module_from_spec(_distance_spec)
 _distance_spec.loader.exec_module(_distance_module)
 edit_distance = _distance_module.edit_distance
+layout_signature = _distance_module.layout_signature
 
 TOKENS = re.compile(r"\w+|[^\w\s]|\n", re.UNICODE)
 NEGATIONS = re.compile(r"\b(?:no|not|never|none|nothing|nobody|neither|nor|without|cannot|\w+n['’]t)\b", re.I)
@@ -36,7 +38,9 @@ def read_jsonl(path):
 
 def parse_jsonl(contents, label="predictions"):
     rows = []
-    for number, line in enumerate(contents.splitlines(), 1):
+    # JSONL is LF-delimited; Unicode line/paragraph separators are legal
+    # literal JSON string contents and must not split a reviewed payload.
+    for number, line in enumerate(contents.split("\n"), 1):
         if not line.strip():
             continue
         value = json.loads(line)
@@ -74,8 +78,8 @@ def load_dataset(directory, split):
         seen.add(row["id"])
         if not row.get("trainingEligible") or row.get("label") != "human-reviewed" or row.get("split") != split:
             raise ValueError("evaluation requires independently reviewed examples in the requested split")
-        if not isinstance(row.get("input"), str) or not isinstance(row.get("target"), str) or not row["target"].strip():
-            raise ValueError("evaluation requires nonempty text targets")
+        if not isinstance(row.get("input"), str) or not has_reviewed_target(row):
+            raise ValueError("evaluation requires nonempty text targets or explicitly reviewed newline-only layout targets")
         for key in ("mustContain", "mustNotContain"):
             literals = row.get(key, [])
             if not isinstance(literals, list) or any(not isinstance(value, str) or not value for value in literals):
@@ -110,6 +114,11 @@ def prediction_attempts(row):
     # A manually supplied one-shot prediction remains useful for quality inspection.
     # Repeated timing and engine tuning require the actual retained samples.
     return row.get("attempts") if row.get("attempts") is not None else [row]
+
+
+def empty_output(case, output):
+    return not output.strip() and not (case.get("requireExactLayout") is True
+                                       and line_break_payload(case.get("target")) and line_break_payload(output))
 
 
 def predictions_by_id(rows, cases, dataset_id=None):
@@ -176,6 +185,10 @@ def predictions_by_id(rows, cases, dataset_id=None):
 def score(case, prediction):
     expected = case["target"]
     target_tokens = TOKENS.findall(expected)
+    if type(case.get("requireExactLayout", False)) is not bool:
+        raise ValueError("requireExactLayout must be a boolean from explicit human review")
+    required_layout = layout_signature(expected) if case.get("requireExactLayout") is True else None
+    layout_exact = True if required_layout is not None else None
     samples = prediction_attempts(prediction)
     faults = []
     if prediction.get("error"):
@@ -186,9 +199,12 @@ def score(case, prediction):
     for sample in samples:
         output = sample["output"]
         edits += edit_distance(target_tokens, TOKENS.findall(output))
+        if required_layout is not None and layout_signature(output) != required_layout:
+            faults.append("changed_layout")
+            layout_exact = False
         if sample.get("error") or sample.get("finish_reason") != "stop":
             faults.append("runtime_failure")
-        if not output.strip():
+        if empty_output(case, output):
             faults.append("empty_output")
         # Compare with independent corrected text; a human correction can change raw ASR facts.
         if NUMBERS.findall(expected) != NUMBERS.findall(output):
@@ -206,6 +222,7 @@ def score(case, prediction):
     return {"id": case["id"], "edits": edits / len(samples),
             "tokens": max(1, len(target_tokens)), "latencyMs": prediction["latencyMs"],
             "latenciesMs": [sample["latencyMs"] for sample in samples],
+            "layoutExact": layout_exact,
             "critical": sorted(set(faults)), "exact": not faults and all(sample["output"] == expected for sample in samples)}
 
 
@@ -215,8 +232,11 @@ def percentile95(values):
 
 def aggregate(rows):
     latencies = [latency for row in rows for latency in row["latenciesMs"]]
+    layout_rows = [row for row in rows if row.get("layoutExact") is not None]
     return {"cases": len(rows), "tokenErrorRate": sum(row["edits"] for row in rows) / sum(row["tokens"] for row in rows),
             "exactRate": sum(row["exact"] for row in rows) / len(rows),
+            "reviewedLayoutCases": len(layout_rows),
+            "exactLayoutRate": sum(row["layoutExact"] for row in layout_rows) / len(layout_rows) if layout_rows else None,
             "latencySamples": len(latencies), "p50Ms": statistics.median(latencies), "p95Ms": percentile95(latencies),
             "criticalCases": sum(bool(row["critical"]) for row in rows),
             "criticalCounts": dict(Counter(fault for row in rows for fault in row["critical"]))}

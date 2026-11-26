@@ -30,6 +30,7 @@ SPLIT_POLICY = "flow-grouped-v1-80-10-10"
 UNDO = {"undo", "undo-and-retry", "undo-paste", "rejected"}
 SCOPES = {"dictation": "pasted-span", "opt1": "selection"}
 INTEGRITY_ERRORS = {"invalidJSON", "invalidRecord", "unknownKind", "sourceReadError", "sourceChanged"}
+LINE_ENDINGS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 
 
 def canonical(value):
@@ -49,9 +50,26 @@ def fingerprint(text):
     return digest(normalized(text))
 
 
+def line_break_payload(text):
+    """A structural-only payload, never ordinary empty/model-padding output."""
+    return isinstance(text, str) and not text.strip() and any(char in LINE_ENDINGS for char in text)
+
+
+def has_reviewed_target(row):
+    value = row.get("target")
+    return isinstance(value, str) and (bool(value.strip())
+                                      or (row.get("requireExactLayout") is True and line_break_payload(value)))
+
+
 def case_hash(row):
     content = {key: row[key] for key in ("input", "target", "kind")}
     content.update({key: row.get(key, []) for key in ("mustContain", "mustNotContain")})
+    if type(row.get("requireExactLayout", False)) is not bool:
+        raise ValueError("requireExactLayout must be a boolean from explicit human review")
+    # An absent/false optional policy retains existing frozen case identities.
+    # Enabling it must invalidate predictions made under the weaker policy.
+    if row.get("requireExactLayout") is True:
+        content["requireExactLayout"] = True
     return digest(canonical(content))
 
 
@@ -185,8 +203,10 @@ def apply_labels(runs, path, diagnostics):
             if entry.get("source") != "human-reviewed" or entry.get("scope") != SCOPES[run["kind"]]:
                 raise ValueError(f"label line {line_number}: explicit human-reviewed source and matching scope required")
             value = entry.get("target")
-            if not isinstance(value, str) or not value.strip() or len(value) > 20_000:
-                raise ValueError(f"label line {line_number}: nonempty bounded target required")
+            if type(entry.get("requireExactLayout", False)) is not bool:
+                raise ValueError(f"label line {line_number}: requireExactLayout must be a boolean")
+            if not has_reviewed_target(entry) or len(value) > 20_000:
+                raise ValueError(f"label line {line_number}: nonempty bounded target required; newline-only targets need explicit layout review")
             for key in ("mustContain", "mustNotContain"):
                 literals = entry.get(key, [])
                 if not isinstance(literals, list) or any(not isinstance(text, str) or not text or len(text) > 500
@@ -238,6 +258,9 @@ def target(run):
 
 def make_pair(run):
     verdict, expected, provenance = supervision(run)
+    reviewed_layout = (run.get("reviewedLabel") or {}).get("requireExactLayout", False)
+    if type(reviewed_layout) is not bool:
+        raise ValueError("requireExactLayout must be a boolean from explicit human review")
     edits = [item for item in run.get("followups", []) if item.get("followup") == "edited"]
     last_edit = edits[-1] if edits else {}
     proposal = last_edit.get("editedText") if last_edit.get("targetScope") == SCOPES[run["kind"]] else None
@@ -252,6 +275,8 @@ def make_pair(run):
            "target": expected, "proposedTarget": proposal, "targetProvenance": provenance,
            "trainingEligible": expected is not None, "inputFingerprint": fingerprint(run["input"])}
     row.update({key: (run.get("reviewedLabel") or {}).get(key, []) for key in ("mustContain", "mustNotContain")})
+    if reviewed_layout:
+        row["requireExactLayout"] = True
     # Existing runs provide audioPath; future/imported records can provide stronger recording identity.
     # Never open audio paths during text export. Renamed/copied audio needs a content hash or stable source id.
     recording_keys = []
@@ -343,6 +368,8 @@ def split_examples(pairs, registry):
             dedup[key]["sourceRunIDs"].append(row["id"])
             for field in ("mustContain", "mustNotContain"):
                 dedup[key][field] = sorted(set(dedup[key].get(field, [])) | set(row.get(field, [])))
+            if row.get("requireExactLayout") is True:
+                dedup[key]["requireExactLayout"] = True
     examples = sorted(dedup.values(), key=lambda row: row["id"])
     for row in examples:
         row["sourceRunIDs"].sort()
