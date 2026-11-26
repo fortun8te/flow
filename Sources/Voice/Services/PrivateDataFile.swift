@@ -67,13 +67,17 @@ enum PrivateDataFile {
         return try handle.readToEnd() ?? Data()
     }
 
-    static func withExclusiveAccess<T>(to url: URL, _ body: () throws -> T) throws -> T {
+    static func withExclusiveAccess<T>(to url: URL, restrictDirectoryPermissions: Bool = true,
+                                       _ body: () throws -> T) throws -> T {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
         let parent = try openDirectory(directory)
         defer { close(parent) }
-        guard fchmod(parent, 0o700) == 0 else { throw failure() }
+        // App-owned data directories are private by default. A CLI caller may
+        // choose an existing general-purpose output directory; do not chmod
+        // that whole directory merely to create its private result file.
+        if restrictDirectoryPermissions, fchmod(parent, 0o700) != 0 { throw failure() }
         let name = "." + url.lastPathComponent + ".lock"
         let descriptor = openat(parent, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
         guard descriptor >= 0 else { throw failure() }

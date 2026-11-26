@@ -92,5 +92,10 @@ struct CleanupRoutingTests {
         let accepted = CleanupReplayHarness.Outcome(final: "X.", route: "s1", input: "x", controlLine: "c",
                                                     result: "accepted", engine: "local:s1-mini", cleanupMs: 80)
         #expect(accepted.runResultLabel == "accepted")
+        #expect(!accepted.guardRefused)
+        #expect(!off.guardRefused)
+        let partial = CleanupReplayHarness.Outcome(final: "X.\nY.", route: "sections", input: "x\ny", controlLine: nil,
+                                                    result: "accepted|rejected:output_guard", engine: "local:s1-mini", cleanupMs: 80)
+        #expect(partial.guardRefused)
     }
 }

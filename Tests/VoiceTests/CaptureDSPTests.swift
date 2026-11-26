@@ -391,7 +391,7 @@ struct CaptureReplayTests {
         let wav = try writeWAV(input)
         let caf = wav.deletingPathExtension().appendingPathExtension("caf")
         defer { try? FileManager.default.removeItem(at: wav); try? FileManager.default.removeItem(at: caf) }
-        let result = try CaptureReplay.render(source: wav, to: caf, applyDSP: true, tuning: .forDevice(.usb))
+        let result = try CaptureReplay.render(source: wav, to: caf, applyDSP: true, tuning: .forDevice(.usb), collectSamples: true)
 
         // Expected: the WAV as Parakeet would read it, cut into 4,096-frame buffers, through CaptureDSP.
         let decoded = try TranscriptionService.readSamplesAt16kMono(url: wav)
@@ -427,7 +427,7 @@ struct CaptureReplayTests {
         defer { try? FileManager.default.removeItem(at: wav); try? FileManager.default.removeItem(at: caf) }
         let result = try CaptureReplay.render(source: wav, to: caf, applyDSP: false, tuning: .forDevice(.builtIn))
         let decoded = try TranscriptionService.readSamplesAt16kMono(url: wav)
-        #expect(result.samples == decoded)
+        #expect(result.samples.isEmpty)
         #expect(try TranscriptionService.readSamplesAt16kMono(url: caf) == decoded)
     }
 
@@ -437,7 +437,7 @@ struct CaptureReplayTests {
         defer { try? FileManager.default.removeItem(at: url) }
         try CleanupReplayHarness.appendLine(["id": "a", "status": "ok", "audio": "x/y"], to: url)
         try CleanupReplayHarness.appendLine(["id": "b", "status": "error"], to: url)
-        #expect(CleanupReplayHarness.completedIDs(url) { $0["status"] as? String == "ok" } == ["a"])
+        #expect(try CleanupReplayHarness.completedIDs(url) { $0["status"] as? String == "ok" } == ["a"])
         let text = try String(contentsOf: url, encoding: .utf8)
         #expect(text.hasPrefix("{\"audio\":\"x/y\",\"id\":\"a\",\"status\":\"ok\"}\n"))
         let mode = (try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber)?.intValue

@@ -19,6 +19,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = {
+    "CleanupReplayIOTests": (
+        "Sources/Voice/Services/CleanupReplayIO.swift",
+        "Sources/Voice/Services/PrivateDataFile.swift",
+    ),
     "DictationLayoutBoundaryTests": (
         "Sources/Voice/Services/DictationLayout.swift",
         "Sources/Voice/Services/DictationFinalPass.swift",
@@ -35,7 +39,12 @@ SUITES = {
     "CorrectionEvidenceTests": "Sources/Voice/Services/CorrectionEvidence.swift",
     "SharedModelTaskTests": "Sources/Voice/Services/SharedModelTask.swift",
     "CleanupRuntimeLimitsTests": "Sources/Voice/Services/CleanupRuntimeLimits.swift",
+    "CleanupModelCatalogTests": (
+        "Sources/Voice/Services/CleanupModelCatalog.swift",
+        "Sources/Voice/Services/BoundedLocalFileCache.swift",
+    ),
     "ContextScoreBatchTests": "Sources/Voice/Services/ContextScoreBatch.swift",
+    "PromptTermsTests": "Sources/Voice/Services/PromptTerms.swift",
     "PipelineTimerTests": "Sources/Voice/Services/PipelineTimer.swift",
     "WordDecisionEvidenceTests": "Sources/Voice/Services/WordDecisionEvidence.swift",
     "VocabularyReplacementRulesTests": "Sources/Voice/Services/VocabularyReplacementRules.swift",
