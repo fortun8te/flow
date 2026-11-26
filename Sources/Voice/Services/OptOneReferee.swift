@@ -6,7 +6,7 @@ import Foundation
 /// link, name or negation, an added or dropped word, or a reworded phrase goes back to what was typed.
 /// The deterministic repair then finishes what the model left ("Odenst" -> "doesn't").
 enum OptOneReferee {
-    struct Result: Equatable {
+    struct Result: Equatable, Sendable {
         let text: String
         /// Model groups taken back to the typed words, with a short reason each.
         let reverted: [String]
@@ -41,8 +41,24 @@ enum OptOneReferee {
         let core = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !core.isEmpty else { return nil }
         let result = lead + core + trail
-        for token in protectedTokens(source) where !result.contains(token) { return nil }
+        // Exact ordered literals, not substring checks ("12" is not "123").
+        guard protectedTokens(source) == protectedTokens(result) else { return nil }
+        guard structureSignature(source) == structureSignature(result) else { return nil }
         return result
+    }
+
+    /// The user's existing list/heading/quote prefixes, indentation and line
+    /// breaks are not editable words. Do not permit a model to renumber or
+    /// collapse a typed list. New layout is added separately, after this guard.
+    private static func structureSignature(_ text: String) -> [String] {
+        let lines = text.trimmingCharacters(in: .newlines).components(separatedBy: .newlines)
+        return lines.map { line in
+            let indent = String(line.prefix { $0 == " " || $0 == "\t" })
+            let rest = String(line.dropFirst(indent.count))
+            let marker = rest.range(of: #"^(?:[-+*•>]|#{1,6}|[0-9]{1,3}[.)])[ \t]+"#, options: .regularExpression)
+                .map { String(rest[$0]) } ?? ""
+            return indent + marker
+        }
     }
 
     /// Links and anything with a digit, as typed. These must come through untouched.
@@ -77,6 +93,13 @@ enum OptOneReferee {
     /// up to three words a side by keyboard cost.
     private static func align(_ s: [Word], _ t: [Word]) -> [(Int, Int, Int, Int)] {
         let n = s.count, m = t.count
+        // Most copy edits have many unchanged words. Avoid a quadratic LCS
+        // allocation entirely for same-order, case/punctuation-only edits.
+        if n == m, zip(s, t).allSatisfy({ $0.0.letters == $0.1.letters }) {
+            return (0..<n).map { ($0, $0 + 1, $0, $0 + 1) }
+        }
+        // Bound worst-case work on an oversized or unrelated model reply.
+        if n > 0, m > 2_000_000 / n { return [(0, n, 0, m)] }
         // Longest common subsequence of exact (case- and apostrophe-free) words.
         var lcs = [Int](repeating: 0, count: (n + 1) * (m + 1))
         if n > 0 && m > 0 {
@@ -156,6 +179,12 @@ enum OptOneReferee {
     private static let expansions: [String: Set<String>] = ["u": ["you"], "ur": ["your", "you're"], "im": ["i'm"], "ive": ["i've"]]
 
     static func groupVerdict(_ src: [String], _ tgt: [String], protectedTerms: [String] = []) -> (ok: Bool, reason: String) {
+        let userKeys = TypoRepair.shared.userKeyMap(protectedTerms)
+        return judgeGroup(src, tgt, userKeys: userKeys, lex: TypoRepair.shared.lexicon(wait: false))
+    }
+
+    private static func judgeGroup(_ src: [String], _ tgt: [String], userKeys: [String: String],
+                                   lex: TypoRepair.Lexicon?) -> (ok: Bool, reason: String) {
         func letters(_ ws: [String]) -> String {
             ws.map { $0.lowercased().replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "’", with: "") }.joined()
         }
@@ -173,7 +202,6 @@ enum OptOneReferee {
             if src.count == 1, src[0].count == 1, !["a", "i"].contains(src[0].lowercased()) { return (true, "stray letter") }
             return (false, "dropped words")
         }
-        let userKeys = TypoRepair.shared.userKeyMap(protectedTerms)
         // A name or dictionary entry typed right stays as typed.
         for w in src where w.count >= 3 {
             let k = TypoRepair.key(w)
@@ -183,7 +211,7 @@ enum OptOneReferee {
         let length = Float(max(ls.count, 1))
         var garbled = false
         var targetKnown = true
-        if let lex = TypoRepair.shared.lexicon(wait: false) {
+        if let lex {
             garbled = src.contains { !TypoRepair.shared.isKnown($0, lexicon: lex, userKeys: userKeys) }
             targetKnown = tgt.allSatisfy { TypoRepair.shared.isKnown($0, lexicon: lex, userKeys: userKeys) || $0.first?.isUppercase == true }
         }
@@ -200,19 +228,33 @@ enum OptOneReferee {
 
     static func merge(source: String, candidate raw: String, protectedTerms: [String] = []) -> Result {
         let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if source == candidate { return Result(text: source, reverted: [], modelGroupsKept: 0) }
         let sw = words(source), tw = words(candidate)
         guard !tw.isEmpty, !sw.isEmpty else { return Result(text: source, reverted: ["empty"], modelGroupsKept: 0) }
         let src = source as NSString, cand = candidate as NSString
         let groups = align(sw, tw)
+        // Resolve dictionary/model state once, not once per aligned word.
+        let userKeys = TypoRepair.shared.userKeyMap(protectedTerms)
+        let lex = TypoRepair.shared.lexicon(wait: false)
         var out = ""
         var reverted: [String] = []
         var kept = 0
         var candCursor = 0   // utf16 offset in candidate already emitted
         // Text before the first word: the candidate's, unless it added words there (it cannot: no words).
-        if let first = tw.first { out += cand.substring(to: first.range.location); candCursor = first.range.location }
+        if let first = tw.first {
+            let sourceLead = src.substring(to: sw[0].range.location)
+            // Keep original bullet/quote/heading prefix and indentation.
+            out += source.contains(where: \.isNewline) || !sourceLead.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? sourceLead : cand.substring(to: first.range.location)
+            candCursor = first.range.location
+        }
         for (i0, i1, j0, j1) in groups {
             let sWords = sw[i0..<i1].map(\.text), tWords = tw[j0..<j1].map(\.text)
-            let verdict = groupVerdict(sWords, tWords, protectedTerms: protectedTerms)
+            // Large unrelated spans must be restored directly, never passed to
+            // an unbounded keyboard-distance calculation.
+            let verdict = max(sWords.count, tWords.count) > 40
+                ? (ok: false, reason: "unaligned span")
+                : judgeGroup(sWords, tWords, userKeys: userKeys, lex: lex)
             // Separator before this group: the candidate's, with the typed line breaks.
             var sep = ""
             if j1 > j0 { sep = cand.substring(with: NSRange(location: candCursor, length: tw[j0].range.location - candCursor)) }
@@ -221,25 +263,26 @@ enum OptOneReferee {
                 let gapStart = sw[i0 - 1].range.location + sw[i0 - 1].range.length
                 let gap = src.substring(with: NSRange(location: gapStart, length: sw[i0].range.location - gapStart))
                 let breaks = gap.filter { $0 == "\n" }.count
-                if breaks > 0, !sep.contains("\n") {
-                    sep = sep.trimmingCharacters(in: .whitespaces) + String(repeating: "\n", count: breaks)
-                } else if breaks == 0, sep.contains("\n") {
+                if breaks > 0 || gap.contains("\r") {
+                    // Preserve typed line breaks, bullet marks and indentation.
+                    sep = gap
+                } else if sep.contains("\n") || sep.contains("\r") {
                     sep = sep.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "  ", with: " ")
                     if sep.trimmingCharacters(in: .whitespaces).isEmpty { sep = " " }
                 }
             }
             if i0 == 0, j0 == 0 { sep = "" }
             var body: String
-            if verdict.ok || (j1 > j0 && i1 == i0 && false) {
+            if verdict.ok {
                 body = j1 > j0 ? cand.substring(with: NSRange(location: tw[j0].range.location,
                     length: tw[j1 - 1].range.location + tw[j1 - 1].range.length - tw[j0].range.location)) : ""
                 if j1 > j0 { kept += 1 }
                 if j1 == j0 { sep = "" }   // a stray letter dropped
-            } else if i1 - i0 == j1 - j0, i1 - i0 > 1 {
+            } else if i1 - i0 == j1 - j0, (2...40).contains(i1 - i0) {
                 // Same number of words: judge each pair on its own.
                 var pieces: [String] = []
                 for k in 0..<(i1 - i0) {
-                    let pair = groupVerdict([sw[i0 + k].text], [tw[j0 + k].text], protectedTerms: protectedTerms)
+                    let pair = judgeGroup([sw[i0 + k].text], [tw[j0 + k].text], userKeys: userKeys, lex: lex)
                     pieces.append(pair.ok ? tw[j0 + k].text : sw[i0 + k].text)
                     if pair.ok { kept += 1 }
                 }
@@ -263,8 +306,10 @@ enum OptOneReferee {
             if j1 > j0 { candCursor = tw[j1 - 1].range.location + tw[j1 - 1].range.length }
         }
         out += cand.substring(from: candCursor)
-        out = out.replacingOccurrences(of: #"(?<=\S) {2,}(?=\S)"#, with: " ", options: .regularExpression)
-        out = out.replacingOccurrences(of: " \n", with: "\n").replacingOccurrences(of: " ,", with: ",")
+        if !source.contains(where: \.isNewline) {
+            out = out.replacingOccurrences(of: #"(?<=\S) {2,}(?=\S)"#, with: " ", options: .regularExpression)
+        }
+        out = out.replacingOccurrences(of: " ,", with: ",")
         return Result(text: out, reverted: reverted, modelGroupsKept: kept)
     }
 }

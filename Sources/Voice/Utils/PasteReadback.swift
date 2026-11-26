@@ -88,21 +88,18 @@ enum PasteReadback {
     /// Classifies one look against the state before the paste.
     static func verdict(before: PasteFieldLook, after: PasteFieldLook,
                         inserted: String, replacing range: NSRange?) -> PasteVerdict {
-        guard after.sameTarget, !inserted.isEmpty,
+        guard before.sameTarget, after.sameTarget, !inserted.isEmpty,
               let beforeValue = before.value, let afterValue = after.value,
-              let beforeCaret = before.caret, let afterCaret = after.caret else { return .unknown }
+              let beforeCaret = before.caret, let afterCaret = after.caret,
+              validRange(afterCaret, in: afterValue),
+              let insertedRange = insertionRange(before: before, inserted: inserted, replacing: range) else { return .unknown }
 
         // Verified: exactly our edit, caret directly after the inserted text.
         let edit = range ?? beforeCaret
-        let beforeLength = (beforeValue as NSString).length
-        if edit.location != NSNotFound, edit.location >= 0, edit.length >= 0,
-           edit.location <= beforeLength, edit.length <= beforeLength - edit.location {
-            let expected = (beforeValue as NSString).replacingCharacters(in: edit, with: inserted)
-            let insertedLength = (inserted as NSString).length
-            if expected.utf16.elementsEqual(afterValue.utf16),
-               afterCaret.length == 0, afterCaret.location == edit.location + insertedLength {
-                return .verified
-            }
+        let expected = (beforeValue as NSString).replacingCharacters(in: edit, with: inserted)
+        if expected.utf16.elementsEqual(afterValue.utf16),
+           afterCaret.length == 0, afterCaret.location == insertedRange.location + insertedRange.length {
+            return .verified
         }
 
         // Not landed: nothing moved. Same text, same caret, same element.
@@ -110,6 +107,23 @@ enum PasteReadback {
             return .notLanded
         }
         return .unknown
+    }
+
+    /// Exact post-paste UTF-16 span for readback and correction learning. Invalid
+    /// or mismatched ranges cannot authorize a fallback or a training label.
+    static func insertionRange(before: PasteFieldLook, inserted: String, replacing range: NSRange?) -> NSRange? {
+        guard before.sameTarget, !inserted.isEmpty, let value = before.value,
+              let caret = before.caret, validRange(caret, in: value) else { return nil }
+        let edit = range ?? caret
+        guard edit == caret, validRange(edit, in: value) else { return nil }
+        return NSRange(location: edit.location, length: inserted.utf16.count)
+    }
+
+    private static func validRange(_ range: NSRange, in value: String) -> Bool {
+        let length = value.utf16.count
+        return range.location != NSNotFound && range.location >= 0 && range.length >= 0
+            && range.location <= length && range.length <= length - range.location
+            && Range(range, in: value) != nil
     }
 
     /// A second look may confirm a paste, but may only authorize typing when

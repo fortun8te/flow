@@ -33,14 +33,16 @@
 //      OR AppleScript / System Events (if not)
 //   6. Restore original clipboard after a delay
 //
-// Insertion context rules (Wispr Flow / SuperWhisper approach):
-//   fresh / startOfLine  → no leading space, keep capitalization
-//   afterTerminal (.!?)  → add space, keep capitalization, keep period
-//   midSentence          → add space, lowercase first word (not "I"),
-//                          strip formatter's trailing period
-//   Messaging apps       → strip trailing period in all contexts
-//   Code editors         → strip trailing period, lowercase first char after .!?
-//                          (matches `foo.bar` natural code patterns)
+// Insertion context rules:
+//   Both field edges decide whether the payload needs a separating space.
+//   Preformatted payloads keep their casing and whitespace, including code
+//   indentation and Markdown hard breaks. Existing boundary punctuation is
+//   reused instead of doubled.
+//   Plain dictation may trim model padding and lowercase a small allowlist
+//   of sentence starters in a continuing sentence; title case alone is not
+//   enough to lowercase a word. Mid-sentence, messaging and code contexts
+//   may drop a final prose period, while retaining abbreviation periods.
+//   Partial words, contractions and literal fragments remain joined.
 //
 // WHY NOT changeCount:
 //   NSPasteboard.changeCount only increments on WRITES — it does NOT
@@ -58,6 +60,11 @@ import Foundation
 import AppKit
 import Carbon
 import ApplicationServices
+
+extension Notification.Name {
+    /// Invalidates correction observations before any Flow-authored edit.
+    static let flowWillInsertText = Notification.Name("flow.willInsertText")
+}
 
 class CursorPaster {
     enum PasteDispatchResult { case eventSent, skipped, failed }
@@ -159,12 +166,14 @@ class CursorPaster {
                        expectedTarget: PasteTargetSnapshot? = nil, requireCapturedTarget: Bool = false,
                        submitAfterVerifiedPaste: Bool = false, maySubmit: (() -> Bool)? = nil,
                        mayDeliver: (() -> Bool)? = nil,
+                       onDispatched: ((PasteReceipt) -> Void)? = nil,
                        completion: ((PasteDispatchResult) -> Void)? = nil,
                        onReadback: ((PasteVerdict) -> Void)? = nil,
                        onFailure: ((PasteFailure) -> Void)? = nil) {
         submissionGeneration &+= 1
         let submissionID = submissionGeneration
         guard !text.isEmpty else { completion?(.skipped); return }
+        guard mayDeliver?() != false else { completion?(.skipped); return }
 
         // A caller that owns the result can present its own recovery UI. Legacy
         // callers still get the existing notice, without putting the result in it.
@@ -224,7 +233,7 @@ class CursorPaster {
             guard let self else { notifyFailure("Couldn’t paste."); completion?(.failed); return }
             // Escape or a cancel during the delay stops this paste before the clipboard
             // or any keystroke changes (sol/01 finding 6). The session check is made here, not earlier.
-            if let mayDeliver, !mayDeliver() {
+            if self.submissionGeneration != submissionID || mayDeliver?() == false {
                 print("[VOICE-PASTE] cancelled during the pre-paste delay — nothing pasted")
                 completion?(.skipped)
                 return
@@ -258,7 +267,8 @@ class CursorPaster {
             // A field/range captured at key-down can be stale by the time cleanup ends.
             let receiptValue = self.currentText(of: liveTarget).flatMap { $0.utf16.count <= 1_048_576 ? $0 : nil }
             let receiptRange = self.selectedRange(of: liveTarget)
-            let pasteText = Self.resolvedInsertion(text, field: receiptValue, selection: receiptRange,
+            let insertionContext = self.insertionContext(in: liveTarget, value: receiptValue, selection: receiptRange)
+            let pasteText = Self.resolvedInsertion(text, field: insertionContext.value, selection: insertionContext.selection,
                                                    preFormatted: preFormatted, bundleID: liveTarget.bundleId,
                                                    rememberedEnd: self.rememberedPasteEnd(for: liveTarget))
             guard !pasteText.isEmpty else {
@@ -312,7 +322,8 @@ class CursorPaster {
 
             // Clipboard I/O can give another app time to change focus or claim
             // the clipboard. Recheck after writing, before sending any keys.
-            if self.isFocusedElementSecure() {
+            let dispatchTarget = self.currentPasteTargetSnapshot()
+            if self.isSecureField(dispatchTarget.focusedElement) {
                 skipWrittenPaste("Skipped password field. Find your text in Recent Dictations.",
                                  detail: "secure_field", reason: .secureField)
                 return
@@ -321,11 +332,16 @@ class CursorPaster {
                 skipWrittenPaste("You switched apps. Dictation copied.", detail: "target_app_changed")
                 return
             }
+            guard Self.sameOptionalField(liveTarget.focusedElement, dispatchTarget.focusedElement, equal: { CFEqual($0, $1) }),
+                  receiptRange == nil || self.selectedRange(of: dispatchTarget) == receiptRange else {
+                skipWrittenPaste("The cursor moved. Dictation copied.", detail: "target_cursor_changed")
+                return
+            }
             guard ownsWrittenClipboard() else {
                 skipWrittenPaste("The clipboard changed. Dictation wasn’t pasted.", detail: "clipboard_changed")
                 return
             }
-            if mayDeliver?() == false {
+            if self.submissionGeneration != submissionID || mayDeliver?() == false {
                 restoreIfOwned()
                 Telemetry.signal("paste.skipped", "cancelled")
                 completion?(.skipped)
@@ -334,6 +350,10 @@ class CursorPaster {
 
             // Spacing travels with the text in one paste. A separate space key
             // can replace the selected text before the paste and leave a stray edit.
+            let receipt = PasteReceipt(target: liveTarget,
+                before: PasteFieldLook(value: receiptValue, caret: receiptRange, sameTarget: true),
+                insertedText: pasteText, replacedRange: receiptRange,
+                editSerial: PasteInteractionTracker.shared.editSerial)
             let dispatched = willUseCGEvent ? self.simulatePaste() : self.pasteViaSystemEvents()
             if dispatched, let landedEnd = pasteText.last {
                 // Remember where this paste ended, for the next dictation in the same field.
@@ -343,6 +363,7 @@ class CursorPaster {
                                                lastCharacter: landedEnd, at: Date())
             }
             if dispatched {
+                onDispatched?(receipt)
                 if let savedContents {
                     self.scheduleClipboardRestore(pasteboard, from: savedContents, ownedCount: ownedChangeCount,
                                                   delay: self.clipboardRestoreDelay)
@@ -354,7 +375,12 @@ class CursorPaster {
                     mayType: { [weak self] in
                         self?.submissionGeneration == submissionID && mayDeliver?() != false
                             && targetAppStillActive(preparedFor: liveTarget.bundleId)
-                    }, onVerdict: { onReadback?(originalFieldMatches ? $0 : .unknown) }, onFailure: { [weak self] in
+                    }, onVerdict: { [weak self] verdict in
+                        if verdict == .notLanded, self?.submissionGeneration == submissionID { self?.recentPaste = nil }
+                        onReadback?(originalFieldMatches ? verdict : .unknown)
+                    }, onFailure: { [weak self] in
+                        // Cancelled or expired deliveries must not overwrite a newer clipboard.
+                        guard self?.submissionGeneration == submissionID, mayDeliver?() != false else { return }
                         // The restore may already have put the old clipboard back: copy the text again.
                         self?.pendingClipboardRestore = nil
                         Self.keepForManualPaste(text, pasteboard: pasteboard)
@@ -402,7 +428,7 @@ class CursorPaster {
     /// (it is also in history). This wins over keeping the user's old clipboard.
     @discardableResult
     static func keepForManualPaste(_ text: String, pasteboard: NSPasteboard = .general) -> Bool {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || DictationLayout.isBreakOnly(text) else { return false }
         if pasteboard.string(forType: .string) == text { return true }
         return DictationPasteboard.write(text, to: pasteboard)
     }
@@ -462,94 +488,28 @@ class CursorPaster {
     /// were glued together ("ASAP!The term") in exactly that case.
     static func resolvedInsertion(_ text: String, field: String?, selection: NSRange?,
                                   preFormatted: Bool, bundleID: String?, rememberedEnd: Character? = nil) -> String {
-        let code = bundleID.map(isCodeEditor(bundleID:)) ?? false
-        let messaging = bundleID.map(isMessagingApp(bundleID:)) ?? false
-        func withoutFinalPeriod(_ value: String) -> String {
-            value.hasSuffix(".") && !value.hasSuffix("..") ? String(value.dropLast()) : value
-        }
-        let edit = field.flatMap { value in
-            selection.flatMap { Range($0, in: value) } ?? (value.isEmpty ? value.startIndex..<value.endIndex : nil)
-        }
-        guard let field, let edit else {
-            let base = !preFormatted && (code || messaging) ? withoutFinalPeriod(text) : text
-            return boundarySpaced(base, after: rememberedEnd)
-        }
-
-        let before = field[..<edit.lowerBound]
-        let after = field[edit.upperBound...]
-        let selected = field[edit]
-        let left = before.last
-        let right = after.first
-        let opening = "([{“‘«‹"
-        let closing = ".,!?;:%)]}”’»›"
-        let connector = "-_@/\\"
-        let sentenceEnd = ".!?…"
-
-        // Horizontal padding from the model may describe an earlier field.
-        // Leave intentional line breaks and tab indentation in the payload.
-        func isSpace(_ character: Character) -> Bool { character.isWhitespace && !character.isNewline && character != "\t" }
-        let leadingTrimmed = text.drop(while: isSpace)
-        var body = String(leadingTrimmed.reversed().drop(while: isSpace).reversed())
-        guard !body.isEmpty else { return body }
-
-        func tokenCharacter(_ character: Character?) -> Bool {
-            character.map { $0.isLetter || $0.isNumber || $0 == "_" } ?? false
-        }
-        // Preserve a deliberate insertion or partial selection inside an existing word.
-        let joinsLeft = tokenCharacter(left) && tokenCharacter(selected.first ?? right)
-        let joinsRight = tokenCharacter(right) && tokenCharacter(selected.last ?? left)
-        let lastMeaningful = before.reversed().drop(while: { isSpace($0) || "”’'\")]}»›".contains($0) }).first
-        let continuesSentence = lastMeaningful.map { !$0.isNewline && !sentenceEnd.contains($0) } ?? false
-        if !preFormatted {
-            if messaging || code || continuesSentence { body = withoutFinalPeriod(body) }
-            if edit.isEmpty && !joinsLeft && (continuesSentence || (code && lastMeaningful != nil)),
-               let first = body.first, first.isUppercase {
-                let rest = body.dropFirst()
-                let isI = first == "I" && (rest.first.map { $0.isWhitespace || "'’,.!?".contains($0) } ?? true)
-                let hasInternalCapital = rest.prefix(while: { $0.isLetter }).contains(where: \.isUppercase)
-                if !isI && !hasInternalCapital { body = first.lowercased() + rest }
-            }
-        }
-        guard let first = body.first, let last = body.last else { return body }
-        if right == last, sentenceEnd.contains(last), body.dropLast().last != last {
-            body.removeLast()
-        }
-        guard let actualLast = body.last else { return body }
-        let prefix = left.map {
-            !$0.isWhitespace && !first.isWhitespace && !opening.contains($0) && !closing.contains(first)
-                && !connector.contains($0) && !connector.contains(first) && !joinsLeft
-                && !(code && $0 == ".")
-        } ?? false
-        let suffix = right.map {
-            !$0.isWhitespace && !actualLast.isWhitespace && !opening.contains(actualLast) && !closing.contains($0)
-                && !connector.contains(actualLast) && !connector.contains($0) && !joinsRight
-        } ?? false
-        return (prefix ? " " : "") + body + (suffix ? " " : "")
+        SmartInsertion.resolve(text, field: field, selection: selection, preFormatted: preFormatted,
+                               code: bundleID.map(isCodeEditor(bundleID:)) ?? false,
+                               messaging: bundleID.map(isMessagingApp(bundleID:)) ?? false,
+                               rememberedEnd: rememberedEnd)
     }
 
-    /// Pure rule for inserting after text Flow cannot read. A single space goes between an
-    /// ending of sentence punctuation (. ! ? : ;) or a letter/digit and new text that starts with a
-    /// letter or digit. No space if either side is already whitespace or the new text starts with punctuation.
     static func boundarySpaced(_ text: String, after previousEnd: Character?) -> String {
-        guard let previousEnd, let first = text.first else { return text }
-        let endsWordOrSentence = previousEnd.isLetter || previousEnd.isNumber || ".!?:;".contains(previousEnd)
-        guard endsWordOrSentence, !previousEnd.isWhitespace, !first.isWhitespace, !first.isPunctuation, !first.isSymbol else {
-            return text
-        }
-        return " " + text
+        SmartInsertion.boundarySpaced(text, after: previousEnd)
     }
 
     /// The remembered paste applies only within this window, in the same app.
     static let rememberedPasteWindow: TimeInterval = 60
 
-    /// A known identical field always counts. Otherwise (Electron re-wraps the editor, or no readback)
-    /// the same window title counts, but only if no click or app switch happened since the paste.
+    /// Field identity does not prove the caret stayed put. Any external key, click or app
+    /// switch invalidates this fallback, even if Accessibility still reports the same field.
     static func rememberedPasteApplies(recordedBundle: String?, currentBundle: String?, age: TimeInterval,
                                        sameField: Bool?, sameWindowTitle: Bool?,
                                        interactionSincePaste: Bool) -> Bool {
-        guard let recordedBundle, recordedBundle == currentBundle, age >= 0, age <= rememberedPasteWindow else { return false }
+        guard let recordedBundle, recordedBundle == currentBundle, age >= 0, age <= rememberedPasteWindow,
+              !interactionSincePaste else { return false }
         if sameField == true { return true }
-        return !interactionSincePaste && sameWindowTitle == true
+        return sameWindowTitle == true
     }
 
     // MARK: - Messaging app detection
@@ -765,6 +725,7 @@ class CursorPaster {
         guard let keyDown, let keyUp else { return false }
         keyDown.flags = .maskCommand
         keyUp.flags   = .maskCommand
+        NotificationCenter.default.post(name: .flowWillInsertText, object: nil)
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
         return true
@@ -776,6 +737,7 @@ class CursorPaster {
     /// Falls back to AppleScript when Accessibility isn't granted.
     /// Virtual key 6 = Z.
     func undoLastPaste() {
+        NotificationCenter.default.post(name: .flowWillInsertText, object: nil)
         if isAccessibilityTrusted() {
             let source = makeIsolatedEventSource()
             let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 6, keyDown: true)
@@ -822,6 +784,7 @@ class CursorPaster {
             return false
         }
         var error: NSDictionary?
+        NotificationCenter.default.post(name: .flowWillInsertText, object: nil)
         appleScript.executeAndReturnError(&error)
         if let error = error {
             print("[VOICE-PASTE] result: failed reason=applescript error=\(error)")
@@ -855,6 +818,42 @@ class CursorPaster {
     struct PasteTargetSnapshot {
         let bundleId: String?
         let focusedElement: AXUIElement?
+    }
+
+    /// The exact edit sent to the live field, including boundary spaces. A receipt
+    /// describes dispatch only; callers must also require a verified readback.
+    struct PasteReceipt {
+        let target: PasteTargetSnapshot
+        let before: PasteFieldLook
+        let insertedText: String
+        let replacedRange: NSRange?
+        let editSerial: Int
+
+        var insertedRange: NSRange? {
+            PasteReadback.insertionRange(before: before, inserted: insertedText, replacing: replacedRange)
+        }
+    }
+
+    /// Some web editors expose a bounded StringForRange while withholding the
+    /// whole field value. Use that only for spacing; readback remains unknown.
+    private func insertionContext(in target: PasteTargetSnapshot, value: String?, selection: NSRange?)
+        -> (value: String?, selection: NSRange?) {
+        if value != nil { return (value, selection) }
+        guard let element = target.focusedElement, let selection,
+              !isSecureField(element),
+              let count = AccessibilityBudget.copyAttribute(element, kAXNumberOfCharactersAttribute, app: target.bundleId) as? NSNumber,
+              let contextRange = SmartInsertion.contextRange(selection: selection, fieldLength: count.intValue) else {
+            return (nil, nil)
+        }
+        var range = CFRange(location: contextRange.location, length: contextRange.length)
+        guard let axRange = AXValueCreate(.cfRange, &range) else { return (nil, nil) }
+        var result: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString,
+                  axRange, &result) == .success,
+              let context = result as? String, context.utf16.count == contextRange.length else { return (nil, nil) }
+        let localSelection = NSRange(location: selection.location - contextRange.location, length: selection.length)
+        guard Range(localSelection, in: context) != nil else { return (nil, nil) }
+        return (context, localSelection)
     }
 
     /// Public snapshot of the current paste target. Call this right after a
@@ -930,6 +929,22 @@ class CursorPaster {
                                    firstVerdict: verdict, editableAtPaste: editableAtPaste, mayType: mayType,
                                    onVerdict: onVerdict, onFailure: onFailure)
             case .typeOnce:
+                // Permission/focus reads may have taken time. Revalidate the exact
+                // unchanged field immediately before the only fallback insertion.
+                let typingTarget = self.currentPasteTargetSnapshot()
+                guard Self.samePasteField(expected, typingTarget), !self.isSecureField(typingTarget.focusedElement) else {
+                    onVerdict?(.unknown)
+                    onFailure()
+                    return
+                }
+                let typingLook = PasteFieldLook(value: self.currentText(of: typingTarget),
+                    caret: self.selectedRange(of: typingTarget), sameTarget: true)
+                guard PasteReadback.verdict(before: before, after: typingLook, inserted: inserted, replacing: range) == .notLanded,
+                      mayType() else {
+                    onVerdict?(.unknown)
+                    onFailure()
+                    return
+                }
                 // Typing does not write the clipboard, so the restore timer is not affected.
                 let typed = self.typeText(inserted)
                 print("[VOICE-PASTE] readback: not landed after two looks; typed once ok=\(typed)")
@@ -956,6 +971,7 @@ class CursorPaster {
     /// after a paste that clearly did not land. Returns false if an event could not be made.
     private func typeText(_ text: String) -> Bool {
         let source = makeIsolatedEventSource()
+        NotificationCenter.default.post(name: .flowWillInsertText, object: nil)
         for chunk in PasteReadback.typingChunks(text) {
             let units = Array(chunk.utf16)
             guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
@@ -1391,6 +1407,7 @@ class CursorPaster {
         }
         vDown.flags = .maskCommand
         vUp.flags   = .maskCommand
+        NotificationCenter.default.post(name: .flowWillInsertText, object: nil)
         vDown.post(tap: .cghidEventTap)
         vUp.post(tap: .cghidEventTap)
 

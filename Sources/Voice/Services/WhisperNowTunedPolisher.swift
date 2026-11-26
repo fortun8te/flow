@@ -225,7 +225,9 @@ actor WhisperNowTunedPolisher {
     private var runningSelectedTextContract = false
     private var runningCleanupContract = false
     private var runningQuickAdapter = false
-    private var starting: Task<Bool, Never>?
+    private var starting: SharedModelTask<Bool>?
+    private var startGeneration: UUID?
+    private var serverReady = false
     private var inFlight = false
     private var idleStop: Task<Void, Never>?
     // Stay warm: a cold start made Opt+1 wait 6-8 s and then give up (21 Nov 2026).
@@ -240,13 +242,14 @@ actor WhisperNowTunedPolisher {
         return URLSession(configuration: configuration)
     }()
 
-    var isRunning: Bool { process?.isRunning == true && port > 0 && starting == nil }
+    var isRunning: Bool { serverReady && process?.isRunning == true && port > 0 }
 
     // MARK: Lifecycle
 
     /// Starts the server if it is not running and waits until it answers. Safe to call repeatedly.
     @discardableResult
     func prepare() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if isRunning {
             if runningModelURL == Self.modelFile(), runningChatProfile == Self.activeChatProfile,
                runningAdapterURLs == Self.servedAdapterFiles {
@@ -256,7 +259,11 @@ actor WhisperNowTunedPolisher {
             guard !inFlight else { return false }
             shutdown()
         }
-        if let starting { return await starting.value }
+        if let starting {
+            let ok = (try? await starting.value) == true
+            return ok && !Task.isCancelled && isRunning && runningModelURL == Self.modelFile()
+                && runningChatProfile == Self.activeChatProfile && runningAdapterURLs == Self.servedAdapterFiles
+        }
         guard Self.isInstalled else { return false }
         guard !Self.usesT2Contracts || Self.supportsCleanupControls || Self.supportsSelectedTextPolish else { return false }
         // Back-off: a server that died three times in five minutes, or failed to start in the last
@@ -264,18 +271,40 @@ actor WhisperNowTunedPolisher {
         recentDeaths = recentDeaths.filter { Date().timeIntervalSince($0) < 300 }
         if recentDeaths.count >= 3 { return false }
         if let lastStartFailure, Date().timeIntervalSince(lastStartFailure) < 60 { return false }
-        let task = Task { await self.start() }
+        let generation = UUID()
+        startGeneration = generation
+        let task = SharedModelTask<Bool> { [weak self] in
+            guard let self else { return false }
+            let ok = await self.start(generation: generation)
+            return await self.finishStart(generation: generation, succeeded: ok)
+        }
         starting = task
-        let ok = await task.value
+        let ok = (try? await task.value) == true
+        return ok && !Task.isCancelled && isRunning && runningModelURL == Self.modelFile()
+            && runningChatProfile == Self.activeChatProfile && runningAdapterURLs == Self.servedAdapterFiles
+    }
+
+    private func finishStart(generation: UUID, succeeded: Bool) -> Bool {
+        guard startGeneration == generation else { return false }
         starting = nil
-        if ok { scheduleIdleStop() }
-        else { lastStartFailure = Date() }
-        return ok
+        startGeneration = nil
+        let ready = succeeded && !Task.isCancelled && process?.isRunning == true && port > 0
+        serverReady = ready
+        // Publish readiness inside the shared operation, before any waiting
+        // prepare caller resumes. No caller owns completion of a shared load.
+        if ready { scheduleIdleStop() }
+        else {
+            stopServer()
+            lastStartFailure = Date()
+        }
+        return ready
     }
 
     /// Starts the server in the background without waiting (used when a dictation finds it cold).
     func prepareInBackground() {
-        guard !isRunning, starting == nil else { return }
+        guard !Task.isCancelled, starting == nil else { return }
+        if isRunning, runningModelURL == Self.modelFile(), runningChatProfile == Self.activeChatProfile,
+           runningAdapterURLs == Self.servedAdapterFiles { return }
         Task { await self.prepare() }
     }
 
@@ -296,8 +325,16 @@ actor WhisperNowTunedPolisher {
     }
 
     func shutdown() {
+        starting?.cancel()
+        starting = nil
+        startGeneration = nil
+        stopServer()
+    }
+
+    private func stopServer() {
         idleStop?.cancel()
         idleStop = nil
+        serverReady = false
         if let process, process.isRunning { process.terminate() }
         process = nil
         port = 0
@@ -310,10 +347,11 @@ actor WhisperNowTunedPolisher {
         runningQuickAdapter = false
     }
 
-    private func start() async -> Bool {
-        guard let model = Self.modelFile(), let binary = Self.serverBinary(),
+    private func start(generation: UUID) async -> Bool {
+        guard !Task.isCancelled, startGeneration == generation,
+              let model = Self.modelFile(), let binary = Self.serverBinary(),
               let chatProfile = Self.activeChatProfile else { return false }
-        shutdown()
+        stopServer()
         guard let freePort = Self.freeLocalPort() else { return false }
         let isT4 = model.deletingLastPathComponent() == Self.t4Directory
         let logURL = model.deletingLastPathComponent().appendingPathComponent("server.log")
@@ -355,12 +393,18 @@ actor WhisperNowTunedPolisher {
         self.runningCleanupContract = Self.supportsCleanupControls
         self.runningQuickAdapter = quickAdapterLoaded
         let began = Date()
-        while Date().timeIntervalSince(began) < 90 {
-            guard process.isRunning else { break }
-            if await health(port: freePort) {
-                guard await templateMatches(port: freePort, profile: chatProfile) else {
+        let deadline = ContinuousClock.now + .seconds(90)
+        while ContinuousClock.now < deadline {
+            guard !Task.isCancelled, startGeneration == generation,
+                  self.process === process, process.isRunning else { return false }
+            let healthy = await health(port: freePort)
+            guard !Task.isCancelled, startGeneration == generation, self.process === process else { return false }
+            if healthy {
+                let matches = await templateMatches(port: freePort, profile: chatProfile)
+                guard !Task.isCancelled, startGeneration == generation, self.process === process else { return false }
+                guard matches else {
                     Telemetry.log("cleanup.whispernow_server", properties: ["event": "template_mismatch"])
-                    shutdown(); return false
+                    return false
                 }
                 Telemetry.log("cleanup.whispernow_server", properties: [
                     "event": "ready", "ms": Int(Date().timeIntervalSince(began) * 1000), "model": model.lastPathComponent])
@@ -377,26 +421,32 @@ actor WhisperNowTunedPolisher {
                 }
                 if isT4 {
                     for adapter in adapters {
+                        guard !Task.isCancelled, startGeneration == generation, self.process === process else { return false }
                         _ = try? await complete(warmup, port: freePort, budgetText: "okay cool", adapter: adapter)
                     }
                 } else {
                     _ = try? await complete(warmup, port: freePort, budgetText: "okay cool")
                 }
+                guard !Task.isCancelled, startGeneration == generation, self.process === process else { return false }
                 if quickAdapterLoaded && UserDefaults.standard.bool(forKey: HotkeyService.quickPolishEnabledKey) {
                     _ = try? await complete("[Polish: light]\nokay cool", port: freePort,
                                             budgetText: "okay cool", quickPolish: true)
                 }
-                return true
+                return startGeneration == generation && self.process === process && process.isRunning && !Task.isCancelled
             }
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return false }
         }
         Telemetry.log("cleanup.whispernow_server", properties: ["event": "start_failed"])
-        shutdown()
         return false
     }
 
     private func noteTermination(_ terminated: Process? = nil) {
         guard let process, !process.isRunning, terminated == nil || process === terminated else { return }
+        if startGeneration != nil { lastStartFailure = Date() }
+        starting?.cancel()
+        starting = nil
+        startGeneration = nil
+        serverReady = false
         idleStop?.cancel()
         idleStop = nil
         recentDeaths.append(Date())
@@ -542,6 +592,7 @@ actor WhisperNowTunedPolisher {
 
     private func complete(_ input: String, port: Int, budgetText: String? = nil,
                           quickPolish: Bool = false, adapter: DictationAdapter? = nil) async throws -> Reply {
+        guard !Task.isCancelled else { throw Failure.cancelled }
         guard let profile = runningChatProfile, profile == Self.activeChatProfile,
               runningModelURL == Self.modelFile() else { throw Failure.templateMismatch }
         var body = profile.completionBody(userContent: input, sourceText: budgetText ?? input)
@@ -565,6 +616,8 @@ actor WhisperNowTunedPolisher {
             if (error as? URLError)?.code == .timedOut { throw Failure.timeout }
             throw Failure.httpError
         }
+        guard !Task.isCancelled else { throw Failure.cancelled }
+        guard self.port == port, self.process?.isRunning == true else { throw Failure.notReady }
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw Failure.httpError }
         return try Self.parseReply(data)
     }

@@ -34,6 +34,38 @@ final class RealWordFixerTests: XCTestCase {
         }
     }
 
+    func testAcceptedWordLocksMoveWithLengthChangingEdits() {
+        let source = "🙂 their ready, their file"
+        let ns = source as NSString
+        let first = ns.range(of: "their")
+        let second = ns.range(of: "their", options: .backwards)
+        let change = LocalWordEdit(start: first.location, end: first.upperBound,
+                                   original: "their", replacement: "they're")
+        let applied = LocalWordEdits.apply(source, changes: [change]) { $0 }
+        XCTAssertEqual(applied.text, "🙂 they're ready, their file")
+        let firstLock = LocalWordEdits.locks(after: applied.changes)
+        XCTAssertEqual(firstLock, [NSRange(location: first.location, length: 7)])
+        let later = NSRange(location: second.location + 2, length: second.length)
+        XCTAssertEqual(NSIntersectionRange(firstLock[0], later).length, 0)
+
+        // A second pass edits an earlier word and shifts an existing lock.
+        let before = LocalWordEdit(start: 0, end: 2, original: "🙂", replacement: "hello")
+        let rebased = LocalWordEdits.locks(after: [before], preserving: firstLock)
+        XCTAssertEqual(rebased, [NSRange(location: 0, length: 5),
+                                 NSRange(location: first.location + 3, length: 7)])
+    }
+
+    func testStaleAndOverlappingWordEditsAreNotApplied() {
+        let source = "their file"
+        let good = LocalWordEdit(start: 0, end: 5, original: "their", replacement: "there")
+        let stale = LocalWordEdit(start: 6, end: 10, original: "wrong", replacement: "note")
+        let outside = LocalWordEdit(start: 20, end: 24, original: "file", replacement: "note")
+        let overlap = LocalWordEdit(start: 1, end: 4, original: "hei", replacement: "hey")
+        let result = LocalWordEdits.apply(source, changes: [outside, stale, overlap, good]) { $0 }
+        XCTAssertEqual(result.text, "there file")
+        XCTAssertEqual(result.changes.count, 1)
+    }
+
     func testMissingWeightsLeaveTextUnchanged() {
         XCTAssertNil(TinyFixModel(directory: URL(fileURLWithPath: "/nonexistent")))
     }

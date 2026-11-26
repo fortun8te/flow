@@ -49,6 +49,20 @@ struct LocalQualityEvaluationSelectionTests {
 
 @MainActor
 struct LocalQualityEvaluationFailureTests {
+    @Test func emptyCleanupDoesNotCountAsACompletedOutput() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source.json")
+        let examples = [["input": "The violet kettle sits on shelf 2", "output": "The violet kettle sits on shelf 2."]]
+        try JSONSerialization.data(withJSONObject: ["schema_version": 1, "examples": examples]).write(to: source)
+        let receiptURL = try await LocalQualityEvaluationHarness.run(datasetURL: source, receiptDirectory: directory) { _ in " \n" }
+        let receipt = try JSONDecoder().decode(LocalQualityEvaluationHarness.Receipt.self, from: Data(contentsOf: receiptURL))
+        #expect(receipt.completedCount == 0)
+        #expect(receipt.rejectedCalls == 1)
+        #expect(receipt.localMetrics.numbers.applicable == 0)
+    }
+
     @Test func failuresAreCountedAndNeverScoredAsOutputs() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

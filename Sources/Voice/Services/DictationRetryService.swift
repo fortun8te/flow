@@ -50,10 +50,15 @@ enum DictationRetryService {
         case .failure(let failure): return .failure(failure)
         }
 
+        let cleanupLevel = CleanupLevel.current
+        let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
+        let useAssistants = cleanupLevel != .none && polishEnabled
+
         // Same patience as "Transcribe now" on a meeting: up to about 10 s.
         var waited = 0
         while !transcription.isReady && waited < 20 {
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            do { try await Task.sleep(nanoseconds: 500_000_000) }
+            catch { return .failure(.transcription("Cancelled")) }
             waited += 1
         }
         guard transcription.isReady else { return .failure(.modelNotReady) }
@@ -64,28 +69,79 @@ enum DictationRetryService {
 
         // The normal cleanup, minus everything that belongs to pasting: no
         // "press enter" command, no target app, no clipboard.
-        let prepared = DictationTextPreparation.prepare(segments: segments, formatter: formatter,
-                                                        pressEnterEnabled: false, autoPaste: false)
+        let usesTunedCleanup = Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue
+        let usesModelTranscript = usesTunedCleanup
+            && (WhisperNowTunedPolisher.usesT2Contracts || WhisperNowTunedPolisher.usesT4)
+        let raw = segments.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let prepared = T2CleanupOptions.preparationTranscript(rawASR: raw, recognizedT2: usesModelTranscript).map { text in
+            let commandText = formatter.config.interpretVoiceCommands
+                ? TextFormatter.interpretLineBreakCommands(text) : text
+            let rejection: DictationTextPreparation.Rejection? = text.isEmpty ? .empty
+                : (DictationTextPreparation.predominantlyNonLatin(text) ? .nonLatin : nil)
+            return DictationTextPreparation.Prepared(rawText: text,
+                command: .init(text: commandText, shouldSubmit: false), rejection: rejection)
+        } ?? DictationTextPreparation.prepare(segments: segments, formatter: formatter,
+                                              pressEnterEnabled: false, autoPaste: false)
         switch prepared.rejection {
         case .empty?: return .failure(.noSpeech)
         case .nonLatin?: return .failure(.notRecognised)
         case nil: break
         }
         let formatted = prepared.command.text
-        let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
-        var finalText = formatted
-        if CleanupLevel.current != .none && polishEnabled {
-            let suspects = Array(Set(segments.compactMap(\.suspectWords).flatMap { $0 }
-                                     + TextFormatter.suspectsForPolish(formatted)))
-            let vocabulary = Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms()))
-            finalText = await Qwen3Polisher.shared.polish(
-                formatted,
-                suspectWords: suspects.isEmpty ? nil : suspects,
-                userVocabulary: vocabulary.isEmpty ? nil : vocabulary,
-                cleanupLevel: CleanupLevel.current.rawValue,
-                personalityStyle: PersonalityStyle.current.rawValue)
+        func finalize(_ candidate: String) -> String {
+            let result = T2CleanupOptions.finalizedTranscript(candidate: candidate, preparedASR: formatted,
+                level: cleanupLevel.rawValue, recognizedT2: usesModelTranscript)
+                .map { DictationLayout.preservingLineBreaks(in: $0, from: formatted) }
+                ?? DictationTextPreparation.finalize(polished: candidate, formatted: formatted)
+            return DictationFinalPass.apply(DictationLayout.restoringBoundaryBreaks(in: result, from: formatted))
         }
-        finalText = DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+        var finalText = formatted
+        if useAssistants && !DictationLayout.isBreakOnly(formatted) {
+            // Wait until the transcript exists: a stand-alone layout command
+            // does not need any text model, including a speculative warmup.
+            RealWordFixer.shared.prewarm()
+            TypoRepair.shared.prewarm()
+            Task(priority: .utility) { await DraftDecisionGate.prewarmIfEnabled() }
+            let asrSuspects = segments.compactMap(\.suspectWords).flatMap { $0 }
+            let suspects = PromptTerms.orderedUnique(asrSuspects, TextFormatter.suspectsForPolish(formatted))
+            let preferred = ProperNounVocabulary.preferredSpellingTerms()
+            let vocabulary = PromptTerms.orderedUnique(preferred, ProperNounVocabulary.current(), CombinedDictionary.terms())
+            let personality = PersonalityStyle.current.rawValue
+            let level = cleanupLevel.rawValue
+            let polishDraft: @Sendable (String, Bool) async -> String = { text, isSection in
+                await Qwen3Polisher.shared.polish(text,
+                    suspectWords: isSection || suspects.isEmpty ? nil : suspects,
+                    userVocabulary: vocabulary.isEmpty ? nil : vocabulary,
+                    cleanupLevel: level, personalityStyle: personality)
+            }
+            if formatted.contains(where: \.isNewline) {
+                let ranges = DictationTextPreparation.cleanupSections(in: formatted)
+                let deadline = ContinuousClock.now + .seconds(DictationDeadline.sectionBudgetSeconds(count: ranges.count))
+                let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline,
+                    review: { original, edited in
+                        await DraftDecisionGate.shouldKeepOriginal(original, edited: edited, deadline: deadline)
+                    }) { section in await polishDraft(section, true) }
+                finalText = result.text
+            } else {
+                finalText = await polishDraft(formatted, false)
+                if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText) { finalText = formatted }
+            }
+            finalText = finalize(finalText)
+            if !DictationLayout.isBreakOnly(finalText) {
+                let preparedText = finalText
+                let repaired = await DictationReferee.background {
+                    let fixed = DictationReferee.dictationPassDetailed(preparedText, isCode: false, vocabulary: vocabulary)
+                    return LowConfidenceRecheck.recheck(fixed.text, suspects: asrSuspects,
+                                                         protectedTerms: vocabulary, protectedRanges: fixed.lockedRanges).text
+                }
+                finalText = ProperNounVocabulary.applyPreferredSpelling(repaired, terms: preferred)
+            }
+        } else {
+            finalText = finalize(finalText)
+        }
+        guard !Task.isCancelled else { return .failure(.transcription("Cancelled")) }
+        guard !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || DictationLayout.isBreakOnly(finalText)
+        else { return .failure(.noSpeech) }
 
         do {
             // Saving also tells Companion that dictations changed (StorageService.onChange).

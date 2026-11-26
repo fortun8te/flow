@@ -60,9 +60,9 @@ The score does not overrule the coverage rule. It is recorded in the trace so th
 
 ## Draft meaning check
 
-`DraftDecisionGate` asks the local `DraftDecisionModel` (a small optional process) whether an edit kept the meaning. It waits at most 150 ms (`timeout`). Only one request is in flight, and no draft is queued. The check is on by default (`voice.draftDecisionModelEnabled`) and is off in privacy mode.
+`DraftDecisionGate` asks the local `DraftDecisionModel` (a small optional process) whether an edit kept the meaning. It waits at most 150 ms (`timeout`). Only one request is in flight, and no draft is queued. The check is on by default (`voice.draftDecisionModelEnabled`) and is off in privacy mode. Capture start warms the worker on every recording path, and a long recording refreshes its idle timer. For sectioned dictations, one guarded section is reviewed while the next is cleaned; the final non-sectioned review uses the same word-scaled deadline as cleanup.
 
-**Why.** It is a second opinion for edits that have already passed the guards. It cannot add latency to a dictation, so it has a strict deadline.
+**Why.** It is a second opinion for edits that have already passed the guards. It has a strict deadline within the shared cleanup budget; its latency benefit or cost must be measured on the actual device.
 
 ## Real-word fixer
 
@@ -92,6 +92,8 @@ The score does not overrule the coverage rule. It is recorded in the trace so th
 
 A late readable miss keeps the recovery path available even if the first read was inconclusive. Flow can retry by typing only after both reads show that the paste failed and the target supports typed fallback.
 
+The baseline field, selected range and post-paste caret must all be valid UTF-16 boundaries. A malformed range is unknown even when the visible field did not change. The paster also rechecks the target, field and caret immediately before typed fallback. A dispatch receipt is delivery metadata; only a verified readback establishes an insertion that correction learning may observe. Verification does not approve the wording for training.
+
 ## Speaker clustering
 
 `SpeakerDiarizer` groups speech turns by voice embedding. Its clustering cut-off is `0.62` (`clusteringThreshold`, `SpeakerDiarizer.swift`).
@@ -103,3 +105,17 @@ Some gates decide, and others only explain. In the dictation path, the content g
 ## What these gates are not
 
 They are not a general quality metric. They catch specific, costly failures: lost numbers, flipped negations, invented names, lost text, and pastes that did not land. Output quality is measured separately, and the evaluation scripts are described in [TRAINING.md](TRAINING.md).
+
+### D1 availability and scheduling
+
+D1 installations are rechecked after a short backoff. Flow accepts the legacy candidate layout or `~/Library/Application Support/Voice/Models/D1/venv/bin/python` with the `d1-2B-mlx8bit` checkpoint directory next to `venv`. The network sandbox is unchanged. A ready, idle D1 may reserve 150 ms from the existing cleanup budget when at least 600 ms remains. Run records distinguish actual decisions from busy, cold, unavailable, invalid, timed-out, cancelled and skipped checks.
+
+### Correction ownership across judges
+
+Accepted TinyFix and sound-alike edits lock their exact UTF-16 occurrences, not every occurrence of the replacement word. Locks move when a later edit changes an earlier word's length. The low-confidence recheck respects those locks and the same dictionary terms; invalid, stale, overlapping and non-finite candidate edits never reach the final text. Completed run records ignore late asynchronous callbacks.
+
+### Candidate evidence and inference bounds
+
+TinyFix and TinyNext-based judges can record bounded original-first candidate lists, raw scores, rule features, margins and actual thresholds in `WordDecisionEvidence`. KEEP decisions are retained as observations alongside applied edits. These are not probabilities or independent labels; the legacy TinyFix `probability` field is an upstream heuristic, not calibrated confidence for Flow speech. Training requires separate review, as specified in [CUSTOM-MODEL-EXPERIMENTS.md](CUSTOM-MODEL-EXPERIMENTS.md).
+
+TinyNext deduplicates contexts using exact UTF-8 bytes, preserving candidate order and byte-distinct Unicode. Missing/nonfinite scores, cancellation, token overflow and pathological token pieces make a context unscorable, so its original stays unchanged. Sound-alike and low-confidence passes reuse language classification within a sentence and validate window settings before slicing. Their acceptance thresholds are unchanged.

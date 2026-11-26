@@ -15,7 +15,8 @@ import Foundation
 /// One recognised word and how sure the recogniser was (the lowest confidence of its pieces).
 struct ASRWordConfidence: Codable, Equatable, Sendable {
     var word: String
-    var confidence: Float
+    /// Missing/invalid recognizer confidence stays unknown, never an invented zero or one.
+    var confidence: Float?
     var start: Double?
     var end: Double?
 }
@@ -38,7 +39,9 @@ struct FlowRunDecision: Codable, Equatable, Sendable {
 }
 
 struct FlowRunRecord: Codable, Equatable, Sendable {
-    static let currentSchema = 1
+    static let currentSchema = 2
+    /// Bump when the interpretation of pipeline outputs or learning evidence changes.
+    static let currentPipeline = 6
 
     var schemaVersion = FlowRunRecord.currentSchema
     /// "dictation", "opt1", or "followup" (a later line about an earlier run).
@@ -49,6 +52,10 @@ struct FlowRunRecord: Codable, Equatable, Sendable {
     var startedAt: Date?
     /// Flow's build.
     var flowBuild: String?
+    var flowVersion: String?
+    /// Present in receipt-built candidates; nil for builds without a source fingerprint.
+    var sourceSHA256: String?
+    var pipelineVersion: Int?
     /// The app the text went to (bundle id).
     var app: String?
     /// Dictation: the raw ASR transcript. Opt+1: the selected text.
@@ -60,6 +67,9 @@ struct FlowRunRecord: Codable, Equatable, Sendable {
     var suspectWords: [String]?
     var stages: [FlowRunStage] = []
     var decisions: [FlowRunDecision] = []
+    /// Bounded scorer observations, including KEEP. Never supervised labels.
+    /// Optional so older run records decode without this field.
+    var wordDecisions: [WordDecisionEvidence]?
     /// Role -> model name or file ("cleanup": "dose1-t4", "opt1": "ExampleModel-1.5-9B-Q4.gguf").
     var models: [String: String] = [:]
     var settings: [String: String] = [:]
@@ -72,8 +82,12 @@ struct FlowRunRecord: Codable, Equatable, Sendable {
     var output: String?
     /// For kind "followup": "undo", "original-shown", "edited", "undo-paste".
     var followup: String?
-    /// For an "edited" follow-up: the field's text after the change.
+    /// For an "edited" follow-up: only the corrected insertion when targetScope is "pasted-span".
+    /// Legacy rows may contain the whole field and are never supervised targets.
     var editedText: String?
+    /// "observed-edit" is a stable field change after keyboard activity, not human approval.
+    var feedbackSource: String?
+    var targetScope: String?
 }
 
 /// Collects one run's stages while it happens. Thread-safe; pass it down or reach it through the
@@ -90,6 +104,9 @@ final class FlowRunCollector: @unchecked Sendable {
     init(kind: String, id: String, app: String?, input: String?, startedAt: Date = Date()) {
         record = FlowRunRecord(kind: kind, id: id, recordedAt: startedAt, startedAt: startedAt,
                                flowBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+                               flowVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                               sourceSHA256: Bundle.main.object(forInfoDictionaryKey: "FlowSourceSHA256") as? String,
+                               pipelineVersion: FlowRunRecord.currentPipeline,
                                app: app, input: input)
         lastText = input
     }
@@ -98,12 +115,16 @@ final class FlowRunCollector: @unchecked Sendable {
     var elapsedMs: Int { Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000) }
 
     func update(_ change: (inout FlowRunRecord) -> Void) {
-        lock.withLock { change(&record) }
+        lock.withLock {
+            guard !written else { return }
+            change(&record)
+        }
     }
 
     /// A stage that produced text. Word changes are taken against the previous text stage.
     func stage(_ name: String, text: String?, ms: Int? = nil, detail: [String: String]? = nil) {
         lock.withLock {
+            guard !written else { return }
             var changes: [String]?
             if let text, let before = lastText, before != text {
                 changes = FlowRunDiff.changes(from: before, to: text)
@@ -115,20 +136,48 @@ final class FlowRunCollector: @unchecked Sendable {
 
     /// The input a following stage is compared with (e.g. after a branch that skipped a stage).
     func setBaseline(_ text: String) {
-        lock.withLock { lastText = text }
+        lock.withLock {
+            guard !written else { return }
+            lastText = text
+        }
     }
 
     func decision(_ stage: String, _ verdict: String, reason: String? = nil) {
-        lock.withLock { record.decisions.append(FlowRunDecision(stage: stage, verdict: verdict, reason: reason)) }
+        lock.withLock {
+            guard !written else { return }
+            record.decisions.append(FlowRunDecision(stage: stage, verdict: verdict, reason: reason))
+        }
+    }
+
+    /// Call before constructing scorer context/features; collection is optional and bounded.
+    var canCollectWordDecision: Bool {
+        guard FlowRunLog.isEnabled else { return false }
+        return lock.withLock { !written && (record.wordDecisions?.count ?? 0) < WordDecisionEvidence.maxPerRun }
+    }
+
+    func wordDecision(_ evidence: WordDecisionEvidence) {
+        guard evidence.isValid, FlowRunLog.isEnabled else { return }
+        lock.withLock {
+            guard !written, FlowRunLog.isEnabled,
+                  (record.wordDecisions?.count ?? 0) < WordDecisionEvidence.maxPerRun else { return }
+            if record.wordDecisions == nil { record.wordDecisions = [] }
+            record.wordDecisions?.append(evidence)
+        }
     }
 
     func model(_ role: String, _ name: String?) {
         guard let name, !name.isEmpty else { return }
-        lock.withLock { record.models[role] = name }
+        lock.withLock {
+            guard !written else { return }
+            record.models[role] = name
+        }
     }
 
     func timing(_ key: String, _ ms: Int) {
-        lock.withLock { record.timingsMs[key] = ms }
+        lock.withLock {
+            guard !written else { return }
+            record.timingsMs[key] = ms
+        }
     }
 
     var snapshot: FlowRunRecord { lock.withLock { record } }
@@ -140,6 +189,7 @@ final class FlowRunCollector: @unchecked Sendable {
         let done: FlowRunRecord? = lock.withLock {
             guard !written else { return nil }
             written = true
+            lastText = nil
             record.outcome = outcome
             record.output = output
             if let fallback { record.fallbackReason = fallback }
@@ -163,6 +213,10 @@ final class FlowRunCollector: @unchecked Sendable {
 
     static func decision(_ stage: String, _ verdict: String, reason: String? = nil) {
         current?.decision(stage, verdict, reason: reason)
+    }
+
+    static func wordDecision(_ evidence: WordDecisionEvidence) {
+        current?.wordDecision(evidence)
     }
 
     static func model(_ role: String, _ name: String?) {
@@ -243,8 +297,10 @@ enum FlowRunLog {
     /// Best effort, off the main thread: a failed write never blocks a paste.
     static func append(_ record: FlowRunRecord, synchronously: Bool = false) {
         // Tests never write into the real store unless they point it at a folder of their own.
-        if directoryOverride == nil, !isEnabled || isRunningTests { return }
-        let work = { write(record) }
+        guard isEnabled else { return }
+        if directoryOverride == nil, isRunningTests { return }
+        let destination = directory
+        let work: @Sendable () -> Void = { write(record, directory: destination) }
         if synchronously { queue.sync(execute: work) } else { queue.async(execute: work) }
     }
 
@@ -252,8 +308,8 @@ enum FlowRunLog {
     static func flush() { queue.sync {} }
 
     /// A copy of `record` with every field that holds typed or spoken text removed: input, output, ASR words,
-    /// suspect words, edited text, and each stage's text, word changes and detail. Timings, models, labels and
-    /// decisions stay. Used for dictation into a secure (password) field, so a password never reaches runs.jsonl.
+    /// suspect words, edited text, and each stage's text, word changes and detail. Decision values can
+    /// include word swaps too, so they are redacted along with free-form fallback reasons and audio paths.
     static func withoutText(_ record: FlowRunRecord) -> FlowRunRecord {
         var clean = record
         clean.input = nil
@@ -261,6 +317,14 @@ enum FlowRunLog {
         clean.editedText = nil
         clean.asrWords = nil
         clean.suspectWords = nil
+        clean.wordDecisions = nil
+        clean.audioPath = nil
+        clean.fallbackReason = nil
+        // Some routes keep auxiliary recognizer transcripts in settings.
+        clean.settings = [:]
+        clean.decisions = record.decisions.map {
+            FlowRunDecision(stage: $0.stage, verdict: "redacted", reason: nil)
+        }
         clean.stages = record.stages.map { stage in
             var scrubbed = stage
             scrubbed.text = nil
@@ -271,28 +335,44 @@ enum FlowRunLog {
         return clean
     }
 
-    private static func write(_ record: FlowRunRecord) {
+    static func sanitizedForStorage(_ record: FlowRunRecord) -> FlowRunRecord {
+        var clean = record
+        if let value = clean.audioSeconds, !value.isFinite || value < 0 { clean.audioSeconds = nil }
+        if let value = clean.asrConfidence, !value.isFinite || !(0...1).contains(value) { clean.asrConfidence = nil }
+        clean.asrWords = clean.asrWords?.map { word in
+            var word = word
+            if let value = word.confidence, !value.isFinite || !(0...1).contains(value) { word.confidence = nil }
+            if let value = word.start, !value.isFinite || value < 0 { word.start = nil }
+            if let value = word.end, !value.isFinite || value < 0 { word.end = nil }
+            if let start = word.start, let end = word.end, end < start { word.start = nil; word.end = nil }
+            return word
+        }
+        if let observations = clean.wordDecisions {
+            clean.wordDecisions = Array(observations.prefix(WordDecisionEvidence.maxPerRun)).filter(\.isValid)
+        }
+        return clean
+    }
+
+    private static func write(_ record: FlowRunRecord, directory: URL) {
+        // A queued write must obey a privacy switch changed after enqueueing.
+        guard isEnabled else { return }
         do {
-            let fm = FileManager.default
-            try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            excludeFromBackup(directory)
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            var line = try encoder.encode(record)
-            line.append(0x0A)
-            rotateIfNeeded(adding: line.count)
-            if fm.fileExists(atPath: fileURL.path) {
-                let handle = try FileHandle(forWritingTo: fileURL)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: line)
-            } else {
-                try line.write(to: fileURL, options: [.atomic])
-                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            let line = try encoder.encode(sanitizedForStorage(record))
+            let file = directory.appendingPathComponent("runs.jsonl")
+            try PrivateDataFile.withExclusiveAccess(to: file) {
+                guard isEnabled else { return }
+                excludeFromBackup(directory)
+                let rotated = try rotateIfNeeded(adding: line.count + 1, directory: directory)
+                try PrivateDataFile.appendLine(line, at: file)
+                if rotated { pruneRotatedFiles(in: directory) }
             }
+        } catch PrivateDataFile.PersistenceError.synchronizationAfterPublishFailed {
+            print("[FLOW-RUNS] run record written; storage synchronization unconfirmed")
         } catch {
-            print("[FLOW-RUNS] could not write a run record: \(error.localizedDescription)")
+            print("[FLOW-RUNS] could not confirm a complete run record; an interrupted tail may remain")
         }
     }
 
@@ -306,24 +386,47 @@ enum FlowRunLog {
 
     /// Moves a full file aside as runs-<timestamp>.jsonl and drops the oldest rotated files past the cap.
     static func rotateIfNeeded(adding bytes: Int = 0) {
+        let target = directory
+        try? PrivateDataFile.withExclusiveAccess(to: target.appendingPathComponent("runs.jsonl")) {
+            if try rotateIfNeeded(adding: bytes, directory: target) { pruneRotatedFiles(in: target) }
+        }
+    }
+
+    private static func rotateIfNeeded(adding bytes: Int, directory: URL) throws -> Bool {
         let fm = FileManager.default
-        guard let size = (try? fm.attributesOfItem(atPath: fileURL.path))?[.size] as? Int,
-              size + bytes > maxFileBytes else { return }
+        let file = directory.appendingPathComponent("runs.jsonl")
+        guard let identity = try PrivateDataFile.identity(at: file), identity.bytes > 0,
+              identity.bytes > Int64(max(0, maxFileBytes)) - Int64(max(0, bytes)) else { return false }
         // runs-<sequence>-<date>.jsonl: the sequence keeps the names in age order.
-        let sequence = (rotatedFiles().compactMap { Int($0.lastPathComponent.dropFirst(5).prefix(6)) }.max() ?? 0) + 1
+        let existing = rotatedFiles(in: directory)
+        let previous = existing.compactMap { Int($0.lastPathComponent.split(separator: "-").dropFirst().first ?? "") }.max() ?? 0
+        guard previous < Int.max else { throw POSIXError(.EOVERFLOW) }
+        let sequence = previous + 1
         let stamp = rotationFormatter.string(from: Date())
-        let target = directory.appendingPathComponent(String(format: "runs-%06d-", sequence) + stamp + ".jsonl")
-        try? fm.moveItem(at: fileURL, to: target)
-        let rotated = rotatedFiles()
-        if rotated.count > keepRotated {
-            for old in rotated.prefix(rotated.count - keepRotated) { try? fm.removeItem(at: old) }
+        let target = directory.appendingPathComponent(String(format: "runs-%06lld-", Int64(sequence)) + stamp + ".jsonl")
+        try fm.moveItem(at: file, to: target)
+        return true
+    }
+
+    private static func pruneRotatedFiles(in directory: URL) {
+        let rotated = rotatedFiles(in: directory)
+        if rotated.count > max(0, keepRotated) {
+            for old in rotated.prefix(rotated.count - max(0, keepRotated)) {
+                do { try FileManager.default.removeItem(at: old) }
+                catch { print("[FLOW-RUNS] could not remove an expired run log; current run was saved") }
+            }
         }
     }
 
     /// Rotated files, oldest first.
     static func rotatedFiles() -> [URL] {
+        rotatedFiles(in: directory)
+    }
+
+    private static func rotatedFiles(in directory: URL) -> [URL] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        return names.filter { $0.hasPrefix("runs-") && $0.hasSuffix(".jsonl") }.sorted()
+        return names.filter { $0.hasPrefix("runs-") && $0.hasSuffix(".jsonl") }
+            .sorted { $0.compare($1, options: .numeric) == .orderedAscending }
             .map { directory.appendingPathComponent($0) }
     }
 
@@ -345,8 +448,10 @@ enum FlowRunLog {
     }
 
     /// A later line about an earlier run (Undo, Original shown, edited after paste).
-    static func followup(id: String, kind: String, followup: String, app: String? = nil, editedText: String? = nil) {
+    static func followup(id: String, kind: String, followup: String, app: String? = nil, editedText: String? = nil,
+                         feedbackSource: String? = nil, targetScope: String? = nil) {
         append(FlowRunRecord(kind: "followup", id: id, recordedAt: Date(), app: app,
-                             input: nil, outcome: kind, followup: followup, editedText: editedText))
+                             input: nil, outcome: kind, followup: followup, editedText: editedText,
+                             feedbackSource: feedbackSource, targetScope: targetScope))
     }
 }

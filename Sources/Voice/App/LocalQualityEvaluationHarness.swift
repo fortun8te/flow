@@ -202,10 +202,13 @@ enum LocalQualityEvaluationHarness {
             let start = DispatchTime.now().uptimeNanoseconds
             do {
                 let result = try await localPolish(example.input)
+                guard !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CallFailure.rejected }
                 inputMetrics.add(reference: example.output, actual: example.input)
                 localMetrics.add(reference: example.output, actual: result)
                 comparison.add(input: example.input, reference: example.output, delivered: result)
                 consecutiveFailures = 0
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 // Errors may include private text, so never print or store them.
                 failedCalls += 1

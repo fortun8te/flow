@@ -37,20 +37,35 @@ enum LowConfidenceRecheck {
 
     /// Production entry point: lexicon and model must already be loaded (or are loaded when `wait`).
     static func recheck(_ text: String, suspects: [String], protectedTerms: [String] = [],
-                        config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
-        guard !suspects.isEmpty,
-              let lexicon = TypoRepair.shared.lexicon(wait: wait),
-              let scorer = TinyNextScorer.shared.ready(wait: wait) else { return (text, []) }
+                        protectedRanges: [NSRange] = [], config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
+        guard !Task.isCancelled else { return (text, []) }
+        guard !suspects.isEmpty else {
+            FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "no-asr-suspects")
+            return (text, [])
+        }
+        guard let lexicon = TypoRepair.shared.lexicon(wait: wait) else {
+            FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "lexicon-" + TypoRepair.shared.readiness)
+            return (text, [])
+        }
+        guard let scorer = TinyNextScorer.shared.ready(wait: wait) else {
+            FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "tinynext-" + TinyNextScorer.shared.readiness)
+            return (text, [])
+        }
         let found = decisions(text, suspects: suspects, protectedTerms: protectedTerms,
-                              lexicon: lexicon, scorer: scorer, config: config)
+                              protectedRanges: protectedRanges, lexicon: lexicon, scorer: scorer, config: config)
+        guard !Task.isCancelled else { return (text, []) }
+        if !found.isEmpty { FlowRunCollector.current?.model("low-confidence", "tinynext") }
+        FlowRunCollector.current?.decision("low-confidence", found.isEmpty ? "no-eligible-candidates" : "scored", reason: "\(found.count) candidates")
         return apply(text, decisions: found, margin: config.margin)
     }
 
     /// Every flagged word with its best alternative and the gain, whatever the margin. Used by the
     /// production path (through `recheck`) and by the offline sweep that picks the margin on dev.
     static func decisions(_ text: String, suspects: [String], protectedTerms: [String] = [],
-                          lexicon: TypoRepair.Lexicon, scorer: TinyNextScorer.Model,
+                          protectedRanges: [NSRange] = [], lexicon: TypoRepair.Lexicon, scorer: TinyNextScorer.Model,
                           config: Config = Config()) -> [Decision] {
+        guard config.before >= 0, config.after >= 0, config.maxFlagged > 0, config.maxCandidates > 0,
+              config.maxDistance >= 0, config.margin.isFinite, !Task.isCancelled else { return [] }
         let ns = text as NSString
         let whole = NSRange(location: 0, length: ns.length)
         let flagged = Set(suspects.map { $0.lowercased() })
@@ -60,9 +75,10 @@ enum LowConfidenceRecheck {
         for (k, v) in TypoRepair.personalDictionary {
             protectedKeys.insert(k.lowercased()); protectedKeys.insert(v.lowercased())
         }
-        let codeRanges = skipPattern.matches(in: text, range: whole).map(\.range)
+        let codeRanges = skipPattern.matches(in: text, range: whole).map(\.range) + protectedRanges
         let sentences = sentencePattern.matches(in: text, range: whole).map(\.range)
         let words = wordPattern.matches(in: text, range: whole).map(\.range)
+        var englishBySentence: [Int: Bool] = [:]
 
         func atSentenceStart(_ r: NSRange) -> Bool {
             var j = r.location - 1
@@ -71,9 +87,52 @@ enum LowConfidenceRecheck {
             return [".", "!", "?", ":", "\n"].contains(ns.substring(with: NSRange(location: j, length: 1)))
         }
 
+        struct Job {
+            let range: NSRange
+            let word: String
+            let candidates: [String]
+            let contexts: [String]
+            let contextRange: NSRange
+        }
         var out: [Decision] = []
+        var jobs: [Job] = []
+        var batchCount = 0
+        var considered = 0
+
+        func flush() {
+            guard !jobs.isEmpty else { return }
+            let contexts = jobs.flatMap(\.contexts)
+            let scores = scorer.score(contexts)
+            if scores.count == contexts.count {
+                var offset = 0
+                for job in jobs {
+                    let span = scores[offset..<(offset + job.candidates.count)]
+                    if span.allSatisfy(\.isFinite),
+                       let best = (1..<job.candidates.count).max(by: { span[offset + $0] < span[offset + $1] }) {
+                        let delta = span[offset + best] - span[offset]
+                        if let collector = FlowRunCollector.current, collector.canCollectWordDecision {
+                            let candidates = job.candidates.enumerated().map { i, word in
+                                WordDecisionEvidence.Candidate(text: word, rawScore: Double(span[offset + i]),
+                                    adjustedScore: Double(span[offset + i] - span[offset]), features: ["asrFlagged": 1])
+                            }
+                            if let evidence = WordDecisionEvidence.make(stage: "low-confidence", mode: "dictation", source: text,
+                                range: job.range, contextRange: job.contextRange, candidates: candidates,
+                                chosenIndex: delta >= config.margin ? best : 0, margin: Double(delta),
+                                threshold: Double(config.margin), modelID: "tinynext-v2") { collector.wordDecision(evidence) }
+                        }
+                        out.append(Decision(start: job.range.location, end: job.range.upperBound,
+                                            original: job.word, replacement: job.candidates[best],
+                                            delta: delta))
+                    }
+                    offset += job.candidates.count
+                }
+            }
+            jobs.removeAll(keepingCapacity: true)
+            batchCount = 0
+        }
+
         for (i, r) in words.enumerated() {
-            if out.count >= config.maxFlagged { break }
+            if considered >= config.maxFlagged || Task.isCancelled { break }
             let word = ns.substring(with: r)
             let key = word.lowercased()
             guard flagged.contains(key), key.count >= 4, key.allSatisfy({ $0 >= "a" && $0 <= "z" }),
@@ -82,8 +141,12 @@ enum LowConfidenceRecheck {
             let starts = atSentenceStart(r)
             if word.first!.isUppercase && !starts { continue }          // a name in the middle of a sentence
             if word.count > 1 && word == word.uppercased() { continue } // an acronym
-            if let s = sentences.first(where: { NSLocationInRange(r.location, $0) }),
-               !RealWordFixer.LanguageGate.sentenceIsEnglish(ns.substring(with: s)) { continue }
+            if let s = sentences.first(where: { NSLocationInRange(r.location, $0) }) {
+                let english = englishBySentence[s.location]
+                    ?? RealWordFixer.LanguageGate.sentenceIsEnglish(ns.substring(with: s))
+                englishBySentence[s.location] = english
+                if !english { continue }
+            }
 
             // Alternatives: lexicon words within the edit budget, cheapest keyboard cost first.
             let budget = key.count <= 5 ? 1 : config.maxDistance
@@ -93,29 +156,29 @@ enum LowConfidenceRecheck {
                 .prefix(config.maxCandidates)
             guard !pool.isEmpty else { continue }
 
-            let lo = words[max(0, i - config.before)].location
-            let hi = words[min(words.count - 1, i + config.after)].upperBound
+            let lo = words[i - min(i, config.before)].location
+            let hi = words[i + min(words.count - 1 - i, config.after)].upperBound
             let left = ns.substring(with: NSRange(location: lo, length: r.location - lo))
             let right = ns.substring(with: NSRange(location: r.upperBound, length: hi - r.upperBound))
             let candidates = [word] + pool.map { alt -> String in
                 starts && word.first!.isUppercase ? alt.prefix(1).uppercased() + alt.dropFirst() : alt
             }
-            let scores = scorer.score(candidates.map { left + $0 + right })
-            guard let bestIndex = (1..<candidates.count).max(by: { scores[$0] < scores[$1] }) else { continue }
-            out.append(Decision(start: r.location, end: r.upperBound, original: word,
-                                replacement: candidates[bestIndex], delta: scores[bestIndex] - scores[0]))
+            // Bound temporary tensors; TinyNext runs these contexts together.
+            if batchCount + candidates.count > 32 { flush() }
+            jobs.append(Job(range: r, word: word, candidates: candidates,
+                            contexts: candidates.map { left + $0 + right }, contextRange: NSRange(location: lo, length: hi - lo)))
+            batchCount += candidates.count
+            considered += 1
         }
+        if !Task.isCancelled { flush() }
         return out
     }
 
     /// Applies the decisions whose gain clears `margin`, right to left so offsets stay valid.
     static func apply(_ text: String, decisions: [Decision], margin: Float) -> (text: String, changes: [Decision]) {
-        let picked = decisions.filter { $0.delta >= margin && $0.replacement != $0.original }
-        guard !picked.isEmpty else { return (text, []) }
-        let mutable = NSMutableString(string: text)
-        for d in picked.sorted(by: { $0.start > $1.start }) {
-            mutable.replaceCharacters(in: NSRange(location: d.start, length: d.end - d.start), with: d.replacement)
+        let picked = decisions.filter { $0.delta.isFinite && $0.delta >= margin }
+        return LocalWordEdits.apply(text, changes: picked) {
+            LocalWordEdit(start: $0.start, end: $0.end, original: $0.original, replacement: $0.replacement)
         }
-        return (mutable as String, picked.sorted { $0.start < $1.start })
     }
 }

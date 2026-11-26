@@ -30,6 +30,13 @@ final class DictationLayoutTests: XCTestCase {
         XCTAssertEqual(DictationParagraphs.format(input), input)
     }
 
+    func testShortTopicShiftDoesNotIsolateATinyFirstParagraph() {
+        let input = "Done. On another note, please check the blue gate near the old barn before you leave for the station and bring the spare key back tomorrow."
+        XCTAssertGreaterThanOrEqual(input.split(whereSeparator: \.isWhitespace).count, 25)
+        XCTAssertLessThan(input.split(whereSeparator: \.isWhitespace).count, 40)
+        XCTAssertEqual(DictationParagraphs.formatDictation(input), input)
+    }
+
     func testProseAndExistingLayoutAreKept() {
         let passages = [
             "Item number one is at the back and number two is on the shelf.",
@@ -87,6 +94,22 @@ final class DictationLayoutTests: XCTestCase {
             + "~~~\nThree things: a, b and c.\n~~~\n"
             + "   Three things: a, b and c."
         XCTAssertEqual(DictationParagraphs.formatDictation(structured), structured)
+    }
+
+    func testShorterInnerFencesDoNotExposeCodeToListFormatting() {
+        let literal = "First, keep this literal. Second, keep this literal too."
+        for (opening, inner, closing) in [("````markdown", "```", "````"), ("~~~~text", "~~~", "~~~~")] {
+            let source = [opening, inner, literal, inner, closing].joined(separator: "\n")
+            XCTAssertEqual(DictationParagraphs.formatDictation(source), source)
+        }
+    }
+
+    func testFenceCloserMustHaveNoTrailingContentAndRealCloserRestoresLayout() {
+        let literal = "First, keep this literal. Second, keep this literal too."
+        let fenced = ["```text", "```still-code", literal, "````   "].joined(separator: "\n")
+        let outside = "First, check the gate. Second, call the station."
+        XCTAssertEqual(DictationParagraphs.formatDictation(fenced + "\n" + outside),
+                       fenced + "\n1. Check the gate.\n2. Call the station.")
     }
 
     func testCountedListsWithoutOxfordCommaKeepNamesNumbersAndLineBreaks() {

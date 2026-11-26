@@ -2,7 +2,7 @@ import Foundation
 
 /// Layout for an Opt+1 result (22 Nov 2026: "it still really doesn't do proper line breaks").
 ///
-/// - Text he laid out himself (any line break in the selection) keeps exactly that layout.
+/// - Existing structured lines keep their layout; independent plain prose lines can still be laid out.
 /// - One block of 40+ words becomes short paragraphs, and a spoken or typed enumeration ("First, ...
 ///   Second, ...") becomes a lead-in line and one item per line, with the same rules as dictation
 ///   (DictationParagraphs). Under 25 words it always stays one line.
@@ -11,29 +11,28 @@ import Foundation
 /// Deterministic and cheap (no model call): a few regex passes over the edited text.
 enum OptOneLayout {
     static func apply(source: String, edited: String) -> String {
-        guard !source.contains(where: \.isNewline), !edited.contains(where: \.isNewline) else { return edited }
-        guard !looksLikeCode(edited) else { return edited }
-        let laidOut = DictationParagraphs.formatDictation(edited)
-        // Only line breaks and list markers may change: the words must be the same.
-        return sameWords(edited, laidOut) ? laidOut : edited
+        guard !looksLikeCode(source), !looksLikeCode(edited) else { return edited }
+        // The deterministic formatter leaves existing list lines, indentation
+        // and fenced blocks alone. It can still lay out each long prose line.
+        return DictationParagraphs.formatDictation(edited)
     }
 
     static func looksLikeCode(_ text: String) -> Bool {
         if text.contains("`") || text.contains("{") || text.contains("}") || text.contains("</") || text.contains("=>") { return true }
-        let semicolons = text.filter { $0 == ";" }.count
-        return semicolons >= 2
+        // Semicolons in ordinary enumerations do not make a message code.
+        // Require actual syntax cues before opting out of prose layout.
+        return text.range(of: #"(?m)^\s*(?:let|var|const|func|def|class|struct|import|return)\s+[^\n]*[;=()]"#,
+                          options: .regularExpression) != nil
     }
 
-    /// Same words in the same order, ignoring list markers ("1.", "-") and spoken ordinals the list replaced.
+    /// Only the exact deterministic layout, or a pure case/whitespace change,
+    /// may disregard enumeration markers. Do not erase all numbers or ordinary
+    /// words such as "one" and "and" when comparing arbitrary drafts.
     static func sameWords(_ a: String, _ b: String) -> Bool {
-        let markers: Set<String> = ["first", "firstly", "second", "secondly", "third", "thirdly", "fourth", "fifth",
-                                    "sixth", "seventh", "eighth", "ninth", "lastly", "finally", "number", "one", "two",
-                                    "three", "four", "five", "six", "seven", "eight", "nine", "and", "of", "all"]
-        func words(_ s: String) -> [String] {
-            s.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "’" })
-                .map(String.init).filter { Int($0) == nil }
+        if a == b { return true }
+        func words(_ text: String) -> [String] {
+            text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "’" }).map(String.init)
         }
-        let x = words(a).filter { !markers.contains($0) }, y = words(b).filter { !markers.contains($0) }
-        return x == y
+        return words(a) == words(b) || (!looksLikeCode(a) && DictationParagraphs.formatDictation(a) == b)
     }
 }

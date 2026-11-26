@@ -683,276 +683,6 @@ enum MeetingsLoadState: Equatable {
     case error(String)
 }
 
-/// Persisted history of the last dictations. Capped at 100 (see
-/// `RecentDictations.limit`). Lives here (not in a service) because it's
-/// UI-shaped state for the menu.
-///
-/// `text` is the polished (final) version that was actually pasted at the cursor.
-/// `rawText` is the pre-polish formatted version (optional for backward compat —
-/// older persisted entries didn't capture it). When both are present the UI can
-/// show a before/after compare.
-struct RecentDictation: Codable, Identifiable {
-    let text: String
-    let timestamp: Date
-    /// Pre-polish formatted text. Optional so we don't break decoding of older
-    /// entries written before this field existed.
-    var rawText: String? = nil
-    /// Bundle ID of the app text was pasted into (e.g. "com.tinyspeck.slackmacgap").
-    var pasteTargetBundleID: String? = nil
-    /// Milliseconds the Qwen3 polish stage took. Nil if polish was skipped/disabled.
-    var polishMs: Int? = nil
-    /// Raw transcript from Granite 4.0 1B (second ASR), captured at the moment
-    /// of dictation. Optional for backward compat with older entries.
-    var graniteText: String? = nil
-    /// Raw transcript from Moonshine Tiny (third ASR), captured at the moment
-    /// of dictation. Optional for backward compat with older entries.
-    var moonshineText: String? = nil
-    /// Raw Parakeet ASR before TextFormatter ran — the actual speech recognizer output.
-    /// Stored to let the pipeline view show all 3 stages: ASR → Formatter → Polish.
-    var parakeetRawText: String? = nil
-    /// Low-confidence words flagged by Parakeet's per-token confidence scoring.
-    /// Passed to Qwen3 as hints; shown in the pipeline view.
-    var parakeetSuspects: [String]? = nil
-    /// Recording duration in seconds. Optional for back-compat with older entries
-    /// captured before this field existed. Used by the BigMenu stats row to
-    /// compute words-per-minute over recent dictations.
-    var durationSeconds: Int? = nil
-    /// Number of spoken punctuation/formatting commands the TextFormatter
-    /// converted to characters (period, comma, new line, exclamation, etc.).
-    /// Surfaced as "fixes made by voice" in the BigMenu stats row.
-    // NOTE: BigMenuWindow's computeStats() should sum `polishFixCount` (not
-    // `voiceCommandCount`) for the "fixes by voice" stat card. Keep this field
-    // around for back-compat but the UI now prefers polishFixCount.
-    var voiceCommandCount: Int? = nil
-    /// Number of fix-events the polish stage applied (spelling/capitalization/grammar/filler).
-    /// Computed by diffing raw → polished at finishRecording time.
-    var polishFixCount: Int? = nil
-    /// Cleanup level the polish stage was running on when this dictation was captured.
-    /// Optional for back-compat with older entries. Display value: "None" / "Light" / "Medium" / "High".
-    var cleanupLevelUsed: String? = nil
-    /// Personality preset in effect when the polish ran. "Neutral" / "Formal" / "Casual" / "Excited".
-    var personalityStyleUsed: String? = nil
-    /// Engine that actually polished this dictation. Tagged by Qwen3Polisher
-    /// during polish so the history view can show "Cloud (Qwen 235B)" vs
-    /// "Local (Qwen3 4B)". Optional for back-compat with older entries.
-    /// Format: "cloud:qwen-3-235b" / "local:qwen3-4b" / "local:qwen3-1.7b" / "rules-only"
-    var polishEngine: String? = nil
-    /// True when this dictation was CANCELLED rather than committed. Cancelled
-    /// dictations are retained (audio kept on disk, transcript saved) but were
-    /// never pasted at the cursor and were not fully polished. Optional /
-    /// defaults false for back-compat with older entries.
-    var cancelled: Bool = false
-    /// On-disk path to the retained .caf audio for this dictation. Populated for
-    /// cancelled dictations so the user can recover / re-process the recording
-    /// from History. Optional for back-compat with older entries (committed
-    /// dictations don't set this — their audio is referenced via the Meeting row).
-    var audioFilePath: String? = nil
-    var deletedAt: Date? = nil
-    var id: String { "\(timestamp.timeIntervalSince1970)" }
-
-    /// True when raw differs meaningfully from polished — i.e. polish actually
-    /// changed something. Used by the UI to decide whether to show a compare
-    /// affordance.
-    var hasPolishDiff: Bool {
-        guard let raw = rawText else { return false }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            != text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// True when we have a raw transcript to show, regardless of whether
-    /// polish changed anything. Used to enable the "show raw" affordance
-    /// on every entry that has the pre-polish text available.
-    var hasRawText: Bool {
-        guard let raw = rawText else { return false }
-        return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-}
-
-fileprivate extension String {
-    var nonEmptyOrNil: String? { isEmpty ? nil : self }
-}
-
-enum RecentDictations {
-    private static let key = "recentDictations"
-    private static let limit = 100
-
-    /// File at ~/Library/Application Support/Voice/recent_dictations.json.
-    /// Mirrors the pattern used by StorageService / Telemetry.
-    private static var fileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let voiceDir = appSupport.appendingPathComponent("Voice", isDirectory: true)
-        try? FileManager.default.createDirectory(at: voiceDir, withIntermediateDirectories: true)
-        return voiceDir.appendingPathComponent("recent_dictations.json")
-    }
-
-    /// Read items from disk. On first run, migrate any legacy UserDefaults
-    /// blob to the new file and delete the old key.
-    static func all() -> [RecentDictation] { stored().filter { $0.deletedAt == nil } }
-
-    static func retainingHistory(_ items: [RecentDictation], now: Date) -> [RecentDictation] {
-        items.filter { $0.deletedAt.map { now.timeIntervalSince($0) < 7 * 24 * 3600 } ?? true }
-    }
-
-    static func trash(now: Date = Date()) -> [RecentDictation] {
-        stored().filter { item in
-            item.deletedAt.map { now.timeIntervalSince($0) < 7 * 24 * 3600 } ?? false
-        }
-    }
-
-    static func restore(id: String) {
-        var items = stored()
-        guard let index = items.firstIndex(where: { $0.id == id }),
-              trash().contains(where: { $0.id == id }) else { return }
-        items[index].deletedAt = nil
-        save(items)
-    }
-
-    private static func stored() -> [RecentDictation] {
-        let url = fileURL
-        if FileManager.default.fileExists(atPath: url.path) {
-            do {
-                let data = try Data(contentsOf: url)
-                let items = try JSONDecoder().decode([RecentDictation].self, from: data)
-                let retained = retainingHistory(items, now: Date())
-                if retained.count != items.count { save(retained) }
-                return retained
-            } catch {
-                NSLog("[VOICE-STORAGE] failed to read recent_dictations.json: \(error)")
-                return []
-            }
-        }
-        // No file yet — try migrating from UserDefaults.
-        if let legacy = UserDefaults.standard.data(forKey: key),
-           let items = try? JSONDecoder().decode([RecentDictation].self, from: legacy) {
-            do {
-                let encoded = try JSONEncoder().encode(items)
-                try encoded.write(to: url, options: .atomic)
-                UserDefaults.standard.removeObject(forKey: key)
-                NSLog("[VOICE-STORAGE] migrated \(items.count) dictations from UserDefaults to file")
-            } catch {
-                NSLog("[VOICE-STORAGE] migration write failed: \(error)")
-            }
-            return items
-        }
-        return []
-    }
-
-    /// Write items to disk, silently swallowing errors after logging.
-    private static func save(_ items: [RecentDictation]) {
-        do {
-            let data = try JSONEncoder().encode(items)
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            NSLog("[VOICE-STORAGE] failed to write recent_dictations.json: \(error)")
-        }
-    }
-
-    /// Back-compat single-text add — used by code paths that don't know the
-    /// pre-polish version. Newer callers should use `add(raw:polished:)`.
-    static func add(_ text: String) {
-        add(raw: nil, polished: text)
-    }
-
-    /// Add a dictation with both the pre-polish formatted text and the final
-    /// polished text. `raw` is optional — pass nil if polish was skipped /
-    /// disabled / unchanged, and only the polished version will be stored.
-    static func delete(id: String) {
-        var items = stored()
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        items[index].deletedAt = Date()
-        save(items)
-    }
-
-    static func add(raw: String?, polished: String, pasteTargetBundleID: String? = nil, polishMs: Int? = nil,
-                    granite: String? = nil, moonshine: String? = nil,
-                    parakeetRaw: String? = nil, suspects: [String]? = nil,
-                    durationSeconds: Int? = nil, voiceCommandCount: Int? = nil,
-                    cleanupLevelUsed: String? = nil,
-                    personalityStyleUsed: String? = nil,
-                    polishFixCount: Int? = nil,
-                    polishEngine: String? = nil,
-                    cancelled: Bool = false,
-                    audioFilePath: String? = nil) {
-        let trimmed = polished.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let trimmedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Always persist `rawText` when it's non-empty (even when identical to
-        // the polished version). The History UI uses `hasPolishDiff` to gate
-        // the compare button — keeping `rawText` populated lets us surface
-        // "polish was a no-op for this one" cleanly, and means users who want
-        // to see the raw transcript always can.
-        let rawForStorage: String? = {
-            guard let r = trimmedRaw, !r.isEmpty else { return nil }
-            return r
-        }()
-        var items = stored()
-        items.insert(
-            RecentDictation(text: trimmed, timestamp: Date(), rawText: rawForStorage,
-                            pasteTargetBundleID: pasteTargetBundleID, polishMs: polishMs,
-                            graniteText: granite?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil,
-                            moonshineText: moonshine?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil,
-                            parakeetRawText: parakeetRaw?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil,
-                            parakeetSuspects: (suspects?.isEmpty == false) ? suspects : nil,
-                            durationSeconds: durationSeconds,
-                            voiceCommandCount: voiceCommandCount,
-                            polishFixCount: polishFixCount,
-                            cleanupLevelUsed: cleanupLevelUsed,
-                            personalityStyleUsed: personalityStyleUsed,
-                            polishEngine: polishEngine,
-                            cancelled: cancelled,
-                            audioFilePath: audioFilePath),
-            at: 0
-        )
-        let retainedTrash = items.filter { $0.deletedAt.map { Date().timeIntervalSince($0) < 7 * 24 * 3600 } ?? false }
-        items = Array(items.filter { $0.deletedAt == nil }.prefix(limit)) + retainedTrash
-        // Raw per-engine ASR alternatives are kept for every item: they are training data, and the 7-day trim
-        // removed them (25 Nov 2026). The 100-item cap above still bounds the history.
-        save(items)
-    }
-
-    /// Count distinct fix events between raw and polished text. A "fix event" is
-    /// any contiguous run of words that differs between the two. This collapses
-    /// e.g. "i think" → "I think" + "yeah" → "" into 2 fixes, not 2.5.
-    static func countFixes(raw: String, polished: String) -> Int {
-        let rawTokens = raw.lowercased().split(separator: " ").map(String.init)
-        let polTokens = polished.lowercased().split(separator: " ").map(String.init)
-
-        // Myers-lite: count edit runs via 2D LCS-style backtrack.
-        let m = rawTokens.count
-        let n = polTokens.count
-        if m == 0 { return n > 0 ? 1 : 0 }
-        if n == 0 { return 1 }
-
-        var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
-        for i in 0..<m {
-            for j in 0..<n {
-                if rawTokens[i] == polTokens[j] {
-                    dp[i+1][j+1] = dp[i][j] + 1
-                } else {
-                    dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
-                }
-            }
-        }
-
-        // Backtrack to count edit runs (contiguous mismatch streaks).
-        var i = m, j = n
-        var runs = 0
-        var inMismatch = false
-        while i > 0 || j > 0 {
-            if i > 0 && j > 0 && rawTokens[i-1] == polTokens[j-1] {
-                if inMismatch { runs += 1; inMismatch = false }
-                i -= 1; j -= 1
-            } else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
-                inMismatch = true; j -= 1
-            } else {
-                inMismatch = true; i -= 1
-            }
-        }
-        if inMismatch { runs += 1 }
-        return runs
-    }
-}
-
 // MARK: - Cleanup Level
 
 enum CleanupLevel: String, CaseIterable, Identifiable {
@@ -1336,7 +1066,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // dictation must reach the cursor even if they re-pressed the hotkey
     // before the prior pipeline finished pasting. The only legitimate cancel
     // path is app shutdown (and we just let those drop on the floor).
-    private var pendingFinishTask: Task<Void, Never>?
+    private let dictationWork = DictationWorkRegistry()
     // Serializes paste tail-segments so back-to-back completed transcripts
     // land at the cursor in chronological arrival order without trampling
     // each other's clipboard / synthesized-keystroke state. Each finish task
@@ -1527,8 +1257,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.coordinator.audioCapture.stopWritingToFile()
                 FlowOwnership.shared.retainRecoveryReference(capture.audioURL)
             }
-            self.pendingFinishTask?.cancel()
-            self.pasteChain?.cancel()
+            self.dictationWork.cancelAll()
+            self.recordingState.transcribingCount = self.dictationWork.activeCount
             self.coordinator.restoreOutputAudio()
             if self.recordingState.isCapturingMeeting || self.meetingStartTask != nil {
                 if self.recordingState.isCapturingMeeting { self.checkpointMeetingDraft() }
@@ -2247,8 +1977,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cancelDismissTask?.cancel(); cancelDismissTask = nil
         errorDismissTask?.cancel(); errorDismissTask = nil
         undoPasteDismissTask?.cancel(); undoPasteDismissTask = nil
-        pendingFinishTask?.cancel(); pendingFinishTask = nil
-        pasteChain?.cancel(); pasteChain = nil
+        dictationWork.cancelAll()
+        recordingState.transcribingCount = dictationWork.activeCount
+        pasteChain = nil
         if let observer = errorObserver {
             NotificationCenter.default.removeObserver(observer)
             errorObserver = nil
@@ -3706,6 +3437,9 @@ extension AppDelegate {
             return
         }
 
+        // Flow's own replacement must not be mistaken for a user correction of a recent dictation.
+        CorrectionLearner.shared.cancelPending()
+
         recordingState.polishWords = text.split(whereSeparator: \.isWhitespace).count
         recordingState.isPolishingSelection = true
         recordingState.polishDiff = nil
@@ -3715,6 +3449,7 @@ extension AppDelegate {
         let timing = quick ? QuickPolishTiming(words: text.split(whereSeparator: \.isWhitespace).count, at: quickStartedAt) : nil
         recordingState.polishWorkEstimate = timing?.estimate(using: quickPolishTimingHistory)
         let operationID = polishGate.begin()
+        recordingState.polishOperationID = operationID.uuidString
         let evidenceAt = Date()
         let saveEvidence: Bool = if quick, Opt1EvidenceLog.isEnabled, !fnSecureInputOn(), !BackgroundActivityGate.privacyMode,
                                    let element = selection.target.focusedElement {
@@ -3797,15 +3532,18 @@ extension AppDelegate {
                     await Qwen3Polisher.shared.polishInPlace(text, preset: preset, level: level)
                 }
                 run.stage("polish", text: proposed, ms: run.elapsedMs)
-                if let proposed, await DraftDecisionGate.shouldKeepOriginal(text, edited: proposed) {
+                if let proposed, await DraftDecisionGate.shouldKeepOriginal(text, edited: proposed, collector: run) {
                     run.decision("decision-gate", "kept-original", reason: "meaning changed")
                     polishedRaw = text
                 } else {
                     polishedRaw = proposed
                 }
             }
-            // Same final word pass as dictation: hesitations never reach the field. Nothing left means no change.
-            let polished: String? = polishedRaw.map { DictationFinalPass.apply($0) }.flatMap { $0.isEmpty ? nil : $0 }
+            // Opt+1 edits selected text, not raw microphone audio. A second
+            // dictation-only stutter/filler pass would undo the referee's
+            // preservation of deliberately repeated words or quoted speech.
+            let polished: String? = polishedRaw.map { quick ? $0 : DictationFinalPass.apply($0) }
+                .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
 
             // ESC-cancel checkpoint: an Escape during the call means no replacement, ever.
             guard !Task.isCancelled, self.polishGate.isCurrent(operationID) else { return }
@@ -3881,7 +3619,7 @@ extension AppDelegate {
                     }
                 }
             }
-            evidenceOutcome = .applied
+            evidenceOutcome = verified ? .applied : .unconfirmed
             self.quickPolishTimingHistory.record(modelSamples)
             let diff = PolishDiff(original: text, polished: polished, undoAvailable: true, model: madeBy)
             appliedText = polished
@@ -3894,8 +3632,9 @@ extension AppDelegate {
             self.recordingState.polishDiff = diff
             PillHaptics.polishFinished()
             // Auto-dictionary: a result he keeps (no Undo) is evidence for the fixes in it.
-            if !BackgroundActivityGate.privacyMode {
-                CorrectionLearner.shared.trackPolish(diffID: diff.id, original: text, polished: polished, target: selection.target)
+            if verified, !BackgroundActivityGate.privacyMode {
+                CorrectionLearner.shared.trackPolish(diffID: diff.id, original: text, polished: polished,
+                                                    expectedField: expectedFull, target: selection.target)
             }
         }
     }
@@ -5624,6 +5363,7 @@ extension AppDelegate: NSWindowDelegate {
         // more CPU burned transcribing — and (b) capture the on-disk audio URL.
         // Unlike before, we do NOT delete this file; it's the user's retained
         // recording.
+        let cancelledSession = recordingState.recordingSessionID
         let claimedForCancel = recordingState.isRecording ? coordinator.claimRecordingSync() : nil
         let retainedAudioURL = claimedForCancel?.audioURL
         // Snapshot the partial transcript we already have RIGHT NOW (sync, on the
@@ -5653,7 +5393,14 @@ extension AppDelegate: NSWindowDelegate {
             // ASR tail AND (crucially) leaves the audio file on disk when there's
             // real speech — RecordingCoordinator only deletes sub-300ms clips.
             // We deliberately do NOT delete the file afterwards.
-            let drained = await self.coordinator.stopRecording(claiming: claimedForCancel)
+            // A cancelled pending start has no claim. Never stop whichever
+            // recording happens to be active when this asynchronous task runs.
+            let drained: [TranscriptSegment]
+            if let claimedForCancel {
+                drained = await self.coordinator.stopRecording(claiming: claimedForCancel)
+            } else {
+                drained = []
+            }
             let drainedText = drained
                 .map { $0.text }
                 .joined(separator: " ")
@@ -5684,7 +5431,7 @@ extension AppDelegate: NSWindowDelegate {
                 // When there's no transcript at all but we DID keep audio, store a
                 // placeholder so the row still appears and the audio is reachable.
                 let storedText = bestTranscript.isEmpty ? "(cancelled — audio retained)" : bestTranscript
-                RecentDictations.add(
+                let historySaved = RecentDictations.add(
                     raw: nil,
                     polished: storedText,
                     pasteTargetBundleID: capturedTargetForCancel,
@@ -5695,14 +5442,18 @@ extension AppDelegate: NSWindowDelegate {
                     personalityStyleUsed: nil,
                     polishFixCount: nil,
                     cancelled: true,
-                    audioFilePath: retainedAudioURL?.path
+                    audioFilePath: audioExists ? retainedAudioURL?.path : nil,
+                    recordingID: claimedForCancel?.sessionId.uuidString ?? cancelledSession.uuidString
                 )
+                self.reportHistorySaveFailure(historySaved)
                 print("[VOICE-CANCEL] retained: audio=\(retainedAudioURL?.lastPathComponent ?? "none") transcriptChars=\(bestTranscript.count) duration=\(duration.map(String.init) ?? "?")s → saved to History (unpolished, not pasted)")
             } else {
                 // Nothing to keep (cancelled during spin-up, no audio, no text).
                 print("[VOICE-CANCEL] nothing to retain (no audio file, no partial transcript) — skipping History save")
             }
 
+            // Keep the history row, but do not clear the next recording's preview.
+            guard self.recordingState.recordingSessionID == cancelledSession else { return }
             self.showCancelledToast()
             // After the toast, so its bookkeeping cannot wipe what Undo needs.
             self.recordingState.cancelledText = bestTranscript
@@ -5753,10 +5504,11 @@ extension AppDelegate: NSWindowDelegate {
         // 1. Signal "cancelled" to every guard inside the finish Task. Each
         //    `guard !recordingState.sessionCancelled else { return }` checkpoint
         //    along the polish → paste path will now bail.
-        recordingState.sessionCancelled = true
-        // Scope the cancel to the CURRENT session so an in-flight background
-        // finish task (an older, legitimately-running session) isn't dropped.
-        recordingState.cancelledSessionID = recordingState.recordingSessionID
+        let cancelledWork = dictationWork.cancelLatest(preferred: recordingState.recordingSessionID)
+        if let cancelledWork, cancelledWork.session == recordingState.recordingSessionID {
+            recordingState.sessionCancelled = true
+            recordingState.cancelledSessionID = cancelledWork.session
+        }
 
         // 2. Salvage whatever partial transcript exists RIGHT NOW (before we
         //    cancel the Task, which may still be appending). Mirrors the
@@ -5772,21 +5524,10 @@ extension AppDelegate: NSWindowDelegate {
         let capturedTargetForCancel = targetAppBundleID
         let startedAtForCancel = recordingStartedAt
 
-        // 3. Cancel the streaming Task chain. The Task<Void, Never> doesn't
-        //    propagate `throw`, but `Task.isCancelled` flips true and the
-        //    inline `guard !Task.isCancelled` checks in finishRecording's body
-        //    will short-circuit. Cancelling the paste chain prevents any
-        //    queued post-polish paste from landing.
-        pendingFinishTask?.cancel()
-        pasteChain?.cancel()
-
-        // 4. Tear down live UI state. The defer in finishRecording's Task
-        //    will run on its way out, but for the worst case (the Task is
-        //    blocked on a long Ollama round-trip and won't return for a
-        //    while) we want the pill back to idle immediately. Setting
-        //    transcribingCount = 0 is safe even if the defer also tries to
-        //    decrement it — `max(0, count - 1)` floors it.
-        recordingState.transcribingCount = 0
+        // 3. The target's token cancels its actual task and delayed callbacks.
+        // Never cancel the FIFO barrier: it still owns the preceding paste order.
+        // 4. Other in-flight dictations keep their own count.
+        recordingState.transcribingCount = dictationWork.activeCount
         recordingState.isPolishingSelection = false
         // Kill the in-flight Opt+1 polish-selection task so it can't paste over
         // the user's selection after they pressed ESC.
@@ -5801,9 +5542,9 @@ extension AppDelegate: NSWindowDelegate {
         //    intentionally do NOT include an audioFilePath here — the audio
         //    was already finalized/disposed by the upstream stopRecording
         //    drain (the cancellation point is past the audio-claim stage).
-        if !bestTranscript.isEmpty {
+        if cancelledWork?.session == recordingState.recordingSessionID, !bestTranscript.isEmpty {
             let duration = startedAtForCancel.map { Int(Date().timeIntervalSince($0)) }
-            RecentDictations.add(
+            let historySaved = RecentDictations.add(
                 raw: nil,
                 polished: bestTranscript,
                 pasteTargetBundleID: capturedTargetForCancel,
@@ -5814,8 +5555,10 @@ extension AppDelegate: NSWindowDelegate {
                 personalityStyleUsed: nil,
                 polishFixCount: nil,
                 cancelled: true,
-                audioFilePath: nil
+                audioFilePath: nil,
+                recordingID: cancelledWork?.session.uuidString
             )
+            reportHistorySaveFailure(historySaved)
             print("[VOICE-CANCEL-INFLIGHT] retained partial transcript: chars=\(bestTranscript.count) duration=\(duration.map(String.init) ?? "?")s → saved to History (cancelled, unpolished)")
         } else {
             print("[VOICE-CANCEL-INFLIGHT] no partial transcript to retain")
@@ -5838,6 +5581,12 @@ extension AppDelegate: NSWindowDelegate {
         finishRecording()
     }
 
+    private func reportHistorySaveFailure(_ saved: Bool) {
+        guard !saved, !UserDefaults.standard.bool(forKey: "voice.privacyMode"),
+              let message = RecentDictations.lastStorageError else { return }
+        NotificationCenter.default.post(name: .voiceError, object: nil, userInfo: ["message": message])
+    }
+
     /// End recording, drain the streaming engine, then copy + paste at cursor.
     /// Each invocation runs to completion independently — if the user re-presses
     /// the hotkey while a prior finish is mid-flight, the prior task keeps going
@@ -5846,7 +5595,7 @@ extension AppDelegate: NSWindowDelegate {
     private func finishRecording() {
         hotkeyService.endSessionFromUI()
         // Key release. Every stage time in the dictation trace is counted from here.
-        let keyUpAt = CFAbsoluteTimeGetCurrent()
+        let keyUpTimer = PipelineTimer()
         print("[VOICE-TIMING] finishRecording entered at \(Date())")
         let wasRecording = recordingState.isRecording
         let started = recordingStartedAt
@@ -5887,16 +5636,14 @@ extension AppDelegate: NSWindowDelegate {
         recordingState.pendingRecordingStart = false
         if wasRecording {
             recordingState.lastRecordingSeconds = started.map { Date().timeIntervalSince($0) } ?? 0
-            recordingState.transcribingCount += 1
             SoundEffects.playStop()
         }
 
         recordingStartedAt = nil
         guard wasRecording else {
-            // No active recording — nothing to drain. Make sure we still
-            // tell the engine to stop in case a streaming session is open.
-            print("[VOICE-HK] finishRecording: wasRecording=false, bailing (this is the silent-discard bug if it fires after a real hold)")
-            Task { @MainActor in _ = await coordinator.stopRecording() }
+            // Nothing to claim. An async stop here could stop the next recording.
+            print("[VOICE-HK] finishRecording: wasRecording=false, bailing")
+            coordinator.stopLivePartials()
             return
         }
 
@@ -5906,8 +5653,9 @@ extension AppDelegate: NSWindowDelegate {
             print("[VOICE] Too short (\(duration)s) → silent discard")
             // Pass the claim through so stopRecording() still does its drain+cleanup,
             // but the result is discarded since duration is too short.
-            Task { @MainActor in _ = await coordinator.stopRecording(claiming: claimed) }
-            recordingState.transcribingCount = max(0, recordingState.transcribingCount - 1)
+            if let claimed {
+                Task { @MainActor in _ = await coordinator.stopRecording(claiming: claimed) }
+            }
             recordingState.currentTranscript = []
             return
         }
@@ -5916,6 +5664,8 @@ extension AppDelegate: NSWindowDelegate {
         // main actor) so a later Path 2 re-press that calls captureTargetApp()
         // can't repoint this task's paste at the wrong field. Each finish task
         // owns its own copy of where its transcript belongs.
+        let work = dictationWork.begin(mySession)
+        recordingState.transcribingCount = dictationWork.activeCount
         let recoveryID = beginPasteRecoveryWindow()
         let capturedTargetForTask = targetAppBundleID
         // He may have typed in the same field while dictating. Re-read the context
@@ -5929,6 +5679,7 @@ extension AppDelegate: NSWindowDelegate {
         let capturedRichAppContextForTask = capturedRichAppContext
         let personalityForTask = AppWritingCategory.style(for: capturedTargetForTask)
         let cleanupForTask = CleanupLevel.current.rawValue
+        let polishEnabledByUser = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
 
         // Each finish gets its OWN Task. We intentionally do NOT cancel the
         // previous pendingFinishTask — if the user re-pressed the hotkey
@@ -5947,18 +5698,22 @@ extension AppDelegate: NSWindowDelegate {
         let deliverySlot = DeliverySlot(after: priorDelivery)
         pasteChain = deliverySlot.task
 
-        pendingFinishTask = Task { @MainActor in
-            // GUARANTEED CLEAR: no matter how the task ends — empty
-            // transcript, error, cancellation, hung Ollama — isTranscribing
-            // resets to false. The pill never gets stuck on the loading state.
+        work.task = Task { @MainActor in
+            var deliveryStarted = false
+            // The token remains active until paste/readback finishes, not just cleanup.
             defer {
-                self.recordingState.transcribingCount = max(0, self.recordingState.transcribingCount - 1)
+                if !deliveryStarted {
+                    self.dictationWork.finish(work)
+                    self.recordingState.transcribingCount = self.dictationWork.activeCount
+                }
                 // Ensure live partials are always cleaned up regardless of
                 // which code path triggered finishRecording (silence timeout,
                 // hotkey, or confirm button — all paths end here).
-                coordinator.stopLivePartials()
-                // Restore the user's saved personality if auto-override applied.
-                if let saved = personalityToRestore {
+                if self.recordingState.recordingSessionID == mySession {
+                    coordinator.stopLivePartials()
+                }
+                // Restore only the personality override owned by this session.
+                if self.recordingState.recordingSessionID == mySession, let saved = personalityToRestore {
                     UserDefaults.standard.set(saved, forKey: "personalityStyle")
                     print("[VOICE-PERSONALITY] restored: \(saved)")
                 }
@@ -5968,7 +5723,6 @@ extension AppDelegate: NSWindowDelegate {
                 self.refreshMenuBarIcon()
             }
 
-            var deliveryStarted = false
             defer { if !deliveryStarted { deliverySlot.finish() } }
             // One local training record for this dictation (FlowRunLog): input, every stage, decisions, timings.
             let run = FlowRunCollector(kind: "dictation", id: claimed?.sessionId.uuidString ?? mySession.uuidString,
@@ -6002,8 +5756,9 @@ extension AppDelegate: NSWindowDelegate {
             // paste pipeline runs unconditionally for A's own claimed audio,
             // and A's paste still flows through the pasteChain / pasteOrderAnchor
             // ordering mechanism so A lands before B (chronological order).
-            let iOwnLiveState = (self.recordingState.recordingSessionID == mySession)
-            if !iOwnLiveState {
+            // Re-evaluate after every suspension: another capture can start at any await.
+            func iOwnLiveState() -> Bool { self.recordingState.recordingSessionID == mySession }
+            if !iOwnLiveState() {
                 vlog("[VOICE-RACE] proceeding as background session (not live owner) session=\(mySession) current=\(self.recordingState.recordingSessionID)")
             }
 
@@ -6014,7 +5769,7 @@ extension AppDelegate: NSWindowDelegate {
             // Also forwarded to Telemetry so the JSONL log can be diffed by
             // build / model / app target.
             // ============================================================
-            let tPipelineStart = CFAbsoluteTimeGetCurrent()
+            let pipelineTimer = PipelineTimer()
             // This is a cooperative warning threshold, not a hard deadline:
             // the task group still waits for a cancellation-unresponsive decoder.
             // A WARNING at 15 s, never a cut-off. A transcription that finishes late is still pasted
@@ -6025,10 +5780,12 @@ extension AppDelegate: NSWindowDelegate {
                 guard !Task.isCancelled else { return }
                 fputs("[LATENCY] ASR warning threshold reached; still waiting for the transcript\n", stderr)
             }
-            let segments = await coordinator.stopRecording(claiming: claimed)
+            let segments = await FlowRunCollector.$current.withValue(run) {
+                await coordinator.stopRecording(claiming: claimed)
+            }
             slowWarning.cancel()
-            let parakeetMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-            let transcriptAtMs = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
+            let parakeetMs = pipelineTimer.seconds() * 1000
+            let transcriptAtMs = Int(keyUpTimer.seconds() * 1000)
             fputs("[LATENCY] Parakeet (drain+ASR): \(Int(parakeetMs))ms\n", stderr)
             vlog("[VOICE-TIMING] Parakeet returned at \(Date())")
             // [VOICE-RACE] Prove each finish task received ITS OWN session's
@@ -6072,7 +5829,7 @@ extension AppDelegate: NSWindowDelegate {
             // has taken over, currentTranscript / livePartialText now mirror
             // B's in-flight recording — clearing them here would blank B's live
             // preview. A still pastes its own text via pasteChain below.
-            if iOwnLiveState {
+            if iOwnLiveState() {
                 recordingState.currentTranscript = []
                 // Final transcript has landed — clear live preview so partial text
                 // doesn't linger after the real result is pasted.
@@ -6089,7 +5846,7 @@ extension AppDelegate: NSWindowDelegate {
                 // below, so clear it here (only if we still own live state) —
                 // otherwise the NEXT dictation inherits this session's stale
                 // short-clip flag and wrongly skips its own LLM polish.
-                if iOwnLiveState {
+                if iOwnLiveState() {
                     recordingState.skipPolishForCurrent = false
                     recordingState.graniteTranscript = nil
                     recordingState.moonshineTranscript = nil
@@ -6113,7 +5870,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Without this, a rejected dictation is invisible after the toast dismisses.
                 // We mark the polish stage as "skipped" (polishMs = nil, no fix count)
                 // since the language gate ran before polish.
-                RecentDictations.add(
+                let historySaved = RecentDictations.add(
                     raw: nil,
                     polished: rawText,
                     pasteTargetBundleID: capturedTargetForTask,
@@ -6126,8 +5883,11 @@ extension AppDelegate: NSWindowDelegate {
                     voiceCommandCount: nil,
                     cleanupLevelUsed: nil,
                     personalityStyleUsed: nil,
-                    polishFixCount: nil
+                    polishFixCount: nil,
+                    audioFilePath: claimed?.audioURL?.path,
+                    recordingID: claimed?.sessionId.uuidString ?? mySession.uuidString
                 )
+                self.reportHistorySaveFailure(historySaved)
                 NotificationCenter.default.post(
                     name: .voiceError,
                     object: nil,
@@ -6136,7 +5896,7 @@ extension AppDelegate: NSWindowDelegate {
                 // STALE-FLAG GUARD (same rationale as the empty-transcript path):
                 // consume this session's per-clip polish flags before returning so
                 // a stale skipPolishForCurrent can't leak into the next dictation.
-                if iOwnLiveState {
+                if iOwnLiveState() {
                     recordingState.skipPolishForCurrent = false
                     recordingState.graniteTranscript = nil
                     recordingState.moonshineTranscript = nil
@@ -6152,7 +5912,7 @@ extension AppDelegate: NSWindowDelegate {
             // ============================================================
 
             // Run formatter — paragraph-aware, synchronous (no Ollama round-trip).
-            let tFormatStart = CFAbsoluteTimeGetCurrent()
+            let formatterTimer = PipelineTimer()
             // Strip a trailing stop-word command token ("finito") so the word
             // the user spoke to END the recording never lands in the pasted /
             // saved text. Trailing-only and gated on the feature flag, so a
@@ -6167,15 +5927,17 @@ extension AppDelegate: NSWindowDelegate {
                     ? RecordingCoordinator.strippingTrailingStopWord(from: raw) : raw
                 let submitEnabled = UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled")
                     && (UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true)
+                let commandText = textFormatter.config.interpretVoiceCommands
+                    ? TextFormatter.interpretLineBreakCommands(text) : text
                 return DictationTextPreparation.Prepared(rawText: raw,
-                    command: TrailingPressEnter.parse(text, enabled: submitEnabled), rejection: nil)
+                    command: TrailingPressEnter.parse(commandText, enabled: submitEnabled), rejection: nil)
             } ?? DictationTextPreparation.prepare(segments: segments, formatter: textFormatter,
                 pressEnterEnabled: UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled"),
                 autoPaste: UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true,
                 endedByVoiceStop: coordinator.lastVoiceStopSession == mySession)
             let pressEnterCommand = preparation.command
             let formatted = pressEnterCommand.text
-            let formatterMs = (CFAbsoluteTimeGetCurrent() - tFormatStart) * 1000
+            let formatterMs = formatterTimer.seconds() * 1000
             fputs("[LATENCY] TextFormatter: \(Int(formatterMs))ms\n", stderr)
             run.stage("rules", text: formatted, ms: Int(formatterMs),
                       detail: t2RawText != nil ? ["preparation": "model-transcript"] : nil)
@@ -6183,7 +5945,7 @@ extension AppDelegate: NSWindowDelegate {
             // the formatter ran, bail before we sink time into Ollama polish.
             // The `defer` above still runs (transcribingCount decrement, live
             // partial cleanup) so the pill flips back to idle cleanly.
-            if Task.isCancelled || recordingState.isCancelled(for: mySession) {
+            if Task.isCancelled || work.isCancelled {
                 run.update { $0.outcome = "cancelled" }
                 print("[VOICE-CANCEL-INFLIGHT] post-formatter cancellation detected — bailing before polish")
                 return
@@ -6217,30 +5979,7 @@ extension AppDelegate: NSWindowDelegate {
             // polisher itself reads) — that one stays for backward compat,
             // this one is the new user-visible setting wired into the UI.
             // ============================================================
-            let polishEnabledByUser: Bool = {
-                if UserDefaults.standard.object(forKey: "polishEnabled") == nil { return true }
-                return UserDefaults.standard.bool(forKey: "polishEnabled")
-            }()
-            // ============================================================
-            // OPTIMISTIC PASTE — "type now, refine after".
-            // Storage key `optimisticPaste` (defaults to false). When true
-            // AND polish is enabled AND polish hasn't been short-circuited
-            // for any reason, paste the TextFormatter output IMMEDIATELY,
-            // then run Qwen3 in background and try to swap. Swap only
-            // happens when the pasteboard fingerprint hasn't changed since
-            // our optimistic write (a rough "user hasn't typed over us" gate)
-            // — otherwise the polished text is dropped and the unpolished
-            // text remains. Opt-in because the swap involves Cmd+Z which
-            // can feel disruptive if the user is fast-typing.
-            // ============================================================
-            let optimisticPasteEnabled: Bool = {
-                if UserDefaults.standard.object(forKey: "optimisticPaste") == nil { return false }
-                return UserDefaults.standard.bool(forKey: "optimisticPaste")
-            }()
-            // LLM polish runs only if enabled+available; otherwise returns
-            // `formatted` unchanged after a near-zero check. 800ms hard
-            // timeout inside the polisher guards paste latency (warm
-            // Qwen3-0.6B-4bit on M2 typically completes in ~80–150ms).
+            // Cleanup uses the bounded request/deadline path below and preserves the source on failure.
             // Insertion-context hint lets the model bias for chat / email and
             // skip entirely in code editors.
             vlog("[VOICE] Starting polish... (formatted=\(formatted.count) chars) polishEnabledByUser=\(polishEnabledByUser)")
@@ -6251,15 +5990,13 @@ extension AppDelegate: NSWindowDelegate {
             // so the model knows e.g. "GitHub" not "get hub".
             let parakeetSuspectsAgg = segments.compactMap { $0.suspectWords }.flatMap { $0 }
             let formatterSuspects = TextFormatter.suspectsForPolish(formatted)
-            let suspectWords = Array(Set(parakeetSuspectsAgg + formatterSuspects))
+            let suspectWords = PromptTerms.orderedUnique(parakeetSuspectsAgg, formatterSuspects)
             // Merge built-in dictionary terms with the user's auto-learned
             // proper nouns (brand names, frequent contacts). Auto-learned
             // first so they take priority in any de-duplication.
             let preferredWords = ProperNounVocabulary.preferredSpellingTerms()
-            var seenWords = Set<String>()
-            let userVocab = (preferredWords + ProperNounVocabulary.current() + CombinedDictionary.terms())
-                .filter { seenWords.insert($0.lowercased()).inserted }
-            let polishStart = Date()
+            let userVocab = PromptTerms.orderedUnique(preferredWords, ProperNounVocabulary.current(), CombinedDictionary.terms())
+            let polishTimer = PipelineTimer()
             // Short-utterance bypass: when RecordingCoordinator flagged the
             // current clip as 16-36KB ("ok"/"yeah"/"no" territory), skip the
             // LLM polish pass and keep the rule-based formatted text. Polish
@@ -6277,7 +6014,7 @@ extension AppDelegate: NSWindowDelegate {
             let skipPolish: Bool
             let graniteTranscript: String?
             let moonshineTranscript: String?
-            if iOwnLiveState {
+            if iOwnLiveState() {
                 skipPolish = recordingState.skipPolishForCurrent
                 recordingState.skipPolishForCurrent = false  // consume the flag
                 graniteTranscript = recordingState.graniteTranscript
@@ -6289,78 +6026,11 @@ extension AppDelegate: NSWindowDelegate {
                 graniteTranscript = nil
                 moonshineTranscript = nil
             }
-            // Decide up-front whether this dictation will actually hit the LLM.
-            // Used to gate optimistic paste: there's no point doing the
-            // "paste-now, replace-after" dance if polish was going to be a
-            // no-op anyway (short clip, polish disabled, non-English, etc.).
-            let polishWillRun = CleanupLevel.current != .none && polishEnabledByUser && !skipPolish
-
-            // Optimistic paste: paste TextFormatter output immediately, BEFORE
-            // the LLM round trip. The post-polish replace is best-effort.
-            //
-            // We push the optimistic paste onto pasteChain so it serializes
-            // with any in-flight prior dictation's paste — we don't want two
-            // pastes racing the clipboard. The swap task is fired LATER after
-            // polish completes.
-            //
-            // `optimisticPasteSnapshot` is the SHA-like fingerprint we use to
-            // verify the field hasn't changed before we attempt Cmd+Z + repaste.
-            // (Plain string equality on the pasteboard contents is good enough
-            // — if anything else clobbered our paste, we abort the swap.)
-            let optimisticActive = false // Avoid undoing edits made while cleanup runs.
-            var optimisticPasteboardSig: String? = nil
-            // BUGFIX: hold our own optimistic-paste task locally. The Qwen3
-            // polish below has an `await` and during that await another
-            // finishRecording can overwrite `pasteChain`. If we read
-            // `pasteChain` after the await, we may pick up a NEWER session's
-            // chain link and lose serialization with our own optimistic write.
-            // Capturing it here keeps the swap correctly ordered behind our
-            // own pre-polish paste.
-            var ourOptimisticTask: Task<Void, Never>? = nil
-            if optimisticActive {
-                // BUGFIX (Category 4): chain off the anchor reserved at Parakeet-return,
-                // not pasteChain-now. Otherwise a faster recording B could overwrite
-                // pasteChain between Parakeet and here, and our optimistic paste would
-                // skip past it. The anchor preserves enqueue (chronological) order.
-                let priorChain = pasteOrderAnchor
-                let snapshotTarget = capturedTargetForTask
-                let optimisticText = formatted
-                let optimisticPolishOwnedFormatting = false  // pre-polish — paster runs its rule-based adjuster
-                let optimisticTask: Task<Void, Never> = Task { @MainActor in
-                    _ = await priorChain.value
-                    guard !self.recordingState.isCancelled(for: mySession) else { return }
-                    var didReactivate = false
-                    if let id = snapshotTarget,
-                       let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
-                       !app.isActive {
-                        app.activate()
-                        didReactivate = true
-                    }
-                    // LATENCY: only pay the 80ms activation settle when we
-                    // actually switched apps (see final-paste path for rationale).
-                    if didReactivate { try? await Task.sleep(nanoseconds: 80_000_000) }
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(optimisticText, forType: .string)
-                    self.cursorPaster.pasteAtCursor(
-                        optimisticText,
-                        restoreClipboard: false,
-                        preFormatted: optimisticPolishOwnedFormatting
-                    )
-                    try? await Task.sleep(nanoseconds: 60_000_000)
-                    vlog("[VOICE] OPTIMISTIC paste DONE")
-                }
-                pasteChain = optimisticTask
-                ourOptimisticTask = optimisticTask
-                // Snapshot the pasteboard once the optimistic write has landed,
-                // so the post-polish swap can detect "user typed over our paste".
-                optimisticPasteboardSig = optimisticText
-            }
             // var (not let) — see the empty-polish guard below that may
             // fall back to `formatted` if Qwen3 returns whitespace/empty.
             // Dictation trace (numbers and labels only): which engine was asked, and why a fallback was used.
             var traceEngine: String = {
-                if CleanupLevel.current == .none || !polishEnabledByUser { return "off" }
+                if cleanupForTask == "none" || !polishEnabledByUser { return "off" }
                 switch Qwen3Polisher.effectiveAutomaticCleanupModel {
                 case WhisperNowTunedPolisher.settingValue:
                     if WhisperNowTunedPolisher.usesT4 { return WhisperNowTunedPolisher.dictationAdapter(for: formatted).traceName }
@@ -6372,22 +6042,33 @@ extension AppDelegate: NSWindowDelegate {
             // dose1-t1 is ready when its files are installed. The others count as ready when selected.
             var traceEngineReady = (traceEngine.hasPrefix("dose1-") || traceEngine == WhisperNowTunedPolisher.DictationAdapter.t4.traceName
                 || traceEngine == WhisperNowTunedPolisher.DictationAdapter.v3c.traceName) ? WhisperNowTunedPolisher.isInstalled : traceEngine != "off"
-            var traceModelWillRun = CleanupLevel.current != .none && polishEnabledByUser && !skipPolish
-            var traceFallback: String? = (CleanupLevel.current == .none || !polishEnabledByUser) ? "level-off"
+            var traceModelWillRun = cleanupForTask != "none" && polishEnabledByUser && !skipPolish
+            var traceFallback: String? = (cleanupForTask == "none" || !polishEnabledByUser) ? "level-off"
                 : (skipPolish ? "short-clip" : nil)
             let t2OutcomeObserver = recognizedT2 ? ShadowCleanupObserver() : nil
-            let longProse = formatted.count > 1_200
+            let draftWords = formatted.split(whereSeparator: { $0.isWhitespace }).count
+            let longProse = formatted.count > DictationTextPreparation.sectionLimit || DictationDeadline.isLong(words: draftWords)
             var editedBySection = false
             var finalText: String
             var cleanupRoute = "skipped-level-off"
-            if (recognizedT2 ? cleanupForTask == "none" : CleanupLevel.current == .none) || !polishEnabledByUser {
+            if DictationLayout.isBreakOnly(formatted) {
+                // A spoken layout command is an insertion even though it has no
+                // words. It needs no model request and is never "no speech".
+                finalText = formatted
+                cleanupRoute = "skipped-layout-command"
+                traceFallback = "layout-command"
+                traceModelWillRun = false
+                traceEngine = "rules"
+                traceEngineReady = false
+            } else if cleanupForTask == "none" || !polishEnabledByUser {
                 vlog("[VOICE] Polish skipped (cleanupLevel=none or polishEnabled=false) — rule-based only")
                 finalText = formatted
             } else if skipPolish {
                 vlog("[VOICE] Short clip — skipping LLM polish (rule-based only)")
                 cleanupRoute = "skipped-short-clip"
                 finalText = formatted
-            } else if !recognizedT2 && (graniteTranscript != nil || moonshineTranscript != nil) {
+            } else if !recognizedT2 && !formatted.contains(where: \.isNewline)
+                        && (graniteTranscript != nil || moonshineTranscript != nil) {
                 // Triple-model path: Qwen3 merges Parakeet v2 + Granite 4.0 + Moonshine Tiny outputs.
                 cleanupRoute = "triple-merge"
                 run.update {
@@ -6396,7 +6077,7 @@ extension AppDelegate: NSWindowDelegate {
                 }
                 let graniteLabel = graniteTranscript.map { "'\($0.prefix(40))'" } ?? "nil"
                 let moonshineLabel = moonshineTranscript.map { "'\($0.prefix(40))'" } ?? "nil"
-                finalText = await Qwen3Polisher.shared.merge(
+                finalText = await FlowRunCollector.$current.withValue(run) { await Qwen3Polisher.shared.merge(
                     parakeet: formatted,
                     granite: graniteTranscript,
                     moonshine: moonshineTranscript,
@@ -6407,7 +6088,7 @@ extension AppDelegate: NSWindowDelegate {
                     appContextLabel: capturedRichAppContextForTask ?? Qwen3Polisher.appContextLabel(forBundleID: capturedTargetForTask),
                     cleanupLevel: cleanupForTask,
                     personalityStyle: personalityForTask
-                )
+                ) }
                 // Triple-ASR capture for the Polish Replay debug panel. Pure
                 // observer — runs AFTER the merge has produced `finalText`,
                 // never blocks the paste path, persists best-effort. We
@@ -6421,7 +6102,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Surface average confidence to the pill so it can tint its
                 // stroke (white >= 0.55, amber 0.40..<0.55, red < 0.40).
                 // Already on MainActor (enclosing Task), so set directly.
-                if let conf = parakeetAvgConf {
+                if iOwnLiveState(), let conf = parakeetAvgConf {
                     self.recordingState.transcriptionConfidence = Double(conf)
                 }
                 let capture = TripleASRCapture(
@@ -6442,7 +6123,7 @@ extension AppDelegate: NSWindowDelegate {
                     }
                 }
             } else {
-                guard !recordingState.isCancelled(for: mySession) else { return }
+                guard !work.isCancelled else { return }
                 let polishDraft: @Sendable (String, Bool) async -> String = { [polishContext, suspectWords, userVocab,
                     capturedFieldContextForTask, capturedRichAppContextForTask, capturedTargetForTask, cleanupForTask, personalityForTask]
                     text, isSection in
@@ -6464,38 +6145,52 @@ extension AppDelegate: NSWindowDelegate {
                 // separate bounded window and preserve each unedited section.
                 // Longer drafts earn more time (1.5 s + 12 ms a word, at most 6 s): mid-length dictations
                 // used to miss the flat 1.5 s about two times in three and paste rules-only text (21 Nov 2026).
-                let draftWords = formatted.split(whereSeparator: { $0.isWhitespace }).count
-                let shortBudget = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
+                let shortBudget = DictationDeadline.remainingSeconds(sinceKeyRelease: keyUpTimer.seconds(),
                                                                      words: draftWords)
                 // Long dictations try the PC first (RemoteCleanup); its time counts inside the same budgets below.
                 let remoteStarted = ContinuousClock.now
                 if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
+                   !formatted.contains(where: \.isNewline),
+                   longProse || shortBudget >= 0.15,
                    let pcText = await RemoteCleanup.cleanedText(formatted, cleanupLevel: cleanupForTask,
                         userVocabulary: userVocab.isEmpty ? nil : userVocab, personalityStyle: personalityForTask,
                         appContextLabel: capturedRichAppContextForTask ?? Qwen3Polisher.appContextLabel(forBundleID: capturedTargetForTask),
-                        longProse: longProse, timeout: longProse ? 2.4 : max(0.3, shortBudget * 0.6)) {
+                        longProse: longProse, timeout: longProse ? 2.4 : shortBudget * 0.6) {
                     cleanupRoute = "remote-pc"
+                    run.model("cleanupEngine", "remote-pc")
                     finalText = pcText
-                } else if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
-                   longProse || formatted.contains(where: \.isNewline) {
+                } else if polishContext != .code, Qwen3Polisher.isEnabled,
+                   (!recognizedT2 && longProse) || formatted.contains(where: \.isNewline) {
                     editedBySection = true
                     cleanupRoute = "sections"
                     let ranges = DictationTextPreparation.cleanupSections(in: formatted)
+                    if ranges.isEmpty {
+                        traceEngine = "rules"
+                        traceEngineReady = false
+                        traceModelWillRun = false
+                        traceFallback = "preserved-layout"
+                    }
                     let budget = longProse ? DictationDeadline.sectionBudgetSeconds(count: ranges.count) : shortBudget
                     let deadline = remoteStarted + .seconds(budget)
-                    let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline) { section in
-                        let edited = await polishDraft(section, true)
-                        let vetoed = await DraftDecisionGate.shouldKeepOriginal(section, edited: edited, deadline: deadline)
-                        if vetoed { run.decision("decision-gate", "kept-section", reason: "meaning check vetoed a section edit") }
-                        return vetoed ? nil : edited
-                    }
+                    let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline,
+                        review: { section, edited in
+                            let vetoed = await DraftDecisionGate.shouldKeepOriginal(section, edited: edited, deadline: deadline, collector: run)
+                            if vetoed { run.decision("decision-gate", "kept-section", reason: "meaning check vetoed a section edit") }
+                            return vetoed
+                        }) { section in
+                            await polishDraft(section, true)
+                        }
                     finalText = result.text
                     if result.timedOut { traceFallback = finalText == formatted ? "deadline" : "partial-deadline" }
                 } else {
                     cleanupRoute = "local"
                     run.update { $0.settings["budgetSeconds"] = String(format: "%.2f", shortBudget) }
-                    let localLeft = max(0.05, shortBudget - RemoteCleanup.seconds(since: remoteStarted))
-                    let answer = await DictationDeadline.run(seconds: localLeft) { await polishDraft(formatted, false) }
+                    let localLeft = max(0, shortBudget - RemoteCleanup.seconds(since: remoteStarted))
+                    let reserve = await DraftDecisionGate.reservation(for: formatted, available: localLeft)
+                    // Account for the reservation query itself; an expired
+                    // cleanup budget is not a fresh 50 ms model invocation.
+                    let generationLeft = max(0, shortBudget - RemoteCleanup.seconds(since: remoteStarted) - reserve)
+                    let answer = await DictationDeadline.run(seconds: generationLeft) { await polishDraft(formatted, false) }
                     finalText = answer ?? formatted
                     if answer == nil {
                         traceFallback = "deadline"
@@ -6521,24 +6216,23 @@ extension AppDelegate: NSWindowDelegate {
                     traceFallback = actual.fallback
                 }
             }
-            run.stage("cleanup", text: finalText, ms: Int(Date().timeIntervalSince(polishStart) * 1000),
+            run.stage("cleanup", text: finalText, ms: Int(polishTimer.seconds() * 1000),
                       detail: ["route": cleanupRoute, "engine": traceEngine, "fallback": traceFallback ?? "none"])
             run.model("cleanup", traceEngine)
-            run.model("cleanupEngine", PolishStatus.shared.lastEngine)
-            if PolishStatus.shared.lastSanitizerRejected {
-                run.decision("cleanup-guard", "rejected", reason: PolishStatus.shared.lastReason)
-            } else if let reason = PolishStatus.shared.lastReason, !reason.isEmpty {
-                run.decision("cleanup-guard", "note", reason: reason)
-            }
+            // Backends attach their own engine/guard result through the task-local collector.
+            // The shared UI's last result may belong to another concurrent dictation.
             if let fallback = traceFallback { run.decision("cleanup", "fallback", reason: fallback) }
             // Check the proposed cleanup only within the existing key-up budget.
             // A cold or busy reviewer leaves the ordinary cleanup result in place.
-            if traceModelWillRun, !editedBySection, !recordingState.isCancelled(for: mySession) {
-                let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt)
+            if (traceModelWillRun || cleanupRoute == "remote-pc"), !editedBySection,
+               !work.isCancelled {
+                let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: keyUpTimer.seconds(),
+                                                                   words: draftWords)
                 if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText,
-                    deadline: ContinuousClock.now + .seconds(remaining)) {
+                    deadline: ContinuousClock.now + .seconds(remaining), collector: run) {
                     let partial = finalText.utf8.count <= 600 &&
-                        DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt) > 0.05
+                        DictationDeadline.remainingSeconds(sinceKeyRelease: keyUpTimer.seconds(),
+                                                           words: draftWords) > 0.05
                         ? Qwen3Polisher.recoverAnchoredSpelling(original: formatted, proposed: finalText) : nil
                     finalText = partial ?? formatted
                     traceFallback = "decision-meaning"
@@ -6547,14 +6241,14 @@ extension AppDelegate: NSWindowDelegate {
                     run.stage("decision-gate", text: finalText)
                 }
             }
-            let polishMs = Int(Date().timeIntervalSince(polishStart) * 1000)
+            let polishMs = Int(polishTimer.seconds() * 1000)
             fputs("[LATENCY] Qwen3 polish: \(polishMs)ms (enabled=\(polishEnabledByUser), skipShort=\(skipPolish))\n", stderr)
             // BUGFIX: guard against polish returning empty/whitespace. If
             // Qwen3 ever returns "" we'd paste nothing at the cursor while
             // the user thinks their dictation succeeded. Fall back to the
-            // pre-polish formatted text — same data the optimistic-paste
-            // path would have written.
-            if WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
+            // pre-polish formatted text.
+            if !DictationLayout.isBreakOnly(formatted),
+               WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
                 // WhisperNow tuned answered EMPTY for hesitation sounds only: treat it like no speech.
                 vlog("[VOICE] WhisperNow tuned: no speech — nothing to paste")
                 run.update { $0.outcome = "no-speech" }
@@ -6572,9 +6266,12 @@ extension AppDelegate: NSWindowDelegate {
                 finalText = formatted
             }
             let modelOutputForTraining = finalText
+            let postCleanupTimer = PipelineTimer()
             finalText = T2CleanupOptions.finalizedTranscript(candidate: finalText, preparedASR: formatted,
                 level: cleanupForTask, recognizedT2: usesModelTranscript)
+                .map { DictationLayout.preservingLineBreaks(in: $0, from: formatted) }
                 ?? DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+            finalText = DictationLayout.restoringBoundaryBreaks(in: finalText, from: formatted)
             run.stage("finalize", text: finalText)
             // Fail-proof word pass after every engine: hesitations, stutters, list markup.
             finalText = DictationFinalPass.apply(finalText)
@@ -6583,7 +6280,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Only hesitations were said ("um"): nothing to paste. Same outcome as no speech.
                 run.update { $0.outcome = "no-speech" }
                 showToast(DictationRecoveryRules.emptyTranscriptMessage(mic: coordinator.audioCapture.activeMicrophoneName))
-                if iOwnLiveState {
+                if iOwnLiveState() {
                     recordingState.skipPolishForCurrent = false
                     recordingState.graniteTranscript = nil
                     recordingState.moonshineTranscript = nil
@@ -6591,29 +6288,45 @@ extension AppDelegate: NSWindowDelegate {
                 return
             }
             // Real-word pass (tinyfix): their/there, its/it's, then/than in English sentences. Off with cleanup.
-            if polishEnabledByUser && cleanupForTask != "none" {
-                let started = CFAbsoluteTimeGetCurrent()
-                finalText = DictationReferee.dictationPass(finalText, isCode: polishContext == .code)
-                run.stage("tinyfix", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000))
+            var lockedWordRanges: [NSRange] = []
+            if polishEnabledByUser && cleanupForTask != "none" && !DictationLayout.isBreakOnly(finalText) {
+                let repairTimer = PipelineTimer()
+                let input = finalText
+                let isCode = polishContext == .code
+                let repaired = await DictationReferee.background(collector: run) {
+                    DictationReferee.dictationPassDetailed(input, isCode: isCode, vocabulary: userVocab)
+                }
+                guard !Task.isCancelled, !work.isCancelled else { return }
+                finalText = repaired.text
+                lockedWordRanges = repaired.lockedRanges
+                run.stage("tinyfix", text: finalText, ms: repairTimer.milliseconds())
             }
             // tinynext recheck of Parakeet's low-confidence words: a word changes only when a near word reads
             // clearly better in context (LowConfidenceRecheck). Off with cleanup and in code. Falls back to text.
-            if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code {
-                let started = CFAbsoluteTimeGetCurrent()
-                let recheck = LowConfidenceRecheck.recheck(finalText, suspects: suspectWords, protectedTerms: userVocab)
+            if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code
+                && !DictationLayout.isBreakOnly(finalText) {
+                let repairTimer = PipelineTimer()
+                let input = finalText
+                let locks = lockedWordRanges
+                let recheck = await DictationReferee.background(collector: run) {
+                    LowConfidenceRecheck.recheck(input, suspects: parakeetSuspectsAgg,
+                                                 protectedTerms: userVocab, protectedRanges: locks)
+                }
+                guard !Task.isCancelled, !work.isCancelled else { return }
                 finalText = recheck.text
                 for change in recheck.changes {
                     run.decision("tinynext", "\(change.original) -> \(change.replacement)",
                                  reason: String(format: "score margin %.3f", change.delta))
                 }
-                run.stage("tinynext", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000),
-                          detail: ["suspects": "\(suspectWords.count)", "changed": "\(recheck.changes.count)"])
+                run.stage("tinynext", text: finalText, ms: repairTimer.milliseconds(),
+                          detail: ["suspects": "\(Set(parakeetSuspectsAgg).count)", "changed": "\(recheck.changes.count)"])
             }
             if polishContext != .code {
                 finalText = ProperNounVocabulary.applyPreferredSpelling(finalText, terms: preferredWords)
                 run.stage("vocabulary", text: finalText)
             }
-            if polishEnabledByUser && cleanupForTask != "none" {
+            if polishEnabledByUser && cleanupForTask != "none" && textFormatter.config.detectParagraphs
+                && !DictationLayout.isBreakOnly(finalText) {
                 finalText = polishContext == .code
                     ? DictationParagraphs.format(finalText)
                     : DictationParagraphs.formatDictation(finalText, isEmail: polishContext == .email)
@@ -6624,11 +6337,13 @@ extension AppDelegate: NSWindowDelegate {
             // during the polish round-trip, don't enqueue the paste step.
             // The cancelled-dictation History row was already written by
             // cancelInFlightProcessing(), so we just exit cleanly here.
-            if Task.isCancelled || recordingState.isCancelled(for: mySession) {
+            if Task.isCancelled || work.isCancelled {
                 run.update { $0.outcome = "cancelled" }
                 print("[VOICE-CANCEL-INFLIGHT] post-polish cancellation detected — skipping paste enqueue")
                 return
             }
+            let postCleanupMs = postCleanupTimer.milliseconds()
+            run.timing("postCleanupMs", postCleanupMs)
             // The single place a dictation's final text is decided. Remembered
             // before the paste is attempted, so Control+Command+V still works
             // when the automatic paste landed in the wrong place or failed.
@@ -6659,14 +6374,14 @@ extension AppDelegate: NSWindowDelegate {
             ])
 
             // Calculate statistics
-            let wordCount = finalText.split(separator: " ").count
+            let wordCount = finalText.split(whereSeparator: \.isWhitespace).count
             let durationSeconds = Int(duration)
             let wpm = durationSeconds > 0 ? (wordCount * 60) / durationSeconds : 0
             // "Last dictation" snapshot stats drive the live pill / stats UI and
             // represent the MOST RECENT dictation. If B owns the session, B is
             // the most recent — an older background session A must not overwrite
             // these with its stale numbers. Gate on ownership.
-            if iOwnLiveState {
+            if iOwnLiveState() {
                 recordingState.lastDictationWordCount = wordCount
                 recordingState.lastDictationDurationSeconds = durationSeconds
                 recordingState.lastDictationWPM = wpm
@@ -6689,133 +6404,37 @@ extension AppDelegate: NSWindowDelegate {
                 skipPolish: skipPolish, formatted: formatted, final: finalText,
                 fieldContextProvided: capturedFieldContextForTask != nil, command: pressEnterCommand)
             let polishOwnedFormatting = deliveryIntent.preFormatted
-            // BUGFIX (Category 4): if we ran optimistic paste, chain off THAT task
-            // (most-recent pasteChain) so our final paste serializes after our own
-            // optimistic write. Otherwise chain off the parakeet-return anchor so
-            // paste order = finish-call order, not polish-completion order.
-            // BUGFIX: reading `pasteChain` here was racy — during the polish
-            // await another session can mutate it. Use the local snapshot of
-            // our own optimistic task instead so we always serialize behind
-            // our own pre-polish write.
-            let prior: Task<Void, Never>? = optimisticActive
-                ? (ourOptimisticTask ?? pasteOrderAnchor)
-                : pasteOrderAnchor
-            print("[VOICE-TIMING] polish returned at \(Date()) chars=\(finalText.count)")
-            // OPTIMISTIC SWAP PATH: optimistic paste already wrote `formatted`
-            // to the field above. If polish completed and produced something
-            // genuinely different, attempt a Cmd+Z then paste the polished
-            // version. Bail out and leave the unpolished text in place when:
-            //   - polish didn't change anything (no swap needed)
-            //   - polish was disabled / short / non-English (finalText==formatted)
-            //   - the system pasteboard contents differ from what we wrote
-            //     (something else clobbered it — could be the user typing
-            //     manually, another paste source, etc.)
-            //
-            // The Cmd+Z + repaste is best-effort: if Cmd+Z can't undo (the
-            // app doesn't support it) the user ends up with both versions
-            // visible, which is a less bad outcome than losing their text.
-            let optimisticSwapNeeded = optimisticActive && polishChanged
-            let optimisticSig = optimisticPasteboardSig
+            let prior = pasteOrderAnchor
             // The pill's glow learns how long processing took for this much speech.
             PillWorkTiming.recordDictation(words: wordCount, audioSeconds: duration,
-                                           seconds: CFAbsoluteTimeGetCurrent() - keyUpAt)
+                                           seconds: keyUpTimer.seconds())
             run.update {
                 $0.fallbackReason = traceFallback
                 $0.timingsMs["rulesMs"] = Int(formatterMs)
                 $0.timingsMs["cleanupMs"] = polishMs
-                $0.timingsMs["handoffAtMs"] = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
+                $0.timingsMs["handoffAtMs"] = Int(keyUpTimer.seconds() * 1000)
                 $0.settings["context"] = polishContext.rawValue
                 $0.settings["autoPaste"] = "\(autoPaste)"
             }
             deliveryStarted = true
-            Task { @MainActor in
-                defer { deliverySlot.finish() }
+            let deliveryQueueTimer = PipelineTimer()
+            work.task = Task { @MainActor in
+                defer {
+                    deliverySlot.finish()
+                    self.dictationWork.finish(work)
+                    self.recordingState.transcribingCount = self.dictationWork.activeCount
+                    self.scheduleMenuBarIconTimer()
+                    self.refreshMenuBarIcon()
+                }
                 _ = await prior?.value
-                // ESC-cancel checkpoint: unlike the optimistic first paste, the
-                // swap (Cmd+Z undo + repaste) had no early guard — so an ESC
-                // could still trigger an undo/repaste after cancellation. Bail.
-                guard !Task.isCancelled, !self.recordingState.isCancelled(for: mySession) else { return }
-                let tPasteStart = CFAbsoluteTimeGetCurrent()
-                if optimisticSwapNeeded, let sig = optimisticSig {
-                    // SWAP PATH — optimistic paste already ran, try to replace.
-                    let pb = NSPasteboard.general
-                    let currentClipboard = pb.string(forType: .string) ?? ""
-                    if currentClipboard != sig {
-                        print("[VOICE] OPTIMISTIC swap SKIPPED — clipboard changed since paste (current!=sig)")
-                        if autoCopy {
-                            DictationPasteboard.write(finalText, to: pb)
-                        }
-                    } else {
-                        if let id = capturedTargetForTask,
-                           let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
-                           !app.isActive {
-                            app.activate()
-                        }
-                        try? await Task.sleep(nanoseconds: 60_000_000)
-                        self.cursorPaster.undoLastPaste()
-                        try? await Task.sleep(nanoseconds: 60_000_000)
-                        // TRANSCRIPT-LOSS SAFETY NET (mirrors the final-paste
-                        // path): keep the polished text on the clipboard as the
-                        // recovery net whether or not auto-copy is on, and never
-                        // restore the prior clipboard over it. If the synthetic
-                        // repaste fails, CursorPaster's toast tells the user to
-                        // press Cmd+V — that must actually paste their transcript.
-                        DictationPasteboard.write(finalText, to: pb)
-                        self.cursorPaster.pasteAtCursor(
-                            finalText,
-                            restoreClipboard: false,
-                            preFormatted: polishOwnedFormatting
-                        )
-                        try? await Task.sleep(nanoseconds: 60_000_000)
-                    }
-                    Qwen3Polisher.shared.updateRollingContext(finalText)
-                    let pasteMs = (CFAbsoluteTimeGetCurrent() - tPasteStart) * 1000
-                    let totalMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-                    fputs("[LATENCY] Paste (optimistic-swap branch): \(Int(pasteMs))ms\n", stderr)
-                    run.finish(outcome: "optimistic-swap", output: finalText, fallback: traceFallback)
-                    fputs("[LATENCY] TOTAL pipeline (optimistic): \(Int(totalMs))ms (parakeet=\(Int(parakeetMs)) formatter=\(Int(formatterMs)) polish=\(polishMs) paste=\(Int(pasteMs)))\n", stderr)
-                    Telemetry.log("latency.pipeline", properties: [
-                        "total_ms": Int(totalMs),
-                        "parakeet_ms": Int(parakeetMs),
-                        "formatter_ms": Int(formatterMs),
-                        "polish_ms": polishMs,
-                        "paste_ms": Int(pasteMs),
-                        "polish_enabled": polishEnabledByUser,
-                        "polish_skipped_short": skipPolish,
-                        "input_chars": formatted.count,
-                        "output_chars": finalText.count,
-                        "optimistic_paste": true
-                    ])
+                let deliveryQueueMs = deliveryQueueTimer.milliseconds()
+                run.timing("deliveryQueueMs", deliveryQueueMs)
+                // Cancellation while waiting for the previous delivery must not paste later.
+                guard !Task.isCancelled, work.mayDeliver else {
+                    run.finish(outcome: "cancelled", output: nil)
                     return
                 }
-                if optimisticActive && !optimisticSwapNeeded {
-                    // Optimistic paste already landed the right text — nothing to do.
-                    print("[VOICE] OPTIMISTIC paste was sufficient — polish unchanged")
-                    if autoCopy {
-                        let pb = NSPasteboard.general
-                        DictationPasteboard.write(finalText, to: pb)
-                    }
-                    Qwen3Polisher.shared.updateRollingContext(finalText)
-                    let pasteMs = (CFAbsoluteTimeGetCurrent() - tPasteStart) * 1000
-                    let totalMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-                    fputs("[LATENCY] Paste (optimistic-noop branch): \(Int(pasteMs))ms\n", stderr)
-                    run.finish(outcome: "optimistic", output: finalText, fallback: traceFallback)
-                    fputs("[LATENCY] TOTAL pipeline (optimistic-noop): \(Int(totalMs))ms (parakeet=\(Int(parakeetMs)) formatter=\(Int(formatterMs)) polish=\(polishMs) paste=\(Int(pasteMs)))\n", stderr)
-                    Telemetry.log("latency.pipeline", properties: [
-                        "total_ms": Int(totalMs),
-                        "parakeet_ms": Int(parakeetMs),
-                        "formatter_ms": Int(formatterMs),
-                        "polish_ms": polishMs,
-                        "paste_ms": Int(pasteMs),
-                        "polish_enabled": polishEnabledByUser,
-                        "polish_skipped_short": skipPolish,
-                        "input_chars": formatted.count,
-                        "output_chars": finalText.count,
-                        "optimistic_paste": true,
-                        "optimistic_noop": true
-                    ])
-                    return
-                }
+                let pasteTimer = PipelineTimer()
                 if autoCopy {
                     print("[VOICE] Copying to clipboard...")
                     let pb = NSPasteboard.general
@@ -6826,34 +6445,46 @@ extension AppDelegate: NSWindowDelegate {
                 // and clipboard details out of the trace.
                 var traceStages: [String: Int] = [
                     "transcriptAtMs": transcriptAtMs,
-                    "rulesMs": Int(formatterMs)
+                    "rulesMs": Int(formatterMs),
+                    "postCleanupMs": postCleanupMs,
+                    "deliveryQueueMs": deliveryQueueMs
                 ]
                 if started != nil { traceStages["holdMs"] = Int(duration * 1000) }
                 if traceModelWillRun { traceStages["modelMs"] = polishMs }
                 var trace = DictationTrace(
                     engine: traceEngine, engineReady: traceEngineReady, fallbackReason: traceFallback,
-                    level: CleanupLevel.current.rawValue, style: personalityForTask,
+                    level: cleanupForTask, style: personalityForTask,
                     stagesMs: traceStages, pasteVerdict: nil, recordedAt: Date())
                 let traceGate = OneShotGate()
+                var dispatchedReceipt: CursorPaster.PasteReceipt?
+                var pasteDispatchTimer: PipelineTimer?
                 // Set when the paste was refused for a secure (password) field. Text from such a dictation is never logged.
                 var pasteTargetSecure = false
                 func recordPaste(_ verdict: String) {
                     guard traceGate.claim() else { return }
                     let secure = pasteTargetSecure || verdict == "secure-field"
                     trace.pasteVerdict = verdict
+                    let completedAt = keyUpTimer.milliseconds()
+                    trace.stagesMs["deliveryCompleteAtMs"] = completedAt
+                    trace.stagesMs["deliveryMs"] = pasteTimer.milliseconds()
+                    if let pasteDispatchTimer { trace.stagesMs["readbackMs"] = pasteDispatchTimer.milliseconds() }
                     DictationTraceLog.append(trace)
-                    run.timing("pasteAtMs", Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000))
-                    run.finish(outcome: verdict, output: finalText, fallback: trace.fallbackReason, secureField: secure)
+                    run.update {
+                        $0.timingsMs.merge(trace.stagesMs, uniquingKeysWith: { _, current in current })
+                        $0.timingsMs["pasteAtMs"] = completedAt // legacy alias for delivery completion
+                    }
+                    run.finish(outcome: verdict, output: dispatchedReceipt?.insertedText ?? finalText,
+                               fallback: trace.fallbackReason, secureField: secure)
                     let runID = run.snapshot.id
                     Task { @MainActor in self.lastDictationRunID = runID }
                     // Training copy with text: every dictation, whatever happened to the paste.
                     DictationTrainingLog.append(DictationTrainingRecord(
                         id: claimed?.sessionId.uuidString, recordedAt: Date(), app: capturedTargetForTask,
-                        audioPath: claimed?.audioURL?.path, durationSeconds: Int(duration),
+                        audioPath: secure ? nil : claimed?.audioURL?.path, durationSeconds: Int(duration),
                         asrRaw: secure ? nil : rawText,
                         rulesText: secure ? nil : formatted, modelOutput: secure ? nil : modelOutputForTraining,
-                        finalText: secure ? nil : finalText,
-                        engine: trace.engine, fallbackReason: trace.fallbackReason, level: trace.level,
+                        finalText: secure ? nil : (dispatchedReceipt?.insertedText ?? finalText),
+                        engine: trace.engine, fallbackReason: secure ? nil : trace.fallbackReason, level: trace.level,
                         style: trace.style, pasteVerdict: verdict))
                 }
                 if autoPaste {
@@ -6866,7 +6497,7 @@ extension AppDelegate: NSWindowDelegate {
                     // the audio claim and now (race between finishRecording's async
                     // task and cancelRecording), skip the paste entirely. Audio drain
                     // and cleanup above already ran — only the cursor write is skipped.
-                    guard !self.recordingState.isCancelled(for: mySession) else {
+                    guard !work.isCancelled else {
                         print("[VOICE-HK] finishRecording: session was cancelled — skipping paste")
                         Telemetry.signal("paste.skipped", "cancelled", ["session": mySession])
                         recordPaste("cancelled")
@@ -6878,6 +6509,22 @@ extension AppDelegate: NSWindowDelegate {
                     // restoration. A scheduled paste is not confirmation of delivery.
                     await withCheckedContinuation { (landed: CheckedContinuation<Void, Never>) in
                     let landedGate = OneShotGate()
+                    var readbackBackstop: Task<Void, Never>?
+                    func finishDelivery() {
+                        guard landedGate.claim() else { return }
+                        readbackBackstop?.cancel()
+                        readbackBackstop = nil
+                        landed.resume()
+                    }
+                    // Arm before dispatch, including failures that complete synchronously.
+                    readbackBackstop = Task {
+                        do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                        guard landedGate.claim() else { return }
+                        work.expireDelivery()
+                        recordPaste(trace.stagesMs["pasteSentAtMs"] == nil ? "no-dispatch-result" : "unverified")
+                        readbackBackstop = nil
+                        landed.resume()
+                    }
                     var skippedInSecureField = false
                     cursorPaster.pasteAtCursor(
                         finalText,
@@ -6889,23 +6536,36 @@ extension AppDelegate: NSWindowDelegate {
                         maySubmit: { [weak self] in
                             guard let self else { return false }
                             return self.recordingState.recordingSessionID == mySession &&
-                                !self.recordingState.isCancelled(for: mySession) &&
+                                work.mayDeliver &&
                                 UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled")
                         },
                         mayDeliver: { [weak self] in
-                            guard let self else { return false }
-                            return !self.recordingState.isCancelled(for: mySession)
+                            guard self != nil else { return false }
+                            return work.mayDeliver
+                        },
+                        onDispatched: { receipt in
+                            dispatchedReceipt = receipt
+                            // Record boundary adaptation as its own stage, so cleanup and paste are distinguishable.
+                            run.stage("paste-boundary", text: receipt.insertedText,
+                                      detail: ["changed": "\(receipt.insertedText != finalText)",
+                                               "rangeKnown": "\(receipt.insertedRange != nil)"])
                         },
                         completion: { [weak self] result in
-                            defer { if landedGate.claim() { landed.resume() } }
+                            // A sent event is not a completed delivery: keep the FIFO
+                            // slot until readback has either verified or attempted fallback.
+                            defer {
+                                if result != .eventSent { finishDelivery() }
+                            }
                             switch result {
                             case .eventSent:
-                                trace.stagesMs["pasteSentAtMs"] = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
+                                pasteDispatchTimer = PipelineTimer()
+                                trace.stagesMs["pasteSentAtMs"] = keyUpTimer.milliseconds()
                                 // Wispr plays its paste cue once a dictation is pasted.
                                 SoundEffects.playDone()
                                 // Wispr's auto-cleanup nudge: "Cleaned up! See what's changed".
-                                if let self, let diff = PolishDiff.autoCleanupNudge(raw: rawText, final: finalText,
-                                                                                     level: CleanupLevel.current.rawValue) {
+                                if let self, self.recordingState.recordingSessionID == mySession,
+                                   !work.isCancelled, let diff = PolishDiff.autoCleanupNudge(raw: rawText, final: finalText,
+                                                                                     level: cleanupForTask) {
                                     self.recordingState.polishDiff = diff
                                 }
                             case .skipped:
@@ -6918,6 +6578,7 @@ extension AppDelegate: NSWindowDelegate {
                             // A failed dispatch may report unknown synchronously before
                             // completion. Let the completion record the actual failure.
                             if trace.stagesMs["pasteSentAtMs"] != nil {
+                                defer { finishDelivery() }
                                 switch verdict {
                                 case .verified: recordPaste("landed"); PillHaptics.pasteConfirmed()
                                 case .notLanded: recordPaste("not-landed")
@@ -6926,16 +6587,15 @@ extension AppDelegate: NSWindowDelegate {
                             }
                             // Learning starts only after the paste is verified in the field.
                             // A sent event is not enough, and unknown or not-landed starts nothing.
-                            guard verdict == .verified, let target = claimed?.pasteTarget else { return }
-                            CorrectionLearner.shared.track(pastedText: finalText, snapshot: target,
-                                                           dictationID: claimed?.sessionId.uuidString)
+                            guard work.mayDeliver, verdict == .verified, let receipt = dispatchedReceipt else { return }
+                            CorrectionLearner.shared.track(receipt: receipt, dictationID: run.snapshot.id)
                         },
                         onFailure: { [weak self] reason in
                             skippedInSecureField = reason == .secureField
                             if reason == .secureField { pasteTargetSecure = true }
                             guard let self,
                                   self.recordingState.recordingSessionID == mySession,
-                                  !self.recordingState.isCancelled(for: mySession) else { return }
+                                  !work.isCancelled else { return }
                             if reason == .notConfirmed {
                                 self.showCopiedNotice()
                                 return
@@ -6943,12 +6603,6 @@ extension AppDelegate: NSWindowDelegate {
                             self.showPasteRecovery(finalText, id: recoveryID, secureField: reason == .secureField)
                         }
                     )
-                    // Backstop: a paste that never reports back must not hold up the next dictation.
-                    Task {
-                        try? await Task.sleep(for: .seconds(3))
-                        recordPaste(trace.stagesMs["pasteSentAtMs"] == nil ? "no-dispatch-result" : "unverified")
-                        if landedGate.claim() { landed.resume() }
-                    }
                     }
                     // Reduced settle — Wispr Flow ships Cmd-V without these.
                     // (Inter-paste 60ms removed entirely.)
@@ -6956,9 +6610,9 @@ extension AppDelegate: NSWindowDelegate {
                     print("[VOICE] Auto-paste disabled")
                     recordPaste("auto-paste-off")
                 }
-                let pasteMs = (CFAbsoluteTimeGetCurrent() - tPasteStart) * 1000
-                let totalMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-                fputs("[LATENCY] Paste (incl. queue + settle): \(Int(pasteMs))ms\n", stderr)
+                let pasteMs = pasteTimer.seconds() * 1000
+                let totalMs = pipelineTimer.seconds() * 1000
+                fputs("[LATENCY] Delivery: \(Int(pasteMs))ms; queue: \(deliveryQueueMs)ms\n", stderr)
                 fputs("[LATENCY] TOTAL pipeline: \(Int(totalMs))ms (parakeet=\(Int(parakeetMs)) formatter=\(Int(formatterMs)) polish=\(polishMs) paste=\(Int(pasteMs)))\n", stderr)
                 Telemetry.log("latency.pipeline", properties: [
                     "total_ms": Int(totalMs),
@@ -6966,6 +6620,9 @@ extension AppDelegate: NSWindowDelegate {
                     "formatter_ms": Int(formatterMs),
                     "polish_ms": polishMs,
                     "paste_ms": Int(pasteMs),
+                    "delivery_queue_ms": deliveryQueueMs,
+                    "post_cleanup_ms": postCleanupMs,
+                    "key_up_to_delivery_ms": keyUpTimer.milliseconds(),
                     "polish_enabled": polishEnabledByUser,
                     "polish_skipped_short": skipPolish,
                     "input_chars": formatted.count,
@@ -6991,10 +6648,10 @@ extension AppDelegate: NSWindowDelegate {
                 let trimmedPol = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
                 let trimmedRaw = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmedPol.isEmpty, !trimmedRaw.isEmpty,
-                      trimmedPol.lowercased() != trimmedRaw.lowercased() else { return 0 }
+                      trimmedPol != trimmedRaw else { return 0 }
                 return RecentDictations.countFixes(raw: trimmedRaw, polished: trimmedPol)
             }()
-            RecentDictations.add(raw: formatted, polished: finalText,
+            let historySaved = RecentDictations.add(raw: formatted, polished: finalText,
                                   pasteTargetBundleID: capturedTargetForTask,
                                   polishMs: polishChanged ? polishMs : nil,
                                   granite: graniteTranscript,
@@ -7006,7 +6663,10 @@ extension AppDelegate: NSWindowDelegate {
                                   cleanupLevelUsed: cleanupForTask,
                                   personalityStyleUsed: personalityForTask,
                                   polishFixCount: fixCount,
-                                  polishEngine: PolishStatus.shared.lastEngine)
+                                  polishEngine: run.snapshot.models["cleanupEngine"],
+                                  audioFilePath: claimed?.audioURL?.path,
+                                  recordingID: claimed?.sessionId.uuidString ?? mySession.uuidString)
+            self.reportHistorySaveFailure(historySaved)
             // The database row (saved under this session's id when recording
             // stopped) keeps what was heard; add what was pasted beside it.
             if let rowID = claimed?.sessionId {
@@ -7014,13 +6674,16 @@ extension AppDelegate: NSWindowDelegate {
                 catch { vlog("[VOICE] finalText not stored: \(error.localizedDescription)") }
             }
 
-            // Auto-learn proper nouns from the polished text. Looks at the
-            // user's last 50 dictations and promotes capitalized terms that
-            // appear ≥2 times into the proper-noun vocabulary — so the next
-            // polish pass treats them as fixed brand/contact names instead
-            // of "correcting" their spelling.
-            let priorDictations = RecentDictations.all().prefix(50).map(\.text)
-            ProperNounVocabulary.learnFrom(finalText, previousDictations: Array(priorDictations))
+            // Observe repeated names in recognition, not names invented by
+            // cleanup. Exclude this just-saved recording and cancelled history;
+            // a replay carries the same evidence ID and cannot add another vote.
+            if !BackgroundActivityGate.privacyMode {
+                let recordingID = claimed?.sessionId.uuidString ?? mySession.uuidString
+                let priorRecognition = RecentDictations.recognitionHistory(RecentDictations.all(), excluding: recordingID)
+                Task.detached(priority: .utility) {
+                    ProperNounVocabulary.learnFrom(rawText, previousDictations: priorRecognition, evidenceID: recordingID)
+                }
+            }
             Telemetry.log("dictation.completed", properties: [
                 "chars": formatted.count,
                 "duration_s": durationSeconds,
@@ -7097,6 +6760,7 @@ extension AppDelegate: NSWindowDelegate {
 
     func undoLastPaste() {
         guard !recordingState.lastPastedText.isEmpty else { return }
+        CorrectionLearner.shared.cancelPending(dictationID: lastDictationRunID)
         if let id = lastDictationRunID { FlowRunLog.followup(id: id, kind: "dictation", followup: "undo-paste") }
         dismissUndoPasteToast()
         showToast("Use Undo in the original app")
@@ -7138,7 +6802,8 @@ extension AppDelegate: NSWindowDelegate {
                         if CleanupLevel.current != .none && polishEnabled {
                             finalText = await Qwen3Polisher.shared.polish(
                                 formatted, suspectWords: nil,
-                                userVocabulary: Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms())),
+                                userVocabulary: PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                                    ProperNounVocabulary.current(), CombinedDictionary.terms()),
                                 cleanupLevel: CleanupLevel.current.rawValue,
                                 personalityStyle: PersonalityStyle.current.rawValue)
                         }
@@ -7387,9 +7052,7 @@ extension AppDelegate: HotkeyServiceDelegate {
 
         // [VOICE-TIMING] hotkey press received at the gate-passed boundary
         print("[VOICE-TIMING] hotkey press received at \(Date())")
-        if Qwen3Polisher.isEnabled, CleanupLevel.current != .none {
-            Task(priority: .utility) { await DraftDecisionGate.prewarmIfEnabled() }
-        }
+        // Auxiliary model warmups are owned by RecordingCoordinator for every capture route.
         // === Path 2: re-press while transcribing — start fresh alongside ===
         // The prior finishRecording() task keeps running to completion: its
         // transcript will still polish and paste at the cursor via pasteChain.
@@ -7693,11 +7356,13 @@ class RecordingState {
         didSet {
             guard oldValue != isPolishingSelection else { return }
             polishWorkStartedAt = isPolishingSelection ? Date() : nil
+            if !isPolishingSelection { polishOperationID = nil }
             polishWorkStage = .editing
             polishWorkEstimate = nil
         }
     }
     private(set) var polishWorkStartedAt: Date?
+    var polishOperationID: String?
     var polishWorkStage: FlowWorkPresentation.PolishStage = .editing
     var polishWorkEstimate: FlowWorkPresentation.PolishEstimate?
     /// True while a meeting capture session is active (Google Meet / Zoom / Teams).

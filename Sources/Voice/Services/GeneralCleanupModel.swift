@@ -61,21 +61,19 @@ actor GeneralCleanupModel {
     nonisolated static func entry(id: String) -> Entry? {
         guard id != WhisperNowTunedPolisher.settingValue, id != WhisperNowTunedPolisher.legacySettingValue,
               id != "s1-mini", id != "qwen3",
-              let data = try? Data(contentsOf: catalogURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let models = json["models"] as? [[String: Any]],
-              let row = models.first(where: { $0["id"] as? String == id }),
+              let catalog = CleanupModelCatalog.load(from: catalogURL),
+              let row = catalog.row(id: id),
               let path = row["file"] as? String else { return nil }
         let expanded = (path as NSString).expandingTildeInPath
         let file = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded)
             : WhisperNowTunedPolisher.modelDirectory.deletingLastPathComponent().appendingPathComponent(expanded)
-        func number(_ key: String, _ fallback: Double) -> Double { (row[key] as? NSNumber)?.doubleValue ?? fallback }
+        let limits = CleanupRuntimeLimits(row)
         return Entry(id: id, name: row["name"] as? String ?? id, file: file,
-                     bytes: (row["bytes"] as? NSNumber)?.int64Value,
-                     timeoutBase: number("timeoutBase", 3), timeoutPerWord: number("timeoutPerWord", 0.12),
-                     timeoutMax: number("timeoutMax", 25), coldWait: number("coldWait", 1.5),
-                     idleStop: number("idleStop", 900), contextSize: Int(number("contextSize", 8192)),
-                     prompt: (row["prompt"] as? String) ?? (json["prompt"] as? String),
+                     bytes: CleanupRuntimeLimits.weightBytes(row["bytes"]),
+                     timeoutBase: limits.timeoutBase, timeoutPerWord: limits.timeoutPerWord,
+                     timeoutMax: limits.timeoutMax, coldWait: limits.coldWait,
+                     idleStop: limits.idleStop, contextSize: limits.contextSize,
+                     prompt: (row["prompt"] as? String) ?? catalog.prompt,
                      server: (row["server"] as? String).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
                      extraArguments: row["args"] as? [String] ?? [])
     }
@@ -104,15 +102,17 @@ actor GeneralCleanupModel {
 
     enum Failure: String, Error, Sendable {
         case notSelected, notInstalled, serverMissing, lowMemory, loadFailed, recentlyFailed, loading
-        case timeout, httpError, badReply, tokenLimit, invalidInput
+        case timeout, httpError, badReply, tokenLimit, invalidInput, busy, cancelled
     }
 
     private var server: Process?
     private var serverEntry: Entry?
     private var port = 0
     private var ready = false
-    private var loadTask: Task<Bool, Never>?
-    private var failedUntil: [String: Date] = [:]
+    private var loadTask: SharedModelTask<Bool>?
+    private var loadGeneration: UUID?
+    private var inFlight = false
+    private var failedUntil: [String: (entry: Entry, until: Date)] = [:]
     private var idleStopTask: Task<Void, Never>?
 
     private let session: URLSession = {
@@ -122,12 +122,19 @@ actor GeneralCleanupModel {
         return URLSession(configuration: configuration)
     }()
 
+    var isSelectedModelReady: Bool {
+        ready && server?.isRunning == true && serverEntry == Self.selectedEntry
+    }
+
     private nonisolated func setStatus(_ value: String, _ entry: Entry) {
+        guard Self.selectedEntry == entry else { return }
         UserDefaults.standard.set(entry.id + "|" + value, forKey: Self.statusKey)
     }
 
     /// Starts the selected model's server in the background (no-op when it is warm or nothing is selected).
     func prepare() {
+        // A changed selection is applied after the current request releases its lease.
+        guard !Task.isCancelled, !inFlight else { return }
         guard let entry = Self.selectedEntry else {
             if server != nil { stop() }
             return
@@ -135,12 +142,12 @@ actor GeneralCleanupModel {
         _ = ensureLoading(entry)
     }
 
-    private func ensureLoading(_ entry: Entry) -> Task<Bool, Never>? {
+    private func ensureLoading(_ entry: Entry) -> SharedModelTask<Bool>? {
         if serverEntry == entry, server?.isRunning == true {
             if ready { scheduleIdleStop(entry); return nil }
             if let loadTask { return loadTask }
         }
-        if let until = failedUntil[entry.id], until > Date() { return nil }
+        if recentlyFailed(entry) { return nil }
         // The server exited while it was still loading (bad file, out of memory): that is the failure, not a cue to
         // start it again.
         if serverEntry == entry, loadTask != nil, server?.isRunning != true {
@@ -154,7 +161,8 @@ actor GeneralCleanupModel {
         if entry.server != nil, ownServer == nil { fail(entry, "its llama-server build is missing"); return nil }
         guard let binary = ownServer ?? WhisperNowTunedPolisher.serverBinary() else { fail(entry, "llama-server missing"); return nil }
         // Weights plus about 2 GB of working space must fit without pushing the Mac into swap.
-        let need = UInt64(max(entry.bytes ?? 0, 0)) + 2 * 1024 * 1024 * 1024
+        let fileBytes = ((try? FileManager.default.attributesOfItem(atPath: entry.file.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        let need = UInt64(max(entry.bytes ?? 0, fileBytes, 0)) + 2 * 1024 * 1024 * 1024
         guard VoiceMemoryHeadroom.allowsModelLoad(floor: need) else { fail(entry, "not enough free memory"); return nil }
         guard let freePort = WhisperNowTunedPolisher.freeLocalPort() else { fail(entry, "no free port"); return nil }
         let arguments = ["-m", entry.file.path, "--jinja", "--host", "127.0.0.1", "--port", String(freePort),
@@ -168,41 +176,55 @@ actor GeneralCleanupModel {
         setStatus("loading", entry)
         print("[VOICE] General cleanup: loading \(entry.name) on port \(freePort)")
         let started = Date()
-        let task = Task { [session] () -> Bool in
+        let generation = UUID()
+        loadGeneration = generation
+        let task = SharedModelTask<Bool> { [session] in
             var request = URLRequest(url: URL(string: "http://127.0.0.1:\(freePort)/health")!)
             request.timeoutInterval = 1
-            let deadline = Date().addingTimeInterval(90)
-            while process.isRunning && Date() < deadline {
-                if Task.isCancelled { return false }
+            let deadline = ContinuousClock.now + .seconds(90)
+            var healthy = false
+            while process.isRunning && ContinuousClock.now < deadline && !Task.isCancelled {
                 if let (_, response) = try? await session.data(for: request),
-                   (response as? HTTPURLResponse)?.statusCode == 200 { return true }
-                try? await Task.sleep(for: .milliseconds(200))
+                   (response as? HTTPURLResponse)?.statusCode == 200 {
+                    healthy = true
+                    break
+                }
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
             }
-            return false
+            // Publish the state before the shared task completes. Previously a
+            // waiter could observe success while ready was still false.
+            return await self.finishLoad(entry, generation: generation, healthy: healthy, started: started)
         }
         loadTask = task
-        Task { await self.finishLoad(entry, task: task, started: started) }
         return task
     }
 
-    private func finishLoad(_ entry: Entry, task: Task<Bool, Never>, started: Date) async {
-        let ok = await task.value
-        guard serverEntry == entry, loadTask == task else { return }
+    private func finishLoad(_ entry: Entry, generation: UUID, healthy: Bool, started: Date) -> Bool {
+        guard serverEntry == entry, loadGeneration == generation else { return false }
         loadTask = nil
-        if ok {
+        loadGeneration = nil
+        if healthy, !Task.isCancelled, server?.isRunning == true {
             ready = true
             failedUntil[entry.id] = nil
             setStatus("ready", entry)
             print("[VOICE] General cleanup: \(entry.name) ready in \(Int(Date().timeIntervalSince(started) * 1000))ms")
             scheduleIdleStop(entry)
-        } else {
-            stop()
-            fail(entry, "model did not load")
+            return true
         }
+        stop()
+        fail(entry, "model did not load")
+        return false
+    }
+
+    private func recentlyFailed(_ entry: Entry) -> Bool {
+        guard let failure = failedUntil[entry.id] else { return false }
+        return failure.entry == entry && failure.until > Date()
     }
 
     private func fail(_ entry: Entry, _ reason: String) {
-        failedUntil[entry.id] = Date().addingTimeInterval(600)
+        // Correcting a catalog row should retry immediately; a failure of old
+        // weights/settings must not blacklist the same ID for ten minutes.
+        failedUntil[entry.id] = (entry, Date().addingTimeInterval(600))
         setStatus("failed: " + reason, entry)
         Telemetry.log("cleanup.general_load_failed", properties: ["model": entry.id, "reason": reason])
         print("[VOICE] General cleanup: \(entry.name) failed (\(reason)); DOSE1 handles dictation")
@@ -210,9 +232,10 @@ actor GeneralCleanupModel {
 
     private func scheduleIdleStop(_ entry: Entry) {
         idleStopTask?.cancel()
+        guard !inFlight, ready, serverEntry == entry else { return }
         idleStopTask = Task {
             do { try await Task.sleep(for: .seconds(entry.idleStop)) } catch { return }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, !self.inFlight, self.serverEntry == entry else { return }
             self.stop()
             // Without this the status stayed "ready" for a model that was no longer loaded.
             self.setStatus("idle", entry)
@@ -222,6 +245,7 @@ actor GeneralCleanupModel {
     private func stop() {
         loadTask?.cancel()
         loadTask = nil
+        loadGeneration = nil
         idleStopTask?.cancel()
         idleStopTask = nil
         if server?.isRunning == true { server?.terminate() }
@@ -232,22 +256,34 @@ actor GeneralCleanupModel {
     }
 
     /// Cleans one transcript with the selected general model. Any failure returns quickly so DOSE1 can take over.
-    func clean(_ transcript: String) async -> Result<WhisperNowTunedPolisher.Reply, Failure> {
-        guard let entry = Self.selectedEntry else { return .failure(.notSelected) }
+    func clean(_ transcript: String, entry requested: Entry? = nil) async -> Result<WhisperNowTunedPolisher.Reply, Failure> {
+        guard !Task.isCancelled else { return .failure(.cancelled) }
+        guard !inFlight else { return .failure(.busy) }
+        guard let entry = requested ?? Self.selectedEntry else { return .failure(.notSelected) }
         let input = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return .success(.empty) }
         guard input.count <= WhisperNowTunedPolisher.maximumInputCharacters else { return .failure(.invalidInput) }
+        // The one-slot llama server must not queue stale dictations. This also
+        // prevents a warmup/settings change from replacing a server mid-request.
+        inFlight = true
+        idleStopTask?.cancel()
+        defer {
+            inFlight = false
+            if Self.selectedEntry != entry { prepare() }
+            else { scheduleIdleStop(entry) }
+        }
         if !(serverEntry == entry && ready && server?.isRunning == true) {
-            if let until = failedUntil[entry.id], until > Date() { return .failure(.recentlyFailed) }
+            if recentlyFailed(entry) { return .failure(.recentlyFailed) }
             guard let task = ensureLoading(entry) else {
                 if !(serverEntry == entry && ready) { return .failure(.loadFailed) }
                 return await complete(input, entry: entry)
             }
             // A cold model takes 5 to 20 s to load. The dictation waits briefly, then DOSE1 takes it while the
             // model keeps loading for the next one.
-            let waited = await DictationDeadline.run(seconds: entry.coldWait) { await task.value }
-            guard waited == true, ready else {
-                setStatus("fallback: still loading", entry)
+            let waited = await DictationDeadline.run(seconds: entry.coldWait) { (try? await task.value) == true }
+            guard !Task.isCancelled else { return .failure(.cancelled) }
+            guard waited == true, ready, serverEntry == entry, server?.isRunning == true else {
+                if loadTask != nil { setStatus("fallback: still loading", entry) }
                 return .failure(.loading)
             }
         }
@@ -255,7 +291,10 @@ actor GeneralCleanupModel {
     }
 
     private func complete(_ input: String, entry: Entry) async -> Result<WhisperNowTunedPolisher.Reply, Failure> {
-        scheduleIdleStop(entry)
+        guard !Task.isCancelled else { return .failure(.cancelled) }
+        guard ready, serverEntry == entry, let activeServer = server, activeServer.isRunning, port > 0 else {
+            return .failure(.loadFailed)
+        }
         let words = input.split(whereSeparator: \.isWhitespace).count
         let limit = entry.timeout(words: words)
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
@@ -273,6 +312,8 @@ actor GeneralCleanupModel {
         let started = Date()
         do {
             let (data, response) = try await session.data(for: request)
+            guard !Task.isCancelled else { return .failure(.cancelled) }
+            guard server === activeServer, serverEntry == entry else { return .failure(.loadFailed) }
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return .failure(.httpError) }
             do {
                 let reply = try WhisperNowTunedPolisher.parseReply(data)
@@ -284,6 +325,7 @@ actor GeneralCleanupModel {
                 return .failure(failure == .tokenLimit ? .tokenLimit : .badReply)
             } catch { return .failure(.badReply) }
         } catch {
+            if Task.isCancelled { return .failure(.cancelled) }
             if (error as? URLError)?.code == .timedOut {
                 setStatus("fallback: too slow", entry)
                 return .failure(.timeout)

@@ -324,6 +324,33 @@ enum ShadowCleanupTrace {
     @TaskLocal static var observer: ShadowCleanupObserver?
 }
 
+/// A sectioned draft can use a model for one line and rules for another. Do
+/// not label the whole training example with only the final line's engine.
+private final class ShadowSectionCleanupObservations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var engines: Set<String> = []
+    private var controls: [String?] = []
+
+    func record(_ observer: ShadowCleanupObserver, fallbackEngine: String) {
+        let engine = observer.engine ?? fallbackEngine
+        let control = observer.controlLine
+        lock.withLock {
+            engines.insert(engine)
+            controls.append(control)
+        }
+    }
+
+    var summary: (engine: String, controlLine: String?) {
+        lock.withLock {
+            let ordered = engines.sorted()
+            let engine = ordered.isEmpty ? "rules" : (ordered.count == 1 ? ordered[0] : "mixed:" + ordered.joined(separator: "+"))
+            let lines = Set(controls.compactMap { $0 })
+            let control = controls.allSatisfy { $0 != nil } && lines.count == 1 ? lines.first : nil
+            return (engine, control)
+        }
+    }
+}
+
 // MARK: - Storage
 
 final class ShadowStore: @unchecked Sendable {
@@ -848,7 +875,8 @@ final class ShadowModeController: @preconcurrency FnKeyTapDelegate {
     private struct Cleanup {
         let input: String; let engine: String; let result: String; let ms: Int; let final: String
         var controlLine: String? = nil
-        var route: String { ShadowCleanupObserver.route(engine: engine, result: result) ?? "skip:unknown" }
+        var routeOverride: String? = nil
+        var route: String { routeOverride ?? ShadowCleanupObserver.route(engine: engine, result: result) ?? "skip:unknown" }
     }
 
     private func cleanUp(raw: String, segments: [TranscriptSegment], capture: Finished,
@@ -872,12 +900,15 @@ final class ShadowModeController: @preconcurrency FnKeyTapDelegate {
         let autoPaste = UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true
         let context = capture.context
         let cleanupLevel = context?.cleanupLevel ?? CleanupLevel.current.rawValue
-        let recognizedT2 = Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue
-            && WhisperNowTunedPolisher.usesT2Contracts
-        if recognizedT2 && DictationTextPreparation.predominantlyNonLatin(raw) { return skipped("non_latin") }
-        let preparation = T2CleanupOptions.preparationTranscript(rawASR: raw, recognizedT2: recognizedT2).map { text in
+        let usesTunedCleanup = Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue
+        let recognizedT2 = usesTunedCleanup && WhisperNowTunedPolisher.usesT2Contracts
+        let usesModelTranscript = recognizedT2 || (usesTunedCleanup && WhisperNowTunedPolisher.usesT4)
+        if usesModelTranscript && DictationTextPreparation.predominantlyNonLatin(raw) { return skipped("non_latin") }
+        let preparation = T2CleanupOptions.preparationTranscript(rawASR: raw, recognizedT2: usesModelTranscript).map { text in
             // Shadow recordings are stopped by the observed key gesture, not the spoken stop command.
-            DictationTextPreparation.Prepared(rawText: text, command: TrailingPressEnter.parse(text,
+            let commandText = formatter.config.interpretVoiceCommands
+                ? TextFormatter.interpretLineBreakCommands(text) : text
+            return DictationTextPreparation.Prepared(rawText: text, command: TrailingPressEnter.parse(commandText,
                 enabled: UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled") && autoPaste), rejection: nil)
         } ?? DictationTextPreparation.prepare(segments: segments, formatter: formatter,
             pressEnterEnabled: UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled"),
@@ -886,9 +917,14 @@ final class ShadowModeController: @preconcurrency FnKeyTapDelegate {
         if preparation.rejection == .empty { return skipped("empty_transcript") }
         let formatted = preparation.command.text
         func finalize(_ candidate: String) -> String {
-            T2CleanupOptions.finalizedTranscript(candidate: candidate, preparedASR: formatted,
-                level: cleanupLevel, recognizedT2: recognizedT2)
+            let result = T2CleanupOptions.finalizedTranscript(candidate: candidate, preparedASR: formatted,
+                level: cleanupLevel, recognizedT2: usesModelTranscript)
+                .map { DictationLayout.preservingLineBreaks(in: $0, from: formatted) }
                 ?? DictationTextPreparation.finalize(polished: candidate, formatted: formatted)
+            return DictationFinalPass.apply(DictationLayout.restoringBoundaryBreaks(in: result, from: formatted))
+        }
+        if DictationLayout.isBreakOnly(formatted) {
+            return skipped("layout-command", input: formatted, final: formatted)
         }
         let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
         if cleanupLevel == CleanupLevel.none.rawValue || !polishEnabled {
@@ -900,21 +936,45 @@ final class ShadowModeController: @preconcurrency FnKeyTapDelegate {
             return skipped("short_clip", input: formatted,
                            final: finalize(formatted))
         }
-        let suspects = Array(Set(segments.compactMap(\.suspectWords).flatMap { $0 }
-                                 + TextFormatter.suspectsForPolish(formatted)))
-        let vocabulary = Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms()))
+        let suspects = PromptTerms.orderedUnique(segments.compactMap(\.suspectWords).flatMap { $0 },
+                                                TextFormatter.suspectsForPolish(formatted))
+        let vocabulary = PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                                                 ProperNounVocabulary.current(), CombinedDictionary.terms())
         let observer = ShadowCleanupObserver()
+        let sectionObservations = ShadowSectionCleanupObservations()
+        let polishContext = context?.polishContext ?? .default
+        let appContextLabel = context?.appContextLabel ?? Qwen3Polisher.appContextLabel(forBundleID: context?.frontApp)
+        let personality = context?.personality ?? PersonalityStyle.current.rawValue
+        let qwenEngine = Qwen3Polisher.effectiveAutomaticCleanupModel == "qwen3" ? "local:qwen3" : "rules"
+        let polishDraft: @Sendable (String, Bool) async -> String = { text, isSection in
+            let requestObserver = isSection ? ShadowCleanupObserver() : observer
+            let result = await ShadowCleanupTrace.$observer.withValue(requestObserver) {
+                await Qwen3Polisher.shared.polish(text,
+                    context: polishContext,
+                    suspectWords: isSection || suspects.isEmpty ? nil : suspects,
+                    userVocabulary: vocabulary.isEmpty ? nil : vocabulary,
+                    fieldContext: nil,  // text before the cursor is never read in shadow mode
+                    appContextLabel: appContextLabel, cleanupLevel: cleanupLevel,
+                    personalityStyle: personality)
+            }
+            if isSection { sectionObservations.record(requestObserver, fallbackEngine: qwenEngine) }
+            return result
+        }
         let started = Date()
-        var polished = await ShadowCleanupTrace.$observer.withValue(observer) {
-            await Qwen3Polisher.shared.polish(
-                formatted,
-                context: context?.polishContext ?? .default,
-                suspectWords: suspects.isEmpty ? nil : suspects,
-                userVocabulary: vocabulary.isEmpty ? nil : vocabulary,
-                fieldContext: nil,  // text before the cursor is not read in shadow mode
-                appContextLabel: context?.appContextLabel ?? Qwen3Polisher.appContextLabel(forBundleID: context?.frontApp),
-                cleanupLevel: cleanupLevel,
-                personalityStyle: context?.personality ?? PersonalityStyle.current.rawValue)
+        let sectioned = polishContext != .code && Qwen3Polisher.isEnabled && formatted.contains(where: \.isNewline)
+        var sectionTimedOut = false
+        var polished: String
+        if sectioned {
+            let ranges = DictationTextPreparation.cleanupSections(in: formatted)
+            let deadline = ContinuousClock.now + .seconds(DictationDeadline.sectionBudgetSeconds(count: ranges.count))
+            let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline,
+                review: { original, edited in
+                    await DraftDecisionGate.shouldKeepOriginal(original, edited: edited, deadline: deadline)
+                }) { section in await polishDraft(section, true) }
+            polished = result.text
+            sectionTimedOut = result.timedOut
+        } else {
+            polished = await polishDraft(formatted, false)
         }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         let confirmedT2NoSpeech = recognizedT2 && observer.engine == "local:dose1-t2"
@@ -924,7 +984,13 @@ final class ShadowModeController: @preconcurrency FnKeyTapDelegate {
             polished = formatted
         }
         let final = confirmedT2NoSpeech ? "" : finalize(polished)
-        let qwenEngine = Qwen3Polisher.effectiveAutomaticCleanupModel == "qwen3" ? "local:qwen3" : "rules"
+        if sectioned {
+            let summary = sectionObservations.summary
+            let result = sectionTimedOut ? (polished == formatted ? "deadline" : "partial-deadline")
+                : (polished == formatted ? "unchanged" : "accepted")
+            return Cleanup(input: formatted, engine: summary.engine, result: "sections:" + result,
+                           ms: ms, final: final, controlLine: summary.controlLine, routeOverride: "sections")
+        }
         return Cleanup(input: observer.input ?? formatted,
                        engine: observer.engine ?? qwenEngine,
                        result: observer.result ?? (polished == formatted ? "unchanged" : "accepted"),

@@ -15,7 +15,14 @@ Wispr similarity second:
 Behaviour: empty, answering (reply instead of cleanup), looping, max-token stops.
 """
 import difflib
+import importlib.util
+from pathlib import Path
 import re
+
+_distance_spec = importlib.util.spec_from_file_location("flow_text_metrics", Path(__file__).with_name("text_metrics.py"))
+_distance_module = importlib.util.module_from_spec(_distance_spec)
+_distance_spec.loader.exec_module(_distance_module)
+edit_distance = _distance_module.edit_distance
 
 WORD = re.compile(r"[\w'’]+", re.UNICODE)
 TOKEN = re.compile(r"[\w'’-]+|[^\w\s]", re.UNICODE)
@@ -198,16 +205,6 @@ def deleted_positions(a, b):
         if op in ('delete', 'replace'):
             gone.update(range(i1, i2))
     return gone
-
-
-def edit_distance(a, b):
-    previous = list(range(len(b) + 1))
-    for i, x in enumerate(a, 1):
-        current = [i] + [0] * len(b)
-        for j, y in enumerate(b, 1):
-            current[j] = min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (x != y))
-        previous = current
-    return previous[-1]
 
 
 def looping(source, output):

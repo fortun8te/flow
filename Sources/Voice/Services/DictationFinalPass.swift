@@ -21,6 +21,10 @@ enum DictationFinalPass {
     /// the caller reports no speech); a hesitation is never pasted (22 Nov 2026).
     static func apply(_ text: String) -> String {
         guard !text.isEmpty else { return text }
+        return outsideCode(in: text, applying: applyToProse)
+    }
+
+    private static func applyToProse(_ text: String) -> String {
         var result = plainLists(text)
         // A line ending ",." / ",!" (a greeting line "Hey Noor," that a later pass gave a full stop) keeps its comma.
         result = result.replacingOccurrences(of: #"(?m),[.!](?=[ \t]*$)"#, with: ",", options: .regularExpression)
@@ -44,15 +48,68 @@ enum DictationFinalPass {
     // MARK: - Protected spans
 
     private static let protectedPattern = try! NSRegularExpression(pattern:
-        #"`[^`\n]*`|https?://\S+|www\.\S+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+|(?<![\w])[~/][\w.\-/]+|\b[\w-]+\.(?:swift|py|js|ts|json|md|txt|html|css|sh|yml|yaml)\b"#,
+        #"https?://\S+|www\.\S+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+|(?<![\w])[~/][\w.\-/]+|\b[\w-]+\.(?:swift|py|js|ts|json|md|txt|html|css|sh|yml|yaml)\b"#,
         options: [.caseInsensitive])
 
     private static func protectedRanges(_ ns: NSString) -> [NSRange] {
-        protectedPattern.matches(in: ns as String, range: NSRange(location: 0, length: ns.length)).map(\.range)
+        let text = ns as String
+        return protectedPattern.matches(in: text, range: NSRange(location: 0, length: ns.length)).map(\.range)
+            + codeSpan.matches(in: text, range: NSRange(location: 0, length: ns.length)).map(\.range)
+            + fencedCodeRanges(in: text).map { NSRange($0, in: text) }
     }
 
     private static func overlaps(_ range: NSRange, _ protected: [NSRange]) -> Bool {
         protected.contains { NSIntersectionRange($0, range).length > 0 }
+    }
+
+    /// A closing fence needs the same marker and at least the opening run's
+    /// length. Keep an unfinished code block too; cleanup must not edit its
+    /// contents while the user is still writing it.
+    static func fencedCodeRanges(in text: String) -> [Range<String.Index>] {
+        guard text.contains("```") || text.contains("~~~") else { return [] }
+        var ranges: [Range<String.Index>] = []
+        var fence: (start: String.Index, marker: Character, count: Int)?
+        for line in text.split(whereSeparator: \.isNewline) {
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            guard let marker = trimmed.first, marker == "`" || marker == "~" else { continue }
+            let count = trimmed.prefix(while: { $0 == marker }).count
+            guard count >= 3 else { continue }
+            let rest = trimmed.dropFirst(count)
+            if let open = fence {
+                if marker == open.marker && count >= open.count && rest.allSatisfy({ $0 == " " || $0 == "\t" }) {
+                    ranges.append(open.start..<line.endIndex)
+                    fence = nil
+                }
+            } else if marker != "`" || !rest.contains("`") {
+                fence = (line.startIndex, marker, count)
+            }
+        }
+        if let fence { ranges.append(fence.start..<text.endIndex) }
+        return ranges
+    }
+
+    /// Transform only prose, without placeholders that could collide with
+    /// literal user text. This protects code from every pass, including HTML
+    /// list conversion and capitalization after a filler was removed.
+    private static func outsideCode(in text: String, applying transform: (String) -> String) -> String {
+        var ranges = fencedCodeRanges(in: text)
+        let ns = text as NSString
+        for match in codeSpan.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            guard let range = Range(match.range, in: text),
+                  !ranges.contains(where: { $0.overlaps(range) }) else { continue }
+            ranges.append(range)
+        }
+        guard !ranges.isEmpty else { return transform(text) }
+        ranges.sort { $0.lowerBound < $1.lowerBound }
+        var result = ""
+        var cursor = text.startIndex
+        for range in ranges {
+            result += transform(String(text[cursor..<range.lowerBound]))
+            result += text[range]
+            cursor = range.upperBound
+        }
+        result += transform(String(text[cursor...]))
+        return result
     }
 
     // MARK: - Hesitations
@@ -206,12 +263,12 @@ enum DictationFinalPass {
         if !trailingComma, end < length, ".?!".contains(char(end)) {
             var j = r.location - 1
             while j >= 0, char(j) == " " { j -= 1 }
-            if j < 0 || ".!?\n".contains(char(j)) { end += 1 }
+            if j < 0 || ".!?\n\r\u{0085}\u{2028}\u{2029}".contains(char(j)) { end += 1 }
         }
         // Leading: the space before, and a comma before when the token also had one after.
         var start = r.location
         while start > 0, char(start - 1) == " " || char(start - 1) == "\t" { start -= 1 }
-        let atSentenceStart = start == 0 || ".!?\n:;\"“(".contains(char(start - 1))
+        let atSentenceStart = start == 0 || ".!?\n\r\u{0085}\u{2028}\u{2029}:;\"“(".contains(char(start - 1))
         if atSentenceStart {
             // Drop following spaces instead, so the next word moves into place.
             start = r.location
@@ -288,7 +345,7 @@ enum DictationFinalPass {
         "tick", "tock", "boom", "bang", "beep", "ding", "dong", "goody", "pretty", "super", "too", "heel",
         "tegen", "de", "die", "dat", "wee", "poo", "pee", "boo", "oui", "choo", "tsk", "mm", "ooh", "aww", "yum",
         "he", "hee", "ho", "na", "nah", "mama", "papa", "dada", "baba", "bla", "night", "aye", "cha", "tut", "fully",
-        "much", "big", "best", "great", "please", "same", "little", "bit", "long", "way", "step", "side", "back"
+        "much", "big", "best", "great", "please", "same", "little", "bit", "long", "way", "step", "side", "back", "wait"
     ]
 
     private static let doubledWord = try! NSRegularExpression(pattern:
@@ -337,9 +394,14 @@ enum DictationFinalPass {
     /// Only an exact phrase of 3-6 different words said twice in a row inside one sentence, with no
     /// pause mark between ("this and this and this" and "those icons: those icons" stay).
     static func removeRepeatedPhrases(_ text: String) -> String {
-        guard !text.contains("`") else { return text }
-        var lines: [String] = []
-        for line in text.components(separatedBy: "\n") {
+        outsideCode(in: text, applying: removeRepeatedProsePhrases)
+    }
+
+    private static func removeRepeatedProsePhrases(_ text: String) -> String {
+        var result = ""
+        var cursor = text.startIndex
+        for line in text.split(whereSeparator: \.isNewline) {
+            result += text[cursor..<line.startIndex]
             var words = line.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
             func key(_ w: String) -> String {
                 w.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ",;:"))
@@ -372,9 +434,11 @@ enum DictationFinalPass {
                     }
                 }
             }
-            lines.append(words.joined(separator: " "))
+            result += words.joined(separator: " ")
+            cursor = line.endIndex
         }
-        return lines.joined(separator: "\n")
+        result += text[cursor...]
+        return result
     }
 
     // MARK: - Lists from model markup
@@ -413,34 +477,23 @@ enum DictationFinalPass {
 
     // MARK: - Tidy
 
-    private static let codeSpan = try! NSRegularExpression(pattern: #"`[^`\n]*`"#)
+    private static let codeSpan = try! NSRegularExpression(pattern: #"(?s)(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)"#)
 
-    /// Spacing rules never touch `code` spans: each span is swapped for a placeholder (no spaces, no
-    /// punctuation) while the rules run, then put back as it was. Found 21 Nov 2026: "`ls  -la`" lost a space.
+    /// Spacing rules never touch code spans. Found 21 Nov 2026: "`ls  -la`" lost a space.
     private static func tidy(_ text: String) -> String {
-        let ns = text as NSString
-        let spans = codeSpan.matches(in: text, range: NSRange(location: 0, length: ns.length)).map(\.range)
-        guard !spans.isEmpty else { return tidySpacing(text) }
-        let pieces = spans.map { ns.substring(with: $0) }
-        let masked = NSMutableString(string: text)
-        for (i, range) in spans.enumerated().reversed() {
-            masked.replaceCharacters(in: range, with: "\u{E000}\(i)\u{E001}")
-        }
-        var r = tidySpacing(masked as String)
-        for (i, piece) in pieces.enumerated() {
-            r = r.replacingOccurrences(of: "\u{E000}\(i)\u{E001}", with: piece)
-        }
-        return r
+        outsideCode(in: text, applying: tidySpacing)
     }
 
     private static func tidySpacing(_ text: String) -> String {
         var r = text
-        r = r.replacingOccurrences(of: #"(?<=\S)[ \t]{2,}"#, with: " ", options: .regularExpression)
-        r = r.replacingOccurrences(of: #"[ \t]+([,.!?;:])"#, with: "$1", options: .regularExpression)
+        // Only interior prose spaces are normalized. Trailing spaces may be
+        // Markdown hard breaks; indentation and whitespace-only lines belong
+        // to the user's layout, even when a filler elsewhere was removed.
+        r = r.replacingOccurrences(of: #"(?<=\S)[ \t]{2,}(?=\S)"#, with: " ", options: .regularExpression)
+        r = r.replacingOccurrences(of: #"(?<=\S)[ \t]+([,.!?;:])"#, with: "$1", options: .regularExpression)
         r = r.replacingOccurrences(of: #",{2,}"#, with: ",", options: .regularExpression)
         r = r.replacingOccurrences(of: #",([.!?])"#, with: "$1", options: .regularExpression)
-        r = r.replacingOccurrences(of: #"(?m)^[ \t]*,[ \t]*"#, with: "", options: .regularExpression)
-        r = r.replacingOccurrences(of: #"(?m)[ \t]+$"#, with: "", options: .regularExpression)
+        r = r.replacingOccurrences(of: #"(?m)^([ \t]*),[ \t]*"#, with: "$1", options: .regularExpression)
         return r
     }
 

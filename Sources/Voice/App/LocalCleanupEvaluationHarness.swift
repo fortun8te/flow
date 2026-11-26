@@ -204,8 +204,11 @@ enum LocalCleanupEvaluationHarness {
     }
 
     static func normalized(_ outcome: Outcome, input: String) -> Outcome {
-        if case .accepted(let text) = outcome,
-           text.trimmingCharacters(in: .whitespacesAndNewlines) == input.trimmingCharacters(in: .whitespacesAndNewlines) { return .unchanged }
+        if case .accepted(let text) = outcome {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return .refused }
+            if trimmed == input.trimmingCharacters(in: .whitespacesAndNewlines) { return .unchanged }
+        }
         return outcome
     }
 

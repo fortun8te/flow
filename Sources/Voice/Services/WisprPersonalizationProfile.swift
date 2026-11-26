@@ -83,10 +83,9 @@ struct WisprPersonalizationProfile: Decodable {
         return profile
     }
 
-    static func load(from url: URL = defaultURL) -> Self? {
-        guard let data = try? Data(contentsOf: url), data.count <= 64 * 1024 else { return nil }
-        return decode(data)
-    }
+    private static let profileCache = BoundedLocalFileCache<Self>(maximumBytes: 64 * 1024, decode: decode)
+
+    static func load(from url: URL = defaultURL) -> Self? { profileCache.load(from: url) }
 
     /// Apply once, only where VOICE has no saved setting. Returning false means
     /// an earlier import already ran; callers must not reapply context styles.
@@ -117,10 +116,8 @@ struct WisprPersonalizationProfile: Decodable {
 
     static let wisprVocabularySeenKey = "voice.wisprVocabularySeen"
 
-    static func preparedVocabulary(from directory: URL = defaultURL.deletingLastPathComponent()) -> [String]? {
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent("dictionary.json")),
-              data.count <= 4 * 1024 * 1024,
-              let dictionary = try? JSONDecoder().decode(PreparedDictionary.self, from: data),
+    private static let preparedCache = BoundedLocalFileCache<[String]>(maximumBytes: 4 * 1024 * 1024) { data in
+        guard let dictionary = try? JSONDecoder().decode(PreparedDictionary.self, from: data),
               dictionary.schema_version == 1 else { return nil }
         return dictionary.entries.map {
             let replacement = $0.replacement?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -128,24 +125,37 @@ struct WisprPersonalizationProfile: Decodable {
         }
     }
 
+    static func preparedVocabulary(from directory: URL = defaultURL.deletingLastPathComponent()) -> [String]? {
+        preparedCache.load(from: directory.appendingPathComponent("dictionary.json"))
+    }
+
     /// Record terms seen at the source separately from the editable dictionary.
     /// A word deleted in Flow is only resurrected by an explicit import.
     @discardableResult
     static func mergeWisprVocabulary(_ source: [String], preparedSeed: [String] = [], defaults: UserDefaults) -> Bool {
+        VocabularyPreferenceTransaction.withLock {
+            mergeVocabularyLocked(source, preparedSeed: preparedSeed, defaults: defaults)
+        }
+    }
+
+    private static func mergeVocabularyLocked(_ source: [String], preparedSeed: [String], defaults: UserDefaults) -> Bool {
         let marker = wisprVocabularySeenKey
         let dictionaryKey = "voice.userDictionary"
         let stored = defaults.stringArray(forKey: marker)
-        let previous = Set(stored ?? preparedSeed.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        let previous = Set((stored ?? preparedSeed).map(VocabularyReplacementRules.key))
         var seen = previous
         var dictionary = defaults.stringArray(forKey: dictionaryKey) ?? []
         let originalCount = dictionary.count
-        var existing = Set(dictionary.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        var existing = Set(dictionary.map(VocabularyReplacementRules.key))
+        let excluded = Set((defaults.stringArray(forKey: "voice.dictionaryExcludedTerms") ?? []).map(VocabularyReplacementRules.key))
         for raw in source {
             let term = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !term.isEmpty, term.count <= 500,
                   !term.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { continue }
-            let key = term.lowercased()
-            if seen.insert(key).inserted, existing.insert(key).inserted { dictionary.append(term) }
+            let key = VocabularyReplacementRules.key(term)
+            // Remember seeing excluded imports as well, so periodic refresh
+            // cannot resurrect an intentionally removed term later.
+            if seen.insert(key).inserted, !excluded.contains(key), existing.insert(key).inserted { dictionary.append(term) }
         }
         if stored == nil || seen != previous { defaults.set(seen.sorted(), forKey: marker) }
         guard dictionary.count != originalCount else { return false }
@@ -160,16 +170,24 @@ struct WisprPersonalizationProfile: Decodable {
         from directory: URL = defaultURL.deletingLastPathComponent(),
         defaults: UserDefaults = .standard
     ) -> Bool {
+        VocabularyPreferenceTransaction.withLock {
+            importPreparedDictionaryLocked(from: directory, defaults: defaults)
+        }
+    }
+
+    private static func importPreparedDictionaryLocked(from directory: URL, defaults: UserDefaults) -> Bool {
         let marker = "voice.wisprDictionaryImported"
         guard !defaults.bool(forKey: marker), let prepared = preparedVocabulary(from: directory) else { return false }
 
         var terms = defaults.stringArray(forKey: "voice.userDictionary") ?? []
-        var seen = Set(terms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        var seen = Set(terms.map(VocabularyReplacementRules.key))
+        let excluded = Set((defaults.stringArray(forKey: "voice.dictionaryExcludedTerms") ?? []).map(VocabularyReplacementRules.key))
         for word in prepared {
             let term = word.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !term.isEmpty, term.count <= 500,
                   !term.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
-                  seen.insert(term.lowercased()).inserted else { continue }
+                  !excluded.contains(VocabularyReplacementRules.key(term)),
+                  seen.insert(VocabularyReplacementRules.key(term)).inserted else { continue }
             terms.append(term)
         }
         defaults.set(terms, forKey: "voice.userDictionary")

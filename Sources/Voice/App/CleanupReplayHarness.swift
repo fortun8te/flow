@@ -14,12 +14,14 @@
 //
 // No UI, pill, sounds, paste, clipboard, history rows or event log. Cloud cleanup is
 // forced off and privacy mode on for the process (volatile argument domain). Runs
-// sequentially under nice 10, appends one JSON line per item, skips ids already done
-// and logs progress to stderr.
+// sequentially under nice 10, appends one private JSON line per item, resumes only
+// matching workload/settings/executable snapshots, and logs progress to stderr.
+// This is a post-ASR replay, not key-release-to-verified-insertion timing.
 // ============================================================
 
 import AVFoundation
 import Accelerate
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -27,7 +29,7 @@ import Foundation
 enum CleanupReplayHarness {
     // MARK: Configuration
 
-    struct PrepareConfiguration: Decodable {
+    struct PrepareConfiguration: Codable {
         let input: String
         let output: String
         /// Process at most this many pending clips (for spot checks).
@@ -54,13 +56,14 @@ enum CleanupReplayHarness {
         }
     }
 
-    struct RunConfiguration: Decodable {
+    struct RunConfiguration: Codable {
         let input: String
         let output: String
         let s1Variant: String?
         let limit: Int?
         let allowWhileFlowRunning: Bool?
-        /// Optional engine override for this process only: "s1-mini", "whispernow-tuned" or "qwen3".
+        /// Optional engine override for this process only: "s1-mini", "dose1",
+        /// legacy "whispernow-tuned", or "qwen3". Unknown/unavailable choices fail.
         let cleanupModel: String?
         /// Optional dictation adapter for this process only: "v3c" or "t4" pin one; "auto" routes by length.
         let cleanupAdapter: String?
@@ -94,7 +97,7 @@ enum CleanupReplayHarness {
 
     struct RunJob: Decodable {
         let id: String
-        let text: String?
+        let text: String
         let bundleID: String?
 
         enum CodingKeys: String, CodingKey {
@@ -110,8 +113,9 @@ enum CleanupReplayHarness {
     // MARK: Entry points (exit codes: 0 done, 1 failed, 2 bad config, 75 Flow running)
 
     static func runPrepare(configPath: String) async -> Int32 {
-        guard let config = try? JSONDecoder().decode(PrepareConfiguration.self,
-                                                     from: Data(contentsOf: URL(fileURLWithPath: configPath))) else {
+        guard let configData = try? CleanupReplayIO.inputData(at: URL(fileURLWithPath: configPath)),
+              let config = try? JSONDecoder().decode(PrepareConfiguration.self, from: configData),
+              config.limit.map({ $0 >= 0 }) ?? true else {
             log("prepare", "config unreadable; expected {\"input\", \"output\"}"); return 2
         }
         let asrOnly = config.asrOnly == true
@@ -126,11 +130,31 @@ enum CleanupReplayHarness {
             "voice.userDictionary": config.boostTerms.map { _ in [String]() } as Any?,
         ].compactMapValues { $0 })
         let jobs: [PrepareJob]
-        do { jobs = try readJSONLines(config.input) } catch {
+        let replayKey: String
+        let replayState: Data
+        do {
+            let data = try CleanupReplayIO.inputData(at: URL(fileURLWithPath: (config.input as NSString).expandingTildeInPath))
+            jobs = try CleanupReplayIO.decode(data)
+            try CleanupReplayIO.validateIDs(jobs.map(\.id))
+            var artifacts: [String: String] = [:]
+            for job in jobs {
+                let path = (job.audio as NSString).expandingTildeInPath
+                if artifacts[path] == nil { artifacts[path] = try fileSHA256(URL(fileURLWithPath: path)) }
+            }
+            let identity = try replayIdentity(mode: asrOnly ? "asr" : "prepare", configuration: config,
+                                               input: data, artifacts: artifacts)
+            replayKey = identity.key; replayState = identity.state
+        } catch {
             log("prepare", "input unreadable: \(error.localizedDescription)"); return 2
         }
         let outputURL = URL(fileURLWithPath: config.output)
-        let done = completedIDs(outputURL) { $0["status"] as? String == "ok" }
+        let outputLease: CleanupReplayIO.OutputLease
+        do { outputLease = try CleanupReplayIO.OutputLease(at: outputURL) }
+        catch { log("prepare", "output unavailable or already in use"); return 2 }
+        defer { outputLease.release() }
+        let done: Set<String>
+        do { done = try completedIDs(outputURL, replayKey: replayKey) { $0["status"] as? String == "ok" } }
+        catch { log("prepare", "cannot resume: \(error.localizedDescription)"); return 2 }
         var pending = jobs.filter { !done.contains($0.id) }
         if let limit = config.limit { pending = Array(pending.prefix(max(0, limit))) }
         log("prepare", "\(jobs.count) clips in input, \(done.count) already ok, \(pending.count) to do")
@@ -141,7 +165,8 @@ enum CleanupReplayHarness {
             log("prepare", "speech model unavailable: \(error.localizedDescription)"); return 1
         }
         let asrModel = modelLabel(transcription.activeModelID)
-        if asrOnly { return await runASROnly(pending, transcription: transcription, asrModel: asrModel, output: outputURL) }
+        if asrOnly { return await runASROnly(pending, transcription: transcription, asrModel: asrModel,
+                                           output: outputURL, replayKey: replayKey, replayState: replayState) }
         guard await prepareCleanupModel(variant: "stock") else { return 1 }
         log("prepare", "asr=\(asrModel) cleanup=\(Qwen3Polisher.effectiveAutomaticCleanupModel) s1=\(s1Label("stock"))")
 
@@ -155,18 +180,23 @@ enum CleanupReplayHarness {
         let build = ShadowModeController.executableDigestPrefix()
         let environment = Environment.current()
         let formatter = TextFormatter()
-        let started = Date()
+        let started = PipelineTimer()
         var counts: [String: Int] = [:]
+        var failed = false
         for (index, job) in pending.enumerated() {
-            let clipStarted = Date()
+            guard validateReplayState(replayState, mode: "prepare", replayKey: replayKey, output: outputURL) else { return 1 }
+            let clipStarted = PipelineTimer()
             var line: [String: Any]
             do {
                 line = try await prepareClip(job, transcription: transcription, formatter: formatter,
                                              environment: environment, workDirectory: workDirectory)
                 line["status"] = "ok"
             } catch {
+                failed = true
                 line = ["id": job.id, "status": "error", "error": String(describing: error).prefix(200).description]
             }
+            guard validateReplayState(replayState, mode: "prepare", replayKey: replayKey, output: outputURL, attemptedID: job.id) else { return 1 }
+            line["replay_key"] = replayKey
             line["flow_build"] = build
             line["models"] = ["asr": asrModel, "s1": s1Label("stock")]
             do { try appendLine(line, to: outputURL) } catch {
@@ -174,20 +204,21 @@ enum CleanupReplayHarness {
             }
             let route = (line["route"] as? String) ?? (line["status"] as? String ?? "?")
             counts[route, default: 0] += 1
-            let elapsed = Date().timeIntervalSince(started)
+            let elapsed = started.seconds()
             let remaining = elapsed / Double(index + 1) * Double(pending.count - index - 1)
             log("prepare", String(format: "%d/%d %@ route=%@ asr=%@ms clip=%.1fs eta=%.0fmin",
                                   index + 1, pending.count, job.id, route,
                                   (line["asr_ms"] as? Int).map(String.init) ?? "-",
-                                  Date().timeIntervalSince(clipStarted), remaining / 60))
+                                  clipStarted.seconds(), remaining / 60))
         }
         log("prepare", "done: " + counts.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
-        return 0
+        return failed ? 1 : 0
     }
 
     static func runCleanup(configPath: String) async -> Int32 {
-        guard let config = try? JSONDecoder().decode(RunConfiguration.self,
-                                                     from: Data(contentsOf: URL(fileURLWithPath: configPath))) else {
+        guard let configData = try? CleanupReplayIO.inputData(at: URL(fileURLWithPath: configPath)),
+              let config = try? JSONDecoder().decode(RunConfiguration.self, from: configData),
+              config.limit.map({ $0 >= 0 }) ?? true else {
             log("run", "config unreadable; expected {\"input\", \"output\", \"s1_variant\"}"); return 2
         }
         let variant = config.s1Variant ?? "stock"
@@ -197,9 +228,12 @@ enum CleanupReplayHarness {
             log("run", "s1_variant \"\(variant)\" is not loadable in this build (only: \(supportedVariants.joined(separator: ", ")))")
             return 2
         }
+        let requestedModel: String?
+        do { requestedModel = try CleanupReplayIO.canonicalCleanupModel(config.cleanupModel) }
+        catch { log("run", error.localizedDescription); return 2 }
         guard claimOwnership(mode: "run", allowConcurrent: config.allowWhileFlowRunning == true,
                              limit: config.limit) else { return 75 }
-        var overrides: [String: Any] = config.cleanupModel.map { ["voice.cleanupModel": $0] } ?? [:]
+        var overrides: [String: Any] = requestedModel.map { ["voice.cleanupModel": $0] } ?? [:]
         if let adapter = config.cleanupAdapter {
             guard adapter == "auto" || WhisperNowTunedPolisher.DictationAdapter(rawValue: adapter) != nil else {
                 log("run", "cleanup_adapter \"\(adapter)\" is not one of v3c, t4, auto"); return 2
@@ -207,12 +241,30 @@ enum CleanupReplayHarness {
             overrides[WhisperNowTunedPolisher.cleanupAdapterKey] = adapter
         }
         configureProcess(overrides: overrides)
+        if let requestedModel, Qwen3Polisher.effectiveAutomaticCleanupModel != requestedModel {
+            log("run", "explicit cleanup_model is unavailable; refusing to benchmark a different engine")
+            return 1
+        }
         let jobs: [RunJob]
-        do { jobs = try readJSONLines(config.input) } catch {
+        let replayKey: String
+        let replayState: Data
+        do {
+            let data = try CleanupReplayIO.inputData(at: URL(fileURLWithPath: (config.input as NSString).expandingTildeInPath))
+            jobs = try CleanupReplayIO.decode(data)
+            try CleanupReplayIO.validateIDs(jobs.map(\.id))
+            let identity = try replayIdentity(mode: "run", configuration: config, input: data)
+            replayKey = identity.key; replayState = identity.state
+        } catch {
             log("run", "input unreadable: \(error.localizedDescription)"); return 2
         }
         let outputURL = URL(fileURLWithPath: config.output)
-        let done = completedIDs(outputURL) { $0["final"] is String }
+        let outputLease: CleanupReplayIO.OutputLease
+        do { outputLease = try CleanupReplayIO.OutputLease(at: outputURL) }
+        catch { log("run", "output unavailable or already in use"); return 2 }
+        defer { outputLease.release() }
+        let done: Set<String>
+        do { done = try completedIDs(outputURL, replayKey: replayKey) { $0["final"] is String } }
+        catch { log("run", "cannot resume: \(error.localizedDescription)"); return 2 }
         var pending = jobs.filter { !done.contains($0.id) }
         if let limit = config.limit { pending = Array(pending.prefix(max(0, limit))) }
         log("run", "\(jobs.count) rows in input, \(done.count) already done, \(pending.count) to do, variant=\(variant)")
@@ -227,9 +279,10 @@ enum CleanupReplayHarness {
         if config.liveFinish == true {
             log("run", "live finish path, adapter=\(WhisperNowTunedPolisher.routesByLength ? "routed(t4 under \(DictationRouting.longWords) words, v3c from)" : WhisperNowTunedPolisher.dictationAdapter.rawValue) engine=\(WhisperNowTunedPolisher.engineLabel)")
         }
-        let started = Date()
+        let started = PipelineTimer()
         for (index, job) in pending.enumerated() {
-            let text = job.text ?? ""
+            guard validateReplayState(replayState, mode: "run", replayKey: replayKey, output: outputURL) else { return 1 }
+            let text = job.text
             let suspects = TextFormatter.suspectsForPolish(text)
             var sectionResults: [String]? = nil
             let outcome: Outcome
@@ -240,20 +293,22 @@ enum CleanupReplayHarness {
                 outcome = await clean(formatted: text, suspects: suspects, bundleID: job.bundleID,
                                       environment: environment)
             }
+            guard validateReplayState(replayState, mode: "run", replayKey: replayKey, output: outputURL, attemptedID: job.id) else { return 1 }
             var line: [String: Any] = [
-                "id": job.id, "final": outcome.final, "s1_result": outcome.runResultLabel,
-                "guard_refused": outcome.result == "rejected:output_guard",
+                "id": job.id, "replay_key": replayKey, "final": outcome.final, "s1_result": outcome.runResultLabel,
+                "guard_refused": outcome.guardRefused,
                 "cleanup_ms": (outcome.cleanupMs * 10).rounded() / 10, "model": variant, "route": outcome.route,
             ]
             line["control_line"] = outcome.controlLine ?? NSNull()
+            line["engine"] = outcome.engine ?? NSNull()
+            line["cleanup_model"] = Qwen3Polisher.effectiveAutomaticCleanupModel
             if let sectionResults {
                 line["results"] = sectionResults
-                line["engine"] = outcome.engine ?? NSNull()
             }
             do { try appendLine(line, to: outputURL) } catch {
                 log("run", "output not writable: \(error.localizedDescription)"); return 1
             }
-            let elapsed = Date().timeIntervalSince(started)
+            let elapsed = started.seconds()
             let remaining = elapsed / Double(index + 1) * Double(pending.count - index - 1)
             log("run", String(format: "%d/%d %@ %@ %.0fms eta=%.0fs", index + 1, pending.count, job.id,
                               outcome.runResultLabel, outcome.cleanupMs, remaining))
@@ -294,6 +349,13 @@ enum CleanupReplayHarness {
 
     static func prepareCleanupModel(variant: String) async -> Bool {
         guard variant == "stock" else { return false }
+        if Qwen3Polisher.effectiveAutomaticCleanupModel == "qwen3" {
+            guard await Qwen3Polisher.shared.prepareCachedAutomaticModel() else {
+                log("cleanup", "Qwen3 local cache could not load; refusing a rules-only model benchmark")
+                return false
+            }
+            return true
+        }
         if Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue {
             guard await WhisperNowTunedPolisher.shared.prepare() else {
                 log("cleanup", "WhisperNow tuned could not start from \(WhisperNowTunedPolisher.modelDirectory.path)")
@@ -304,7 +366,7 @@ enum CleanupReplayHarness {
             _ = await S1MiniPolisher.shared.prepare()
             return true
         }
-        guard Qwen3Polisher.effectiveAutomaticCleanupModel == "s1-mini" else { return true }
+        guard Qwen3Polisher.effectiveAutomaticCleanupModel == "s1-mini" else { return false }
         if await S1MiniPolisher.shared.prepare() { return true }
         log("cleanup", "S1-mini could not load from \(S1MiniPolisher.defaultDirectory.path)")
         return false
@@ -313,7 +375,7 @@ enum CleanupReplayHarness {
     // MARK: ASR-only measurement (vocabulary boosting off vs on)
 
     static func runASROnly(_ pending: [PrepareJob], transcription: TranscriptionService, asrModel: String,
-                           output: URL) async -> Int32 {
+                           output: URL, replayKey: String, replayState: Data) async -> Int32 {
         let terms = ASRVocabularyBoost.trustedTerms()
         let thresholds = ASRVocabularyBoost.thresholds()
         log("asr", "asr=\(asrModel) boost terms=\(terms.count) cbw=\(thresholds.cbw.map { "\($0)" } ?? "default") "
@@ -322,8 +384,11 @@ enum CleanupReplayHarness {
             .appendingPathComponent("flow-asr-replay-\(getpid())", isDirectory: true)
         do { try ShadowStore.privateDirectory(workDirectory) } catch { log("asr", "work folder unavailable"); return 1 }
         defer { try? FileManager.default.removeItem(at: workDirectory) }
+        var failed = false
+        defer { transcription.vocabularyBoostOverride = nil }
         for (index, job) in pending.enumerated() {
-            var line: [String: Any] = ["id": job.id, "route": "asr-only", "boost_terms": terms.count]
+            guard validateReplayState(replayState, mode: "asr", replayKey: replayKey, output: output) else { return 1 }
+            var line: [String: Any] = ["id": job.id, "replay_key": replayKey, "route": "asr-only", "boost_terms": terms.count]
             let source = URL(fileURLWithPath: (job.audio as NSString).expandingTildeInPath)
             let caf = workDirectory.appendingPathComponent("\(UUID().uuidString.lowercased()).caf")
             do {
@@ -333,13 +398,13 @@ enum CleanupReplayHarness {
                                              tuning: DSPTuning.forMicClass(job.micClass))
                 }.value
                 transcription.vocabularyBoostOverride = false
-                let t0 = Date()
+                let t0 = PipelineTimer()
                 let off = try await transcription.transcribeFile(url: caf)
-                line["asr_ms"] = Int(Date().timeIntervalSince(t0) * 1000)
+                line["asr_ms"] = t0.milliseconds()
                 transcription.vocabularyBoostOverride = true
-                let t1 = Date()
+                let t1 = PipelineTimer()
                 let on = try await transcription.transcribeFile(url: caf)
-                line["asr_boost_ms"] = Int(Date().timeIntervalSince(t1) * 1000)
+                line["asr_boost_ms"] = t1.milliseconds()
                 line["parakeet_raw"] = off.map(\.text).joined(separator: " ")
                 line["parakeet_boosted"] = on.map(\.text).joined(separator: " ")
                 let report = transcription.lastVocabularyBoost
@@ -349,17 +414,18 @@ enum CleanupReplayHarness {
                 line["boost_ms"] = ((report?.milliseconds ?? 0) * 10).rounded() / 10
                 line["status"] = "ok"
             } catch {
+                failed = true
                 line["status"] = "error"
                 line["error"] = String(describing: error).prefix(200).description
             }
             try? FileManager.default.removeItem(at: caf)
+            guard validateReplayState(replayState, mode: "asr", replayKey: replayKey, output: output, attemptedID: job.id) else { return 1 }
             line["models"] = ["asr": asrModel]
             do { try appendLine(line, to: output) } catch { log("asr", "output not writable"); return 1 }
             log("asr", "\(index + 1)/\(pending.count) \(job.id) replacements=\((line["boost_replacements"] as? [String])?.count ?? 0)")
         }
-        transcription.vocabularyBoostOverride = nil
         log("asr", "done")
-        return 0
+        return failed ? 1 : 0
     }
 
     // MARK: Per-clip production path (spec B, steps 1-8)
@@ -399,9 +465,9 @@ enum CleanupReplayHarness {
         let skipPolish = replay.fileBytes < 36_000
 
         // 4. ASR on the saved file, production-selected model and chunker.
-        let asrStarted = Date()
+        let asrStarted = PipelineTimer()
         let segments = try await transcription.transcribeFile(url: caf)
-        line["asr_ms"] = Int(Date().timeIntervalSince(asrStarted) * 1000)
+        line["asr_ms"] = asrStarted.milliseconds()
         let raw = segments.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
 
         // 5. Speech-presence gate (and the media-leak guard, which never fires without media).
@@ -433,8 +499,8 @@ enum CleanupReplayHarness {
         if skipPolish { return skip("skip:short-clip", raw: raw, formatted: formatted) }
 
         // 7-8. Cleanup as the live finish task runs it, then finalize.
-        let suspects = Array(Set(segments.compactMap(\.suspectWords).flatMap { $0 }
-                                 + TextFormatter.suspectsForPolish(formatted)))
+        let suspects = PromptTerms.orderedUnique(segments.compactMap(\.suspectWords).flatMap { $0 },
+                                                   TextFormatter.suspectsForPolish(formatted))
         let outcome = await clean(formatted: formatted, suspects: suspects, bundleID: job.bundleID,
                                   environment: environment)
         line["route"] = outcome.route
@@ -486,6 +552,10 @@ enum CleanupReplayHarness {
         let engine: String?
         let cleanupMs: Double
 
+        var guardRefused: Bool {
+            result?.split(separator: "|").contains("rejected:output_guard") ?? false
+        }
+
         /// `--cleanup-run` vocabulary: rules-only skips are "skipped:<reason>".
         var runResultLabel: String {
             guard let result else { return "skipped:" + route.replacingOccurrences(of: "skip:", with: "") }
@@ -505,9 +575,10 @@ enum CleanupReplayHarness {
                            route: "skip:polish-off", input: nil, controlLine: nil, result: nil, engine: nil,
                            cleanupMs: 0)
         }
-        let vocabulary = Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms()))
+        let vocabulary = PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                                                    ProperNounVocabulary.current(), CombinedDictionary.terms())
         let observer = ShadowCleanupObserver()
-        let started = CFAbsoluteTimeGetCurrent()
+        let started = PipelineTimer()
         var polished = await ShadowCleanupTrace.$observer.withValue(observer) {
             await Qwen3Polisher.shared.polish(
                 formatted,
@@ -519,7 +590,7 @@ enum CleanupReplayHarness {
                 cleanupLevel: parameters.cleanupLevel,
                 personalityStyle: parameters.personalityStyle)
         }
-        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        let ms = started.seconds() * 1000
         // VoiceApp: an empty polish result falls back to the formatted text.
         if polished.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !formatted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -547,17 +618,19 @@ enum CleanupReplayHarness {
         var engine: String? { lock.withLock { lastEngine } }
     }
 
-    static func liveFinishClean(formatted: String, bundleID: String?,
+    static func liveFinishClean(formatted input: String, bundleID: String?,
                                 environment: Environment) async -> (outcome: Outcome, results: [String]) {
+        let formatted = TextFormatterConfig.fromDefaults().interpretVoiceCommands
+            ? TextFormatter.interpretLineBreakCommands(input) : input
         let parameters = environment.parameters(bundleID: bundleID)
         let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
         let preferredWords = ProperNounVocabulary.preferredSpellingTerms()
-        var seen = Set<String>()
-        let vocabulary = (preferredWords + ProperNounVocabulary.current() + CombinedDictionary.terms())
-            .filter { seen.insert($0.lowercased()).inserted }
+        let vocabulary = PromptTerms.orderedUnique(preferredWords, ProperNounVocabulary.current(), CombinedDictionary.terms())
         let suspects = TextFormatter.suspectsForPolish(formatted)
         let usesTuned = Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue
         let usesModelTranscript = usesTuned && (WhisperNowTunedPolisher.usesT2Contracts || WhisperNowTunedPolisher.usesT4)
+        let longProse = formatted.count > DictationTextPreparation.sectionLimit
+            || DictationDeadline.isLong(words: formatted.split(whereSeparator: \.isWhitespace).count)
         let log = ResultLog()
         let polishDraft: @Sendable (String, Bool) async -> String = { text, isSection in
             let observer = ShadowCleanupObserver()
@@ -571,13 +644,15 @@ enum CleanupReplayHarness {
             log.add(observer.result, engine: observer.engine)
             return output
         }
-        let started = CFAbsoluteTimeGetCurrent()
+        let started = PipelineTimer()
         var finalText: String
         var route = "single"
-        if CleanupLevel.current == .none || !polishEnabled {
+        if DictationLayout.isBreakOnly(formatted) {
+            finalText = formatted; route = "skip:layout-command"
+        } else if CleanupLevel.current == .none || !polishEnabled {
             finalText = formatted; route = "skip:polish-off"
         } else if parameters.polishContext != .code, Qwen3Polisher.isEnabled,
-                  formatted.count > 1_200 || formatted.contains(where: \.isNewline) {
+                  (!usesModelTranscript && longProse) || formatted.contains(where: \.isNewline) {
             route = "sections"
             let ranges = DictationTextPreparation.cleanupSections(in: formatted)
             let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges,
@@ -592,12 +667,14 @@ enum CleanupReplayHarness {
         if route == "single", await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText) {
             finalText = formatted; route = "single:decision-meaning"
         }
-        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        let ms = started.seconds() * 1000
         func outcome(_ text: String) -> Outcome {
             Outcome(final: text, route: route, input: formatted, controlLine: nil,
-                    result: log.results.joined(separator: "|"), engine: log.engine, cleanupMs: ms)
+                    result: log.results.isEmpty ? nil : log.results.joined(separator: "|"),
+                    engine: log.engine, cleanupMs: ms)
         }
-        if WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
+        if !DictationLayout.isBreakOnly(formatted),
+           WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
             return (outcome(""), log.results)
         }
         if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -605,14 +682,17 @@ enum CleanupReplayHarness {
         let level = parameters.cleanupLevel
         finalText = T2CleanupOptions.finalizedTranscript(candidate: finalText, preparedASR: formatted,
             level: level, recognizedT2: usesModelTranscript)
+            .map { DictationLayout.preservingLineBreaks(in: $0, from: formatted) }
             ?? DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+        finalText = DictationLayout.restoringBoundaryBreaks(in: finalText, from: formatted)
         finalText = DictationFinalPass.apply(finalText)
-        if polishEnabled && level != "none" {
+        if polishEnabled && level != "none" && !DictationLayout.isBreakOnly(finalText) {
             finalText = DictationReferee.dictationPass(finalText, isCode: parameters.polishContext == .code)
         }
         // tinynext recheck, as the live finish task runs it (suspects here are the formatter's; live adds
         // the recognizer's low-confidence words). Model-less, it returns the text unchanged.
-        if polishEnabled && level != "none" && parameters.polishContext != .code {
+        if polishEnabled && level != "none" && parameters.polishContext != .code
+            && !DictationLayout.isBreakOnly(finalText) {
             let rechecked = LowConfidenceRecheck.recheck(finalText, suspects: suspects, protectedTerms: vocabulary)
             if !rechecked.changes.isEmpty { log.add("tinynext:\(rechecked.changes.count)", engine: nil) }
             finalText = rechecked.text
@@ -620,7 +700,8 @@ enum CleanupReplayHarness {
         if parameters.polishContext != .code {
             finalText = ProperNounVocabulary.applyPreferredSpelling(finalText, terms: preferredWords)
         }
-        if polishEnabled && level != "none" {
+        if polishEnabled && level != "none" && TextFormatterConfig.fromDefaults().detectParagraphs
+            && !DictationLayout.isBreakOnly(finalText) {
             finalText = parameters.polishContext == .code
                 ? DictationParagraphs.format(finalText)
                 : DictationParagraphs.formatDictation(finalText, isEmail: parameters.polishContext == .email)
@@ -642,47 +723,106 @@ enum CleanupReplayHarness {
 
     // MARK: JSONL I/O
 
-    nonisolated static func readJSONLines<T: Decodable>(_ path: String) throws -> [T] {
-        let text = try String(contentsOf: URL(fileURLWithPath: (path as NSString).expandingTildeInPath), encoding: .utf8)
-        let decoder = JSONDecoder()
-        return try text.split(whereSeparator: \.isNewline).compactMap { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { return nil }
-            return try decoder.decode(T.self, from: Data(trimmed.utf8))
+    nonisolated static func fileSHA256(_ url: URL) throws -> String {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor) }
+        var before = stat()
+        guard fstat(descriptor, &before) == 0, before.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EINVAL) }
+        func signature(_ item: stat) -> [UInt64] {
+            [UInt64(truncatingIfNeeded: item.st_dev), UInt64(truncatingIfNeeded: item.st_ino),
+             UInt64(truncatingIfNeeded: item.st_size), UInt64(truncatingIfNeeded: item.st_mtimespec.tv_sec),
+             UInt64(truncatingIfNeeded: item.st_mtimespec.tv_nsec), UInt64(truncatingIfNeeded: item.st_ctimespec.tv_sec),
+             UInt64(truncatingIfNeeded: item.st_ctimespec.tv_nsec)]
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+        var after = stat(), current = stat()
+        guard fstat(descriptor, &after) == 0, lstat(url.path, &current) == 0,
+              signature(before) == signature(after), signature(before) == signature(current) else { throw POSIXError(.EBUSY) }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static var personalizationFiles: [URL] {
+        [WisprImportService.archiveDirectory.appendingPathComponent("replacements.json"),
+         WisprPersonalizationProfile.defaultURL, GeneralCleanupModel.catalogURL]
+    }
+
+    static func effectiveReplaySettings() -> [String: Any] {
+        // Hash the resolved values, including fallback application/global/
+        // registration domains. Model status is an observation, not a setting.
+        var settings = UserDefaults.standard.dictionaryRepresentation()
+        settings.removeValue(forKey: GeneralCleanupModel.statusKey)
+        return settings
+    }
+
+    static func replayStateFingerprint() throws -> Data {
+        try CleanupReplayIO.stateIdentity(settings: effectiveReplaySettings(),
+            learnedRevision: AutoDictionary.shared.liveSnapshot().revision,
+            vocabulary: PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                ProperNounVocabulary.current(), CombinedDictionary.terms()), files: personalizationFiles)
+    }
+
+    static func validateReplayState(_ expected: Data, mode: String, replayKey: String,
+                                     output: URL, attemptedID: String? = nil) -> Bool {
+        do {
+            guard try replayStateFingerprint() == expected else { throw CleanupReplayIO.Failure.changedPersonalization }
+            return true
+        } catch {
+            // Keep the fact that a measured call became incomparable, without
+            // publishing its text as a successful result for the old snapshot.
+            if let attemptedID {
+                do { try appendLine(["id": attemptedID, "replay_key": replayKey,
+                                     "status": "error", "error": "replay-state-changed"], to: output) }
+                catch { log(mode, "could not retain replay-state failure") }
+            }
+            log(mode, "personalization/settings changed or became unreadable; stopping replay")
+            return false
         }
     }
 
-    /// Ids already written to `output` that satisfy `isDone` (resume support).
-    nonisolated static func completedIDs(_ output: URL, isDone: ([String: Any]) -> Bool) -> Set<String> {
-        guard let text = try? String(contentsOf: output, encoding: .utf8) else { return [] }
-        var ids = Set<String>()
-        for line in text.split(whereSeparator: \.isNewline) {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let id = object["id"] as? String, isDone(object) else { continue }
-            ids.insert(id)
+    static func replayIdentity<Configuration: Encodable>(mode: String, configuration: Configuration, input: Data,
+                               artifacts: [String: String] = [:]) throws -> (key: String, state: Data) {
+        guard let executable = Bundle.main.executableURL else { throw POSIXError(.ENOENT) }
+        let state = try replayStateFingerprint()
+        var snapshot = effectiveReplaySettings()
+        snapshot["replayVocabulary"] = PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                                                                 ProperNounVocabulary.current(), CombinedDictionary.terms())
+        snapshot["replayPreferredSpellings"] = ProperNounVocabulary.preferredSpellingTerms()
+        snapshot["replayEffectiveCleanup"] = Qwen3Polisher.effectiveAutomaticCleanupModel
+        let learned = AutoDictionary.shared.liveSnapshot()
+        snapshot["replayLearnedReplacements"] = learned.replacements.map { ["heard": $0.heard, "written": $0.written] }
+        snapshot["replayLearnedSpellings"] = learned.spellings
+        snapshot["replaySoundAlikes"] = learned.soundAlikes.sorted()
+        snapshot["replayConflictingAliases"] = learned.conflictingAliases.sorted()
+        var inputs = artifacts
+        for url in personalizationFiles {
+            // Missing files are part of the experiment too: adding a replacement
+            // or app-style profile must invalidate the prior replay results.
+            do { inputs[url.path] = try fileSHA256(url) }
+            catch let error as POSIXError where error.code == .ENOENT { inputs[url.path] = "missing" }
         }
-        return ids
+        let data = try CleanupReplayIO.identityData(mode: mode, configuration: configuration,
+            inputHash: SHA256.hash(data: input).map { String(format: "%02x", $0) }.joined(),
+            settings: snapshot, executableHash: fileSHA256(executable), artifacts: inputs)
+        guard try replayStateFingerprint() == state else { throw CleanupReplayIO.Failure.changedPersonalization }
+        return (SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), state)
+    }
+
+    nonisolated static func readJSONLines<T: Decodable>(_ path: String) throws -> [T] {
+        try CleanupReplayIO.decode(CleanupReplayIO.inputData(at: URL(fileURLWithPath: (path as NSString).expandingTildeInPath)))
+    }
+
+    /// Ids already written to `output` that satisfy `isDone` (resume support).
+    nonisolated static func completedIDs(_ output: URL, replayKey: String? = nil,
+                                         isDone: ([String: Any]) -> Bool) throws -> Set<String> {
+        try CleanupReplayIO.completedIDs(at: output, replayKey: replayKey, isDone: isDone)
     }
 
     /// One sorted-key JSON line, appended and fsynced; the file is created 0600.
     nonisolated static func appendLine(_ object: [String: Any], to url: URL) throws {
-        var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
-        data.append(0x0A)
-        let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { close(fd) }
-        try data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-            var offset = 0
-            while offset < buffer.count {
-                let written = write(fd, buffer.baseAddress! + offset, buffer.count - offset)
-                if written < 0 {
-                    if errno == EINTR { continue }
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                }
-                offset += written
-            }
-        }
-        _ = fsync(fd)
+        try CleanupReplayIO.append(object, to: url)
     }
 
     nonisolated static func log(_ mode: String, _ message: String) {
@@ -708,7 +848,8 @@ enum CaptureReplay {
         var capturedSeconds: Double = 0
         var peakRMS: Float = 0
         var fileBytes: Int = 0
-        /// Post-DSP samples in file order, without the padding (for tests).
+        /// Optional post-DSP diagnostic samples; ordinary replay retains no
+        /// second full recording-sized Float array.
         var samples: [Float] = []
     }
 
@@ -725,7 +866,8 @@ enum CaptureReplay {
          AVLinearPCMIsBigEndianKey: false]
     }
 
-    static func render(source: URL, to destination: URL, applyDSP: Bool, tuning: DSPTuning) throws -> Result {
+    static func render(source: URL, to destination: URL, applyDSP: Bool, tuning: DSPTuning,
+                       collectSamples: Bool = false) throws -> Result {
         let buffers = applyDSP ? try tapBuffers(source) : try postDSPBuffers(source)
         var result = Result()
         var dsp = CaptureDSP(tuning: tuning)
@@ -745,7 +887,9 @@ enum CaptureReplay {
             result.capturedSeconds += seconds
             if rms >= CaptureDSP.speechFloorRMS { result.voicedSeconds += seconds }
             if rms >= CaptureDSP.quietSpeechFloorRMS { result.quietVoicedSeconds += seconds }
-            result.samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: frames))
+            if collectSamples {
+                result.samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: frames))
+            }
         }
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         let file = try AVAudioFile(forWriting: destination, settings: cafSettings,

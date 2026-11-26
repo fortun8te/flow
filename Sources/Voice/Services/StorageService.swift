@@ -3,7 +3,7 @@
 // Durable, searchable persistence layer for meetings, transcripts, and
 // summaries. Uses GRDB.swift on top of SQLite with FTS5.
 //
-// Schema (current = v8; see migrate() for v5 to v8 additions such as
+// Schema (current = v9; see migrate() for v5 to v8 additions such as
 // meetings.finalText, the cleaned text a dictation pasted):
 //   meetings(
 //     id TEXT PRIMARY KEY,
@@ -288,6 +288,15 @@ class StorageService {
             }
         }
 
+        // History grows over time. Keep parent/segment retrieval, recent lists,
+        // and shared-audio reference checks indexed without changing any data.
+        migrator.registerMigration("v9_history_query_indexes") { db in
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS segments_meeting_time ON segments(meetingId, startTime)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS meetings_date ON meetings(date DESC)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS meetings_kind_date ON meetings(kind, date DESC)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS meetings_audio_path ON meetings(audioFilePath) WHERE audioFilePath IS NOT NULL")
+        }
+
         try migrator.migrate(db)
     }
 
@@ -477,10 +486,15 @@ class StorageService {
             for segment in meeting.segments {
                 try db.execute(
                     sql: """
-                    INSERT OR REPLACE INTO segments
+                    INSERT INTO segments
                         (id, meetingId, speaker, text, startTime, endTime,
                          confidence, speakerId, isFinal)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        speaker=excluded.speaker, text=excluded.text,
+                        startTime=excluded.startTime, endTime=excluded.endTime,
+                        confidence=excluded.confidence, speakerId=excluded.speakerId, isFinal=excluded.isFinal
+                    WHERE segments.meetingId = excluded.meetingId
                     """,
                     arguments: [
                         segment.id.uuidString,
@@ -494,6 +508,10 @@ class StorageService {
                         segment.isFinal ? 1 : 0
                     ]
                 )
+                guard db.changesCount == 1 else {
+                    throw NSError(domain: "Voice.Storage", code: 5,
+                                  userInfo: [NSLocalizedDescriptionKey: "A transcript segment belongs to a different recording. Existing history has been preserved."])
+                }
             }
 
             if let summary = meeting.summary {
@@ -599,6 +617,7 @@ class StorageService {
     /// Most recent N meetings (date DESC). Convenience wrapper.
     func recentMeetings(limit: Int = 20) throws -> [Meeting] {
         guard let db = dbPool else { throw Self.storageUnavailable() }
+        guard limit > 0 else { return [] }
         return try db.read { db in
             let rows = try Row.fetchAll(
                 db,
@@ -722,6 +741,7 @@ class StorageService {
     /// keep payload small — call `fetchAllMeetings` if you need them).
     func searchTranscripts(query: String, limit: Int = 50) throws -> [SearchHit] {
         guard let db = dbPool else { throw Self.storageUnavailable() }
+        guard limit > 0 else { return [] }
         let safeQuery = sanitizeFTSQuery(query)
         guard !safeQuery.isEmpty else { return [] }
 
@@ -748,16 +768,18 @@ class StorageService {
                 LIMIT ?
             """, arguments: [safeQuery, limit])
 
+            var parents: [String: Meeting] = [:]
             return try rows.compactMap { row -> SearchHit? in
                 let meetingId = row["meetingId"] as String
-                guard let meetingRow = try Row.fetchOne(
-                    db,
-                    sql: "SELECT * FROM meetings WHERE id = ?",
-                    arguments: [meetingId]
-                ) else { return nil }
-
-                // Build a lightweight meeting (no segments/summary inlined).
-                let parent = try self.meetingHeader(from: meetingRow)
+                let parent: Meeting
+                if let cached = parents[meetingId] {
+                    parent = cached
+                } else {
+                    guard let meetingRow = try Row.fetchOne(db, sql: "SELECT * FROM meetings WHERE id = ?",
+                                                           arguments: [meetingId]) else { return nil }
+                    parent = try self.meetingHeader(from: meetingRow)
+                    parents[meetingId] = parent
+                }
 
                 let segment = TranscriptSegment(
                     id: UUID(uuidString: row["segmentId"]) ?? UUID(),
@@ -780,28 +802,9 @@ class StorageService {
         }
     }
 
-    /// Strip characters that would make the FTS5 MATCH grammar choke
-    /// (quotes, parens, colons). Falls back to a quoted phrase if the
-    /// caller passed something that looks like free text rather than an
-    /// FTS expression.
+    /// Match literal words and explicit prefix terms, preserving boundaries.
     private func sanitizeFTSQuery(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        // Strip dangerous chars; keep word chars, spaces, *, AND/OR/NOT.
-        let allowed = CharacterSet.alphanumerics
-            .union(.whitespaces)
-            .union(CharacterSet(charactersIn: "*-_"))
-        let cleaned = String(trimmed.unicodeScalars.filter { allowed.contains($0) })
-        // Quote each token: FTS5 barewords reject "-" and treat AND/OR/NOT/NEAR
-        // as operators, so "COVID-19" or a lone "NOT" would throw. A trailing
-        // "*" stays outside the quotes to keep prefix search.
-        let tokens: [String] = cleaned.split(whereSeparator: { $0 == " " || $0 == "\t" }).compactMap { raw in
-            let isPrefix = raw.hasSuffix("*")
-            let word = raw.replacingOccurrences(of: "*", with: "")
-            guard word.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
-            return "\"\(word)\"" + (isPrefix ? "*" : "")
-        }
-        return tokens.joined(separator: " ")
+        HistorySearchQuery.literalTerms(raw)
     }
 
     // MARK: - Tags & Notes
@@ -875,20 +878,22 @@ class StorageService {
     /// can find them.
     var audioDirectoryURL: URL { audioDirectory }
 
-    /// Map of normalized segment text → audioFilePath, used by the
-    /// `--rerun-audio` harness to bridge a `RecentDictation` (which stores no
-    /// audio path) to its retained `.caf`. The segments table stores the raw
-    /// Parakeet text, which equals `RecentDictation.parakeetRawText`, so a
-    /// normalized-text lookup resolves the audio file. Read-only.
+    /// Exact identity lookup without loading every segment and summary.
+    func audioPath(forRecordingID id: UUID) throws -> String? {
+        guard let db = dbPool else { throw Self.storageUnavailable() }
+        return try db.read { db in
+            try String.fetchOne(db, sql: "SELECT audioFilePath FROM meetings WHERE id = ?", arguments: [id.uuidString])
+        }
+    }
+
+    /// Compatibility lookup for older recent-history entries with no ID/path.
+    /// Omit any text associated with more than one recording or audio path.
     func audioPathsByNormalizedSegmentText() -> [String: String] {
         guard let db = dbPool else { return [:] }
-        func norm(_ s: String) -> String {
-            s.lowercased().split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
-        }
         return (try? db.read { db -> [String: String] in
-            var out: [String: String] = [:]
+            var index = LegacyAudioPathIndex()
             let rows = try Row.fetchAll(db, sql: """
-                SELECT s.text AS text, m.audioFilePath AS audioFilePath
+                SELECT s.text AS text, m.id AS recordingID, m.audioFilePath AS audioFilePath
                 FROM segments s JOIN meetings m ON m.id = s.meetingId
                 WHERE m.audioFilePath IS NOT NULL
                 """)
@@ -896,20 +901,14 @@ class StorageService {
                 let path: String? = r["audioFilePath"]
                 let text: String? = r["text"]
                 guard let p = path, !p.isEmpty, let t = text else { continue }
-                out[norm(t)] = p   // last write wins; fine for our purpose
+                index.add(text: t, recordingID: r["recordingID"], path: p)
             }
-            return out
+            return index.paths
         }) ?? [:]
     }
 
-    /// Disk-safety pruner. If the total size of `audioDirectory` exceeds
-    /// `highWatermark` bytes, deletes the oldest audio files (by modification
-    /// date) until total drops below `lowWatermark`. Skips files that are
-    /// still referenced by a meeting row only if `respectReferences` is true;
-    /// otherwise size-based eviction wins (oldest first).
-    ///
-    /// Safe to call on a background queue; does not touch the DB.
-    /// Returns (bytesRemoved, filesRemoved).
+    /// Compatibility no-op: retained recordings are never automatically evicted.
+    /// Returns (0, 0); the watermark arguments do not enable deletion.
     @discardableResult
     func pruneAudioBySize(
         highWatermark: Int = 5 * 1024 * 1024 * 1024,   // 5 GB
@@ -919,10 +918,7 @@ class StorageService {
         return (0, 0)
     }
 
-    /// Scan the audio directory and delete any `.caf`/`.wav`/`.m4a` files
-    /// that aren't referenced by a meeting row. Returns the number of
-    /// files removed. Safe to call any time; cheap (single DB query +
-    /// directory listing).
+    /// Compatibility no-op: unreferenced recovery/in-flight audio is preserved.
     @discardableResult
     func pruneOrphanedAudio() throws -> Int {
         // An unreferenced recording may be a recovery file or in-flight capture.

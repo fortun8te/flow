@@ -6,6 +6,29 @@ import Testing
 /// the tokens the selection should take (22 Nov 2026).
 @Suite("Opt+1 streamed progress")
 struct Opt1TypoFixProgressTests {
+    @Test("Chunk splitting preserves whitespace-only selections and leading/trailing blank paragraphs")
+    func chunksRoundTrip() {
+        for text in ["  ", "\n\n", " \n\n  alpha\n\nbeta\n\n ", "a\n\nb\n\nc\n\nd\n\n"] {
+            let chunks = TypoFixModel.chunks(text)
+            #expect(chunks.count <= 3)
+            #expect(chunks.map { $0.lead + $0.body + $0.trail }.joined() == text)
+        }
+    }
+
+    @Test("Long single-paragraph selections use all available slots and preserve every byte")
+    func longProseUsesSlots() {
+        let sentence = "Check the backup tomorrow, then send the report to the team. "
+        let text = String(repeating: sentence, count: 36) + "Keep version 2.4."
+        let chunks = TypoFixModel.chunks(text)
+        #expect(chunks.count == 3)
+        #expect(chunks.allSatisfy { !$0.body.isEmpty })
+        #expect(chunks.map { $0.lead + $0.body + $0.trail }.joined() == text)
+        #expect(chunks.map { $0.body.count }.max()! < text.count * 2 / 3)
+        let code = " `" + text + "` "
+        #expect(TypoFixModel.chunks(code).count == 1)
+        #expect(TypoFixModel.chunks("Short request.").count == 1)
+    }
+
     @Test("A streamed reply collects text, stops at [DONE] and keeps the finish reason")
     func streamedReplyCollectsText() throws {
         var stream = StreamedReply()
@@ -59,6 +82,20 @@ struct Opt1TypoFixProgressTests {
         let loading = Notification(name: PillPolishSignal.notification, object: nil,
                                    userInfo: PillPolishSignal(fraction: nil, loadingModel: true).userInfo)
         #expect(PillPolishSignal(notification: loading) == PillPolishSignal(fraction: nil, loadingModel: true))
+    }
+
+    @Test("Late progress belongs only to the operation that produced it")
+    func progressIsScoped() {
+        let signal = PillPolishSignal(fraction: 0.7, operationID: "first")
+        let note = Notification(name: PillPolishSignal.notification, object: nil, userInfo: signal.userInfo)
+        let decoded = PillPolishSignal(notification: note)
+        #expect(decoded.belongs(to: "first"))
+        #expect(!decoded.belongs(to: "second"))
+        #expect(!decoded.belongs(to: nil))
+        var state = PillPolishState()
+        state.apply(decoded)
+        state.apply(PillPolishSignal(fraction: 0.2, operationID: "first"))
+        #expect(state.fraction == 0.7)
     }
 
     @Test("Estimated tokens without the server stay positive and grow with length")

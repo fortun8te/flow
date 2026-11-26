@@ -155,7 +155,7 @@ struct PillBlobView: View, Animatable {
             }
             .foregroundStyle(skin.palette.ink)
             .lineLimit(1)
-            .fixedSize()
+            .padding(.horizontal, skin.metrics.tooltipPadding)
             .frame(width: frame.rect.width, height: frame.rect.height)
             .clipped()
             .opacity(Double(min(1, max(0, (frame.presence - 0.55) / 0.45))))
@@ -298,7 +298,7 @@ struct PillFaceView: View {
                 wordsWithUndo("The Flow Bar will be hidden for an hour", mark: nil, undo: actions.undoHide)
             case .line(let text, let tone):
                 HStack(spacing: 7) {
-                    PillToneMark(tone: tone, size: m.noticeIcon)
+                    if tone != .info { PillToneMark(tone: tone, size: m.noticeIcon).fixedSize() }
                     Text(text).font(skin.type.font(.label)).foregroundStyle(p.ink).lineLimit(1).truncationMode(.tail)
                 }
                 .padding(.horizontal, m.noticePadding)
@@ -323,7 +323,8 @@ struct PillFaceView: View {
                 PillWaveform(levels: [], animated: false, barLevel: 0, live: false)
             }
         }
-        .fixedSize()
+        // Let the text accept the measured width proposal. Horizontal
+        // fixedSize forced long labels outside their capped pill.
         .frame(width: size.width, height: size.height)
     }
 
@@ -333,6 +334,7 @@ struct PillFaceView: View {
             if let mark { PillToneMark(tone: mark, size: 13) }
             Text(words).font(skin.type.font(.label)).foregroundStyle(skin.palette.ink).lineLimit(1)
             PillChip(title: "Undo") { undo(); return true }
+                .layoutPriority(1)
         }
         .padding(.leading, m.statusPadding)
         .padding(.trailing, 5)
@@ -407,6 +409,7 @@ struct PillChangesFace: View {
             }
         }
         .lineLimit(1)
+        .minimumScaleFactor(0.85)
         .padding(.horizontal, skin.metrics.statusPadding)
         .frame(width: size.width, height: size.height)
         .background(Capsule().fill(hovering ? (skin.onBrightGlass ? Color.black.opacity(0.1) : Color(white: 0.29)) : .clear))

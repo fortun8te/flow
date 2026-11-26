@@ -139,14 +139,12 @@ final class Qwen3Polisher {
     /// ID-based loader, which can contact Hugging Face and download weights.
     func prepareCachedMeetingModel() async -> Bool {
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
-        if isLargeModelReady { return true }
-        let directory = ModelConfiguration(id: Self.largeModelID).modelDirectory(hub: defaultHubApi)
-        guard Self.isCompleteLocalModel(at: directory), !Task.isCancelled else { return false }
+        guard !Task.isCancelled else { return false }
         do {
-            let container = try await loadModelContainer(directory: directory)
+            // Meetings and dictation share the same local-only 4B load. A
+            // second meeting request must not map a second copy of the weights.
+            _ = try await ensureLargeModel()
             guard !Task.isCancelled else { return false }
-            cachedLargeContainer = container
-            isLargeModelReady = true
             last4BUseTime = Date()
             return true
         } catch {
@@ -258,11 +256,14 @@ final class Qwen3Polisher {
     /// Cached load task — concurrent prewarm + first-polish callers all
     /// await the same in-flight load instead of racing to each kick off
     /// their own download.
-    private var loadTask: Any?  // Task<ModelContainer, Error> when MLX is present
+    private var loadTask: Any?  // SharedModelTask<ModelContainer> when MLX is present
+    private var smallLoadGeneration: UUID?
+    private var smallLoadIsLocal = false
 
     /// Cached load task for the 4B prose-quality model. Same sharing semantics
     /// as `loadTask` but for `largeModelID`.
-    private var largeLoadTask: Any?  // Task<ModelContainer, Error> when MLX is present
+    private var largeLoadTask: Any?  // SharedModelTask<ModelContainer> when MLX is present
+    private var largeLoadGeneration: UUID?
 
     /// Resolved small-model container. Set once after the first successful
     /// `ensureModel()` load and reused for every subsequent inference call.
@@ -449,6 +450,9 @@ final class Qwen3Polisher {
     /// re-kick a fresh load — that path is already idempotent.
     func unloadIfIdle() {
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
+        // Dropping an unfinished task permits a second load while the first
+        // still maps weights, then lets its late result repopulate the cache.
+        guard smallLoadGeneration == nil, largeLoadGeneration == nil, !prewarmInFlight else { return }
         // Eagerly free the 4B container/task if the feature flag is off and
         // a previous build had it loaded. Runs on every idle check so the
         // RAM is reclaimed on the first idle cycle after this ships.
@@ -483,7 +487,7 @@ final class Qwen3Polisher {
         guard let last = lastPolishTime else { return }
         guard Date().timeIntervalSince(last) > idleUnloadAfter else { return }
         // Nothing loaded? Nothing to do.
-        guard loadTask != nil || largeLoadTask != nil else { return }
+        guard cachedSmallContainer != nil || cachedLargeContainer != nil else { return }
         let idleSec = Int(Date().timeIntervalSince(last))
         print("[VOICE] Qwen3 idle unload: \(idleSec)s since last polish — dropping model containers")
         loadTask = nil
@@ -527,12 +531,19 @@ final class Qwen3Polisher {
     }
 
     func prewarm() {
-        // Optional cleanup must not load a second, unselected model.
+        // Prepare the selected route before deciding whether its cold-start
+        // fallback also needs warming.
         if Self.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue {
-            // The fallback loads on demand when the primary declines an edit.
-            Task { _ = await WhisperNowTunedPolisher.shared.prepare() }
-            // A general model chosen in Companion starts loading too (or stops when it was unselected).
-            Task { await GeneralCleanupModel.shared.prepare() }
+            Task {
+                // This starts loading immediately (or stops an unselected general
+                // server). It does not wait for a cold model to become ready.
+                await GeneralCleanupModel.shared.prepare()
+                // A ready general model needs no extra fallback weight load.
+                // While it is cold/unavailable, keep DOSE1's existing warmup so
+                // the short general-model wait still has a prepared fallback.
+                guard !(await GeneralCleanupModel.shared.isSelectedModelReady) else { return }
+                _ = await WhisperNowTunedPolisher.shared.prepare()
+            }
             return
         }
         if Self.effectiveAutomaticCleanupModel == "s1-mini" {
@@ -585,7 +596,10 @@ final class Qwen3Polisher {
             } catch {
                 print("[VOICE] Qwen3 prewarm failed: \(error.localizedDescription)")
                 await MainActor.run {
-                    self.availabilityStatus = .error(error.localizedDescription)
+                    // A warmup generation can fail after weights loaded. The
+                    // model remains usable; only a load failure makes it unavailable.
+                    self.availabilityStatus = self.cachedSmallContainer == nil
+                        ? .error(error.localizedDescription) : .available
                 }
             }
         }
@@ -595,13 +609,19 @@ final class Qwen3Polisher {
     // MARK: - Model load
 
     #if canImport(MLXLLM) && canImport(MLXLMCommon)
-    private func ensureModel() async throws -> ModelContainer {
+    private func ensureModel(allowDownload: Bool = true) async throws -> ModelContainer {
+        try Task.checkCancellation()
         // Fast path: container already resolved — BPETokenizer.init runs only
         // once per load cycle; every subsequent inference reuses this instance.
         if let cached = cachedSmallContainer {
+            lastPolishTime = Date()
             return cached
         }
-        if let task = self.loadTask as? Task<ModelContainer, Error> {
+        if let task = self.loadTask as? SharedModelTask<ModelContainer> {
+            guard allowDownload || smallLoadIsLocal else {
+                throw NSError(domain: "Qwen3Polisher", code: -3,
+                              userInfo: [NSLocalizedDescriptionKey: "Local cleanup model is still downloading"])
+            }
             return try await task.value
         }
         // Kick off a single shared load. UI flips status as the Hub progress
@@ -613,47 +633,61 @@ final class Qwen3Polisher {
             throw NSError(domain: "Qwen3Polisher", code: -43,
                           userInfo: [NSLocalizedDescriptionKey: "Not enough free memory to load the cleanup model"])
         }
-        print("[VOICE] Qwen3 ensureModel: starting load (was \(availabilityStatus))")
-        self.availabilityStatus = .loading
-        // Use Task.detached: the surrounding class is @MainActor, so an
-        // unstructured `Task { ... }` would inherit MainActor isolation and
-        // pin the synchronous slices of `loadModelContainer` (weight mapping,
-        // metal kernel JIT) to the main thread, freezing the UI on first run.
         let modelID = Self.modelID
         let directory = ModelConfiguration(id: modelID).modelDirectory(hub: defaultHubApi)
         let localModelComplete = Self.isCompleteLocalModel(at: directory)
-        let task = Task.detached(priority: .userInitiated) { () -> ModelContainer in
-            if localModelComplete {
-                return try await loadModelContainer(directory: directory)
-            }
-            return try await loadModelContainer(id: modelID) { progress in
-                let frac = progress.fractionCompleted
-                // Hop back to MainActor — `loadModelContainer`'s progress
-                // handler is `@Sendable` and runs off-actor.
-                Task { @MainActor in
-                    if frac < 1.0, Qwen3Polisher.shared.cachedSmallContainer == nil {
-                        Qwen3Polisher.shared.availabilityStatus = .downloading(frac)
+        guard localModelComplete || allowDownload else {
+            throw NSError(domain: "Qwen3Polisher", code: -3,
+                          userInfo: [NSLocalizedDescriptionKey: "Local cleanup model is not cached"])
+        }
+        print("[VOICE] Qwen3 ensureModel: starting load (was \(availabilityStatus))")
+        self.availabilityStatus = .loading
+        let generation = UUID()
+        smallLoadGeneration = generation
+        smallLoadIsLocal = localModelComplete
+        let task = SharedModelTask<ModelContainer> { [weak self] in
+            do {
+                let container: ModelContainer
+                if localModelComplete {
+                    container = try await loadModelContainer(directory: directory)
+                } else {
+                    container = try await loadModelContainer(id: modelID) { [weak self] progress in
+                        let fraction = progress.fractionCompleted
+                        Task { @MainActor [weak self] in
+                            guard let self, self.smallLoadGeneration == generation, fraction < 1 else { return }
+                            self.availabilityStatus = .downloading(fraction)
+                        }
                     }
                 }
+                guard await self?.finishSmallLoad(container, generation: generation) == true else { throw CancellationError() }
+                return container
+            } catch {
+                await self?.failSmallLoad(generation: generation, error: error)
+                throw error
             }
         }
         self.loadTask = task
-        do {
-            let container = try await task.value
-            print("[VOICE] Qwen3 ensureModel: load complete, status -> available")
-            self.availabilityStatus = .available
-            // Cache the resolved container so future calls skip the Task
-            // machinery entirely and return immediately.
-            self.cachedSmallContainer = container
-            return container
-        } catch {
-            print("[VOICE] Qwen3 ensureModel: load FAILED: \(error.localizedDescription)")
-            self.availabilityStatus = .error(error.localizedDescription)
-            // Clear the failed task so the next call retries instead of
-            // re-throwing the cached error forever.
-            self.loadTask = nil
-            throw error
-        }
+        return try await task.value
+    }
+
+    private func finishSmallLoad(_ container: ModelContainer, generation: UUID) -> Bool {
+        guard smallLoadGeneration == generation, !Task.isCancelled else { return false }
+        cachedSmallContainer = container
+        loadTask = nil
+        smallLoadGeneration = nil
+        availabilityStatus = .available
+        lastPolishTime = Date()
+        startIdleUnloadWatchdogIfNeeded()
+        print("[VOICE] Qwen3 ensureModel: load complete, status -> available")
+        return true
+    }
+
+    private func failSmallLoad(generation: UUID, error: Error) {
+        guard smallLoadGeneration == generation else { return }
+        loadTask = nil
+        smallLoadGeneration = nil
+        availabilityStatus = .error(error.localizedDescription)
+        print("[VOICE] Qwen3 ensureModel: load FAILED: \(error.localizedDescription)")
     }
 
     /// Load a complete cached 4B model on demand. Missing weights fail fast
@@ -667,6 +701,7 @@ final class Qwen3Polisher {
     /// from `polishWithMLX` will still get the throw and fall back to the
     /// small model.
     private func ensureLargeModel() async throws -> ModelContainer {
+        try Task.checkCancellation()
         // Feature flag: 4B local model disabled. Throw a synthetic error so
         // every caller's existing fallback path (to 1.7B / cloud) fires.
         // Never load weights, never pay RAM cost.
@@ -680,16 +715,19 @@ final class Qwen3Polisher {
         // Fast path: container already resolved — BPETokenizer.init runs only
         // once per load cycle; every subsequent inference reuses this instance.
         if let cached = cachedLargeContainer {
+            last4BUseTime = Date()
             return cached
+        }
+        // Joining an existing load needs no additional weight memory. Check
+        // this before the headroom gate, which can fall after loading starts.
+        if let task = self.largeLoadTask as? SharedModelTask<ModelContainer> {
+            return try await task.value
         }
         // The 4B checkpoint needs far more room than the small one. Below the floor the callers' existing
         // fallback (1.7B, then rules) takes over.
         guard VoiceMemoryHeadroom.allowsModelLoad(floor: 12 * 1024 * 1024 * 1024) else {
             throw NSError(domain: "Qwen3Polisher", code: -43,
                           userInfo: [NSLocalizedDescriptionKey: "Not enough free memory to load the large cleanup model"])
-        }
-        if let task = self.largeLoadTask as? Task<ModelContainer, Error> {
-            return try await task.value
         }
         // Don't re-attempt if a prior load has already permanently failed
         // this session. The caller will throw → polishWithMLX falls back
@@ -707,43 +745,43 @@ final class Qwen3Polisher {
         }
         print("[VOICE-LP] Loading cached 4B model")
         let loadStart = Date()
-        let task = Task.detached(priority: .utility) { () -> ModelContainer in
-            try await loadModelContainer(directory: directory)
+        let generation = UUID()
+        largeLoadGeneration = generation
+        let task = SharedModelTask<ModelContainer>(priority: .utility) { [weak self] in
+            do {
+                let container = try await loadModelContainer(directory: directory)
+                guard await self?.finishLargeLoad(container, generation: generation, started: loadStart) == true else {
+                    throw CancellationError()
+                }
+                return container
+            } catch {
+                await self?.failLargeLoad(generation: generation, error: error)
+                throw error
+            }
         }
         self.largeLoadTask = task
-        do {
-            let container = try await task.value
-            let elapsed = Date().timeIntervalSince(loadStart)
-            print(String(format: "[VOICE-LP] 4B prewarm: ready in %.1fs", elapsed))
-            // Flip readiness on the main actor (we already are — class is
-            // @MainActor — but the assignment is explicit for clarity and so
-            // a future refactor that detaches this method can't silently
-            // miss the actor hop).
-            self.isLargeModelReady = true
-            // Stamp the use-time so the 5-min idle unload starts ticking
-            // from now (in case the first inference is delayed). Without
-            // this the first idle check after load might unload before the
-            // first inference even runs.
-            self.last4BUseTime = Date()
-            // Cache the resolved container so future calls skip the Task
-            // machinery entirely and return immediately.
-            self.cachedLargeContainer = container
-            return container
-        } catch {
-            print("[VOICE-LP] 4B prewarm: FAILED: \(error.localizedDescription)")
-            // Permanent failure flag — see `ensureLargeModel` doc comment.
-            // We do NOT clear `largeLoadTask` here because the cached task's
-            // value will throw the same error on every retry anyway, AND we
-            // want the next attempt (from polishWithMLX) to also see the
-            // failure and fall back. Setting the permanent flag prevents
-            // the background prewarm from re-entering this path.
-            self.largeModelLoadFailedThisSession = true
-            self.isLargeModelReady = false
-            // Clear so direct polish calls can retry (best-effort) but the
-            // background prewarm is gated by `largeModelLoadFailedThisSession`.
-            self.largeLoadTask = nil
-            throw error
-        }
+        return try await task.value
+    }
+
+    private func finishLargeLoad(_ container: ModelContainer, generation: UUID, started: Date) -> Bool {
+        guard largeLoadGeneration == generation, !Task.isCancelled else { return false }
+        cachedLargeContainer = container
+        largeLoadTask = nil
+        largeLoadGeneration = nil
+        isLargeModelReady = true
+        last4BUseTime = Date()
+        startIdleUnloadWatchdogIfNeeded()
+        print(String(format: "[VOICE-LP] 4B prewarm: ready in %.1fs", Date().timeIntervalSince(started)))
+        return true
+    }
+
+    private func failLargeLoad(generation: UUID, error: Error) {
+        guard largeLoadGeneration == generation else { return }
+        largeLoadTask = nil
+        largeLoadGeneration = nil
+        largeModelLoadFailedThisSession = true
+        isLargeModelReady = false
+        print("[VOICE-LP] 4B prewarm: FAILED: \(error.localizedDescription)")
     }
     #endif
 
@@ -774,8 +812,7 @@ final class Qwen3Polisher {
             if !isLargeModelReady {
                 print("[VOICE-RAW] Waiting for 4B large model to be ready…")
             }
-            if let cached = cachedLargeContainer { container = cached }
-            else { container = try await ensureLargeModel() }
+            container = try await ensureLargeModel()
         } catch {
             print("[VOICE-RAW] ensureLargeModel failed: \(error.localizedDescription)")
             return nil
@@ -811,19 +848,12 @@ final class Qwen3Polisher {
     /// share zero letters once tokenized. Soundex maps both halves of an
     /// ASR-shattered proper noun onto the same code sequence.
     nonisolated static func prioritizeVocabulary(_ vocab: [String], suspects: [String]?) -> [String] {
-        guard let suspects, !suspects.isEmpty else { return vocab }
+        guard vocab.count > 1, let suspects, !suspects.isEmpty else { return vocab }
 
-        // Section E: in-memory cache keyed on combined (vocab, suspects) hash.
-        // The polish hot-path can hit this with the same `(vocab, suspects)`
-        // tuple multiple times per dictation (polish + merge prompt build),
-        // and soundex scoring on a 60-entry vocab against 16 suspects is
-        // measurable. FIFO eviction at capacity 16 — small dictation surface,
-        // no need for true LRU. Hashing directly via Hasher avoids the
-        // string-join + interpolation allocation the previous key required.
-        var hasher = Hasher()
-        hasher.combine(vocab)
-        hasher.combine(suspects)
-        let cacheKey = hasher.finalize()
+        // Repeated polish/merge prompt construction shares a bounded snapshot.
+        // Exact bytes and array boundaries belong to the key, not just a hash:
+        // canonical-equivalent Strings may still carry different prompt bytes.
+        let cacheKey = PromptTerms.RankingCache.Key(vocabulary: vocab, suspects: suspects)
         if let cached = vocabPrioritizationCache.read(cacheKey) {
             return cached
         }
@@ -854,39 +884,12 @@ final class Qwen3Polisher {
             }
             return best
         }
-        let result = vocab.sorted { score($0) > score($1) }
+        let result = PromptTerms.ranked(vocab, score: score)
         vocabPrioritizationCache.write(cacheKey, value: result)
         return result
     }
 
-    /// Tiny FIFO cache for `prioritizeVocabulary`. NSLock makes it safe to
-    /// call from any actor / queue since the surrounding function is
-    /// `nonisolated`. Capacity 16 — when full, drop the oldest entry.
-    private final class VocabCache: @unchecked Sendable {
-        private let lock = NSLock()
-        private var order: [Int] = []
-        private var store: [Int: [String]] = [:]
-        private let capacity: Int
-        init(capacity: Int) { self.capacity = capacity }
-        func read(_ key: Int) -> [String]? {
-            lock.lock(); defer { lock.unlock() }
-            return store[key]
-        }
-        func write(_ key: Int, value: [String]) {
-            lock.lock(); defer { lock.unlock() }
-            if store[key] != nil {
-                store[key] = value
-                return
-            }
-            if order.count >= capacity, let oldest = order.first {
-                order.removeFirst()
-                store.removeValue(forKey: oldest)
-            }
-            order.append(key)
-            store[key] = value
-        }
-    }
-    nonisolated private static let vocabPrioritizationCache = VocabCache(capacity: 16)
+    nonisolated private static let vocabPrioritizationCache = PromptTerms.RankingCache(capacity: 16)
 
     /// Tiny Soundex implementation (standard American Soundex):
     ///   1. Keep the first letter (uppercase).
@@ -1387,10 +1390,9 @@ final class Qwen3Polisher {
     /// local cache. No repository-ID downloader or cloud route is used here.
     func prepareCachedAutomaticModel() async -> Bool {
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
-        let directory = ModelConfiguration(id: Self.modelID).modelDirectory(hub: defaultHubApi)
-        guard Self.isCompleteLocalModel(at: directory), !Task.isCancelled else { return false }
+        guard !Task.isCancelled else { return false }
         do {
-            _ = try await ensureModel()
+            _ = try await ensureModel(allowDownload: false)
             return !Task.isCancelled
         } catch { return false }
         #else
@@ -1418,11 +1420,9 @@ final class Qwen3Polisher {
         lastPolishTime = Date()
         var container = cachedSmallContainer
         if container == nil {
-            let directory = ModelConfiguration(id: Self.modelID).modelDirectory(hub: defaultHubApi)
-            guard Self.isCompleteLocalModel(at: directory), !Task.isCancelled else { return nil }
-            // Directory is complete, so ensureModel loads from disk (no download)
-            // and joins any load already in flight instead of starting a second.
-            guard let loaded = try? await ensureModel() else { return nil }
+            // Local-only loading joins preparation already in flight, but must
+            // not start or wait for a missing-weights download.
+            guard let loaded = try? await ensureModel(allowDownload: false) else { return nil }
             container = loaded
         }
         guard let container, !Task.isCancelled, deadline.map({ $0 > Date() }) ?? true else { return nil }
@@ -1456,8 +1456,14 @@ final class Qwen3Polisher {
 
     func prewarmQuickPolish() async {
         TypoRepair.shared.prewarm()
-        await TypoFixModel.shared.prepareInBackground()
+        RealWordFixer.shared.prewarm()
         await DraftDecisionGate.prewarmIfEnabled()
+        // The selected typing model is the Opt+1 route. Do not load an
+        // additional large fallback editor just to leave it idle in RAM.
+        if TypoFixModel.isAvailable {
+            await TypoFixModel.shared.prepareInBackground()
+            return
+        }
         if WhisperNowTunedPolisher.hasQuickPolishAdapter {
             _ = await WhisperNowTunedPolisher.shared.prepare()
             return
@@ -1522,7 +1528,7 @@ final class Qwen3Polisher {
                         onLoading: ((Bool) -> Void)? = nil,
                         onDraft: (() -> Void)? = nil) async -> (text: String?, preview: Bool) {
         if TypoFixModel.isAvailable {
-            return await typoFixShortcut(original, deadline: deadline, onLoading: onLoading)
+            return await typoFixShortcut(original, deadline: deadline, onLoading: onLoading, onDraft: onDraft)
         }
         let core = await polishShortcutCore(original, deadline: deadline, onLoading: onLoading, onDraft: onDraft)
         guard !Task.isCancelled else { return core }
@@ -1542,7 +1548,7 @@ final class Qwen3Polisher {
     /// finishes what is left, and product names snap to their spelling. A cold model never means an
     /// unchanged selection: the deterministic fixes go out instead and the model keeps loading.
     private func typoFixShortcut(_ original: String, deadline: ContinuousClock.Instant?,
-                                 onLoading: ((Bool) -> Void)?) async -> (text: String?, preview: Bool) {
+                                 onLoading: ((Bool) -> Void)?, onDraft: (() -> Void)?) async -> (text: String?, preview: Bool) {
         Self.lastSelectedRejection = nil
         let deadline = deadline ?? ContinuousClock.now + .seconds(PolishTransaction.shortcutBudgetSeconds(for: original))
         let terms = DictationReferee.protectedTerms()
@@ -1566,8 +1572,11 @@ final class Qwen3Polisher {
         if ready, let edited = await model.edit(original, deadline: deadline - .milliseconds(700),
                                                 progress: { PillPolishSignal.post(fraction: $0) }), !Task.isCancelled {
             PillPolishSignal.post(fraction: TypoFixProgress.ceiling)
-            let judged = OptOneReferee.finish(source: original, model: edited, protectedTerms: terms,
-                                              deadline: min(deadline, ContinuousClock.now + .milliseconds(900)))
+            onDraft?()
+            let reviewDeadline = min(deadline, ContinuousClock.now + .milliseconds(900))
+            let judged = await DictationReferee.background {
+                OptOneReferee.finish(source: original, model: edited, protectedTerms: terms, deadline: reviewDeadline)
+            }
             result = judged.text
             if !judged.reverted.isEmpty { print("[VOICE-SELECT] referee kept \(judged.reverted.count) typed group(s)") }
         }
@@ -1576,12 +1585,20 @@ final class Qwen3Polisher {
         if result == nil {
             if ready { Telemetry.log("polish.opt1_model_timeout", properties: ["words": original.split(whereSeparator: \.isWhitespace).count]) }
             if !ready { await model.prepareInBackground() }
-            result = OptOneReferee.deterministic(original, protectedTerms: terms,
-                                                 deadline: min(deadline, ContinuousClock.now + .milliseconds(600)))
+            onDraft?()
+            let repairDeadline = min(deadline, ContinuousClock.now + .milliseconds(600))
+            result = await DictationReferee.background {
+                OptOneReferee.deterministic(original, protectedTerms: terms, deadline: repairDeadline)
+            }
         }
-        let snapped = TypoRepair.shared.snapVocabulary(result ?? original, protectedTerms: terms)
-        // Line breaks and lists for one long block (OptOneLayout): rules only, no model call.
-        return (OptOneLayout.apply(source: original, edited: snapped), false)
+        guard !Task.isCancelled else { return (nil, false) }
+        let base = result ?? original
+        let laidOut = await DictationReferee.background {
+            let snapped = TypoRepair.shared.snapVocabulary(base, protectedTerms: terms)
+            let safe = OptOneReferee.finalize(snapped, source: original) ?? base
+            return OptOneLayout.apply(source: original, edited: safe)
+        }
+        return Task.isCancelled ? (nil, false) : (laidOut, false)
     }
 
     private func polishShortcutCore(_ original: String, deadline: ContinuousClock.Instant? = nil,
@@ -2870,7 +2887,8 @@ final class Qwen3Polisher {
         // A general model chosen in Companion goes first. Its answer passes the same content guard; on any failure,
         // timeout or guard trip DOSE1 cleans this dictation as before (24 Nov 2026).
         if let general = GeneralCleanupModel.selectedEntry {
-            let generalReply = await GeneralCleanupModel.shared.clean(text)
+            let generalReply = await GeneralCleanupModel.shared.clean(text, entry: general)
+            guard !Task.isCancelled else { return text }
             let generalMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
             if case .success(let reply) = generalReply {
                 let decision = await WhisperNowCleanupDecision.decide(source: text, reply: .success(reply)) { nil }
@@ -2879,6 +2897,8 @@ final class Qwen3Polisher {
                     Telemetry.log("cleanup.general_used", properties: ["model": general.id, "model_ms": generalMs,
                                                                        "words": text.split(separator: " ").count])
                     ShadowCleanupTrace.observer?.set(input: text, engine: label, result: decision.outcome.label)
+                    FlowRunCollector.model("cleanupEngine", label)
+                    FlowRunCollector.decision("cleanup", decision.outcome.label)
                     PolishStatus.shared.lastEngine = label
                     if decision.outcome == .noSpeech { return "" }
                     return Self.applyMinimalPostprocessor(decision.text, userVocabulary: userVocabulary,
@@ -2886,6 +2906,7 @@ final class Qwen3Polisher {
                 }
                 Telemetry.log("cleanup.general_fallback", properties: ["model": general.id, "reason": decision.outcome.reason ?? "guard"])
                 FlowRunCollector.model("pickedMissed", general.id + "|guard")
+                FlowRunCollector.decision("cleanup-guard", "rejected", reason: decision.outcome.reason ?? "general-output-guard")
             } else if case .failure(let failure) = generalReply {
                 FlowRunCollector.model("pickedMissed", general.id + "|" + failure.rawValue)
                 Telemetry.log("cleanup.general_fallback", properties: ["model": general.id, "reason": failure.rawValue,
@@ -2914,9 +2935,15 @@ final class Qwen3Polisher {
         }
         ShadowCleanupTrace.observer?.set(input: text, engine: engineLabel,
                                          result: decision.outcome.reason.map { decision.outcome.label + ":" + $0 } ?? decision.outcome.label)
-        PolishStatus.shared.lastEngine = decision.outcome == .model || decision.outcome == .noSpeech
+        let settledEngine = decision.outcome == .model || decision.outcome == .noSpeech
             ? engineLabel
             : (decision.outcome.label == "s1mini" ? "local:s1-mini" : "rules:whispernow-guard")
+        FlowRunCollector.model("cleanupEngine", settledEngine)
+        FlowRunCollector.decision("cleanup", decision.outcome.label, reason: decision.outcome.reason)
+        if let reason = decision.outcome.reason, !reason.hasPrefix("failure:") {
+            FlowRunCollector.decision("cleanup-guard", "rejected", reason: reason)
+        }
+        PolishStatus.shared.lastEngine = settledEngine
         if decision.outcome == .noSpeech { return "" }
         return Self.applyMinimalPostprocessor(decision.text, userVocabulary: userVocabulary,
                                               personalityStyle: personalityStyle, appContextLabel: appContextLabel)
@@ -2993,6 +3020,8 @@ final class Qwen3Polisher {
                     structure: UserDefaults.standard.string(forKey: T2CleanupOptions.structureKey) ?? "lists"),
                   options.isSupported(by: WhisperNowTunedPolisher.activeT2Contracts) else {
                 ShadowCleanupTrace.observer?.skipped(input: text, reason: "t2-cleanup-unsupported-controls")
+                FlowRunCollector.model("cleanupEngine", "rules:t2-unsupported-controls")
+                FlowRunCollector.decision("cleanup", "skipped", reason: "t2-unsupported-controls")
                 PolishStatus.shared.lastEngine = "rules:t2-unsupported-controls"
                 return text
             }
@@ -3022,7 +3051,13 @@ final class Qwen3Polisher {
             }
             ShadowCleanupTrace.observer?.set(input: text, engine: receivedReply ? "local:dose1-t2" : "rules",
                 result: outcome, controlLine: receivedReply ? options.controlLine : nil)
-            PolishStatus.shared.lastEngine = outcome == "accepted" || outcome == "no-speech" ? "local:dose1-t2" : "rules:t2-refused"
+            let settledEngine = outcome == "accepted" || outcome == "no-speech" ? "local:dose1-t2" : "rules:t2-refused"
+            FlowRunCollector.model("cleanupEngine", settledEngine)
+            FlowRunCollector.decision("cleanup", outcome)
+            if outcome.hasPrefix("rejected:") {
+                FlowRunCollector.decision("cleanup-guard", "rejected", reason: String(outcome.dropFirst("rejected:".count)))
+            }
+            PolishStatus.shared.lastEngine = settledEngine
             // T2 learned the requested casing, punctuation and layout. Legacy style postprocessing
             // must not change that answer or rewrite the original on failure.
             return result
@@ -3084,6 +3119,8 @@ final class Qwen3Polisher {
             ShadowCleanupTrace.observer?.s1(input: text, result: result, guardRefused: guardRefused,
                                             controlLine: s1Options.controlLine)
             if Self.s1Settles(result, assessment: assessed) {
+                FlowRunCollector.model("cleanupEngine", engine)
+                FlowRunCollector.decision("cleanup", final == text ? "unchanged" : "accepted")
                 PolishStatus.shared.lastEngine = engine
                 return final
             }
@@ -3374,9 +3411,9 @@ final class Qwen3Polisher {
                 }
             }
 
-            // Cache key: stable hash of the system prompt so calls sharing
-            // the same settings route to the same Cerebras cache slot.
-            let cacheKey = "voice-polish-\(abs(cloudPrompt.hashValue) % 0xFFFF)"
+            // Swift hashValue is randomized between launches and abs(Int.min)
+            // traps. A bounded deterministic digest keeps cache routing stable.
+            let cacheKey = "voice-polish-" + ModelChatProfile.sha256(Data(cloudPrompt.utf8)).prefix(32)
             // SERIAL cloud-first. Cerebras runs to completion (or its own
             // adaptive timeout). If it returns nil we try Groq, then local.
             let callText = messageToSend
@@ -3590,6 +3627,7 @@ final class Qwen3Polisher {
             switch result {
             case .nvidiaOK(let s):
                 polishedFrozen = s
+                FlowRunCollector.model("cleanupEngine", "cloud:nvidia-gpt-oss-120b")
                 let nvMs = NVIDIAPolisher.shared.lastLatencyMs
                 print("[VOICE-ROUTE] cloud (NVIDIA primary) returned in \(nvMs)ms | local_avg=\(Int(self.avgLatencyMs))ms")
                 print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:nvidia-gpt-oss-120b because NVIDIA returned text in \(nvMs)ms")
@@ -3599,6 +3637,7 @@ final class Qwen3Polisher {
                 }
             case .cerebrasOK(let s):
                 polishedFrozen = s
+                FlowRunCollector.model("cleanupEngine", "cloud:gpt-oss-120b")
                 let cloudMs = CerebrasPolisher.shared.lastLatencyMs
                 print("[VOICE-ROUTE] cloud (Cerebras) returned in \(cloudMs)ms | local_avg=\(Int(self.avgLatencyMs))ms")
                 print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:gpt-oss-120b because Cerebras returned text in \(cloudMs)ms")
@@ -3608,6 +3647,7 @@ final class Qwen3Polisher {
                 }
             case .hyperbolicOK(let s):
                 polishedFrozen = s
+                FlowRunCollector.model("cleanupEngine", "cloud:hyperbolic-gpt-oss-120b")
                 let hyperMs = HyperbolicPolisher.shared.lastLatencyMs
                 let cerebrasReason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
                 print("[VOICE-ROUTE] cloud (Hyperbolic fallback) returned in \(hyperMs)ms")
@@ -3618,6 +3658,7 @@ final class Qwen3Polisher {
                 }
             case .groqOK(let s):
                 polishedFrozen = s
+                FlowRunCollector.model("cleanupEngine", "cloud:groq-llama3.3-70b")
                 let groqMs = GroqPolisher.shared.lastLatencyMs
                 let cerebrasReason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
                 let hyperbolicReason = await HyperbolicPolisher.shared.lastFailureReason
@@ -3760,6 +3801,7 @@ final class Qwen3Polisher {
         let outputSentinels = countSentinels(in: polishedFrozenFinal)
         let safePolished: String = (inputSentinels == outputSentinels && EntityFreezer.hasIntactEntities(polishedFrozenFinal, frozen: frozen)) ? polishedFrozenFinal : {
             print("[VOICE-GUARD] sentinel mismatch: in=\(inputSentinels) out=\(outputSentinels), falling back")
+            FlowRunCollector.decision("cleanup-guard", "rejected", reason: "entity-sentinel-mismatch")
             return frozen.text
         }()
 
@@ -3805,6 +3847,7 @@ final class Qwen3Polisher {
             userVocabulary: userVocabulary
         ) {
             polished = accepted
+            FlowRunCollector.decision("cleanup-sanitizer", "accepted")
             Telemetry.log("polish.sanitizer_result", properties: [
                 "accepted": true,
                 "mode": "relaxed",
@@ -3814,6 +3857,7 @@ final class Qwen3Polisher {
             ])
         } else {
             print("[VOICE-GUARD] relaxed sanitizer rejected polish — falling back to raw input")
+            FlowRunCollector.decision("cleanup-guard", "rejected", reason: "relaxed-sanitizer")
             // A reject means we ship the RAW transcript — the single biggest
             // "polish did nothing" signal. Make it loud in events.jsonl so a
             // false-positive sanitizer rule is diagnosable without the console.
@@ -3834,7 +3878,7 @@ final class Qwen3Polisher {
         // implied enumeration).
         let polishOut = Self.applyPostprocessor(polished, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         let polishOutMs = Int(Date().timeIntervalSince(polishInStartedAt) * 1000)
-        let polishOutEngine = await MainActor.run { PolishStatus.shared.lastEngine ?? "unknown" }
+        let polishOutEngine = FlowRunCollector.current?.snapshot.models["cleanupEngine"] ?? "unknown"
         let polishOutSanitized = (polishOut != polished)
         print("[VOICE-POLISH-OUT] engine=\(polishOutEngine) latency=\(polishOutMs)ms sanitized=\(polishOutSanitized)")
         return polishOut
@@ -4259,6 +4303,8 @@ final class Qwen3Polisher {
         // eval marks the case as not cloud-served.
         if Self.evalCloudOnly {
             print("[EVAL] local MLX blocked (voice.evalCloudOnly); returning input unchanged")
+            FlowRunCollector.model("cleanupEngine", "rules:local-blocked")
+            FlowRunCollector.decision("cleanup", "skipped", reason: "eval-cloud-only")
             PolishStatus.shared.lastEngine = nil
             return text
         }
@@ -4304,6 +4350,8 @@ final class Qwen3Polisher {
         // ("ok" / "yeah" / "got it") while capturing path/URL commands.
         if wordCount < 6 {
             print("[VOICE-LP] ultra-short fast-path, skipping LLM (wordCount=\(wordCount))")
+            FlowRunCollector.model("cleanupEngine", "rules:short-input")
+            FlowRunCollector.decision("cleanup", "skipped", reason: "short-input")
             let formatted = TextFormatter().format(cleanedInput)
             return formatted
         }
@@ -4374,6 +4422,8 @@ final class Qwen3Polisher {
                     container = try await ensureModel()
                 } catch {
                     print("[VOICE] Qwen3 polish: model unavailable (\(error.localizedDescription))")
+                    FlowRunCollector.model("cleanupEngine", "rules:qwen-unavailable")
+                    FlowRunCollector.decision("cleanup", "fallback", reason: Task.isCancelled ? "cancelled" : "model-unavailable")
                     return text
                 }
             }
@@ -4382,6 +4432,8 @@ final class Qwen3Polisher {
                 container = try await ensureModel()
             } catch {
                 print("[VOICE] Qwen3 polish: model unavailable (\(error.localizedDescription))")
+                FlowRunCollector.model("cleanupEngine", "rules:qwen-unavailable")
+                FlowRunCollector.decision("cleanup", "fallback", reason: Task.isCancelled ? "cancelled" : "model-unavailable")
                 return text
             }
         }
@@ -4590,11 +4642,18 @@ final class Qwen3Polisher {
             }
         } : nil
         defer { warmupNotifier?.cancel() }
+        let localEngine = usedLarge ? "local:qwen3-4b" : "local:qwen3-1.7b"
+        FlowRunCollector.model("cleanupAttemptEngine", localEngine)
         do {
             guard let response = try await Self.generateDictation(
                 container: container, prompt: prompt, parameters: params,
                 deadline: start.addingTimeInterval(Double(effectiveTimeout) / 1000)
-            ) else { return text }
+            ) else {
+                FlowRunCollector.model("cleanupEngine", "rules:qwen-incomplete")
+                FlowRunCollector.decision("cleanup", "fallback", reason: Task.isCancelled ? "cancelled" : "incomplete-generation")
+                return text
+            }
+            FlowRunCollector.model("cleanupEngine", localEngine)
             if isFirstCall { hasWarmedUp = true }
             let ms = Int(Date().timeIntervalSince(start) * 1000)
             recordLatency(ms)
@@ -4602,6 +4661,8 @@ final class Qwen3Polisher {
             return Self.stripDashes(sanitized)
         } catch {
             print("[VOICE] Qwen3 polish error: \(error.localizedDescription)")
+            FlowRunCollector.model("cleanupEngine", "rules:qwen-failed")
+            FlowRunCollector.decision("cleanup", "fallback", reason: Task.isCancelled ? "cancelled" : "generation-failed")
             return text
         }
     }

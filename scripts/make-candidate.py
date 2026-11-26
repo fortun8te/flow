@@ -11,11 +11,12 @@ What it does, in order:
   3. Checks the candidate. It refuses to finish, and deletes the candidate and its
      receipt, unless all of these hold:
      - Info.plist: CFBundleIdentifier is com.example.flow, CFBundleExecutable is Flow,
-       and no "$(" placeholder appears anywhere in the file;
+       and no "$(" or "${" placeholder remains in plist keys or values;
      - the signature is valid (codesign --verify --deep --strict) and was made with
        the identity "acmehub Local Signing";
-     - the binary answers its harness flag --check-permissions with JSON and exit 0.
+     - the binary answers --check-permissions with typed permission JSON and exit 0.
        That flag returns before the app starts: nothing is launched, no window opens.
+       It is never executed after failed plist or signature validation.
 
 It never installs over /Applications/Flow.app and never launches the app.
 """
@@ -26,8 +27,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
-from candidate_check import EXPECTED_SIGNER, codesign_problems, plist_problems
+from candidate_check import EXPECTED_SIGNER, codesign_problems, permission_problems, plist_problems
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
@@ -50,36 +52,48 @@ def verify(candidate):
     info_path = candidate / 'Contents/Info.plist'
     if not info_path.is_file():
         return ['Info.plist is missing from the candidate']
-    info = plistlib.loads(info_path.read_bytes())
+    try:
+        info = plistlib.loads(info_path.read_bytes())
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException, ExpatError):
+        return ['Info.plist is unreadable or invalid']
     problems += plist_problems(info)
-    if b'$(' in info_path.read_bytes():
-        problems.append('the raw Info.plist file still contains "$("')
+    if problems:
+        # Do not execute a path from a bundle whose metadata already failed.
+        return problems
     executable = candidate / 'Contents/MacOS' / str(info.get('CFBundleExecutable', ''))
-    if not executable.is_file():
+    if executable.is_symlink() or not executable.is_file() or not executable.resolve().is_relative_to(candidate.resolve()):
         problems.append('the executable named in Info.plist is missing: %s' % executable.name)
         return problems
 
-    signing = subprocess.run(['codesign', '-dv', '--verbose=4', str(candidate)],
-                             capture_output=True, text=True)
+    try:
+        signing = subprocess.run(['codesign', '-dv', '--verbose=4', str(candidate)],
+                                 capture_output=True, text=True, timeout=30)
+        strict = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(candidate)],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ['candidate signature inspection failed or exceeded 30 s']
+    if signing.returncode != 0:
+        problems.append('candidate signature inspection failed')
     problems += codesign_problems(signing.stdout + '\n' + signing.stderr)
-    strict = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(candidate)],
-                            capture_output=True, text=True)
     if strict.returncode != 0:
         problems.append('signature does not verify: ' + strict.stderr.strip())
+    if problems:
+        return problems
 
     try:
         check = subprocess.run([str(executable), '--check-permissions'],
                                capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         return problems + ['the binary did not answer --check-permissions within 30 s']
+    except OSError:
+        return problems + ['the binary could not execute --check-permissions']
     if check.returncode != 0:
         problems.append('the binary exited with %d for --check-permissions' % check.returncode)
     else:
         try:
             answer = json.loads(check.stdout)
-            if not {'microphone', 'accessibility'} <= set(answer):
-                problems.append('--check-permissions printed JSON without the expected keys')
-        except ValueError:
+            problems += permission_problems(answer)
+        except (ValueError, TypeError):
             problems.append('--check-permissions did not print JSON')
     return problems
 

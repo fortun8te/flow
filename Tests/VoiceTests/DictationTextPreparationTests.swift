@@ -34,6 +34,19 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertEqual(DictationTextPreparation.finalize(polished: "   ", formatted: "A synthetic line."), "A synthetic line.")
     }
 
+    @MainActor func testLayoutCommandSurvivesFinalizeAndDeliveryWithoutPolish() {
+        for source in ["\n", "\n\n", "\nNext line.\n"] {
+            XCTAssertEqual(DictationTextPreparation.finalize(polished: source.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                            formatted: source), source)
+            let intent = DictationTextPreparation.delivery(autoCopy: false, autoPaste: true, skipPolish: true,
+                formatted: source, final: source, fieldContextProvided: false,
+                command: .init(text: source, shouldSubmit: false))
+            XCTAssertTrue(intent.shouldPaste)
+            XCTAssertTrue(intent.preFormatted)
+            XCTAssertFalse(intent.shouldSubmit)
+        }
+    }
+
     func testDelayedPasteRefusesToFollowTheUserToAnotherApp() {
         XCTAssertTrue(CursorPaster.canPasteInApp(captured: "com.example.editor", current: "com.example.editor"))
         XCTAssertFalse(CursorPaster.canPasteInApp(captured: "com.example.editor", current: "com.example.chat"))
@@ -43,20 +56,21 @@ final class DictationTextPreparationTests: XCTestCase {
 
     func testPasteSpacingUsesBothSidesOfTheLiveSelection() {
         let chrome = "com.google.Chrome"
-        func paste(_ text: String, into field: String, at location: Int, replacing length: Int = 0) -> String {
+        func paste(_ text: String, into field: String, at location: Int, replacing length: Int = 0,
+                   preFormatted: Bool = true) -> String {
             let selection = NSRange(location: location, length: length)
             let insertion = CursorPaster.resolvedInsertion(text, field: field, selection: selection,
-                                                          preFormatted: true, bundleID: chrome)
+                                                          preFormatted: preFormatted, bundleID: chrome)
             return (field as NSString).replacingCharacters(in: selection, with: insertion)
         }
 
-        XCTAssertEqual(paste(" there ", into: "Hello ", at: 6), "Hello there")
+        XCTAssertEqual(paste(" there ", into: "Hello ", at: 6, preFormatted: false), "Hello there")
         XCTAssertEqual(paste("there", into: "Hello", at: 5), "Hello there")
-        XCTAssertEqual(paste(" there ", into: "Hello, friend", at: 5), "Hello there, friend")
-        XCTAssertEqual(paste("a ", into: "HelloBRIDGEworld", at: 5, replacing: 6), "Helloaworld")
+        XCTAssertEqual(paste(" there ", into: "Hello, friend", at: 5, preFormatted: false), "Hello there, friend")
+        XCTAssertEqual(paste("a ", into: "HelloBRIDGEworld", at: 5, replacing: 6, preFormatted: false), "Helloaworld")
         XCTAssertEqual(paste("there", into: "Hello old world", at: 5, replacing: 5), "Hello there world")
-        XCTAssertEqual(paste(" detail ", into: "Read () now", at: 6), "Read (detail) now")
-        XCTAssertEqual(paste(" 🎉 ", into: "Done ", at: 5), "Done 🎉")
+        XCTAssertEqual(paste(" detail ", into: "Read () now", at: 6, preFormatted: false), "Read (detail) now")
+        XCTAssertEqual(paste(" 🎉 ", into: "Done ", at: 5, preFormatted: false), "Done 🎉")
         XCTAssertEqual(paste("one", into: "👩🏽‍💻 two", at: "👩🏽‍💻 ".utf16.count), "👩🏽‍💻 one two")
         XCTAssertEqual(paste("World.", into: "Hello .", at: 6), "Hello World.")
         XCTAssertEqual(paste(", then leave.", into: "Take it", at: 7), "Take it, then leave.")
@@ -131,6 +145,9 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertFalse(CursorPaster.rememberedPasteApplies(recordedBundle: "com.t3tools.t3code", currentBundle: "com.t3tools.t3code",
                                                            age: 20, sameField: false, sameWindowTitle: true,
                                                            interactionSincePaste: true))
+        XCTAssertFalse(CursorPaster.rememberedPasteApplies(recordedBundle: "com.example.editor", currentBundle: "com.example.editor",
+                                                           age: 20, sameField: true, sameWindowTitle: true,
+                                                           interactionSincePaste: true), "An identical field can have a different caret after a click or key")
     }
 
     func testADifferentOrUnknownWindowTitleBreaksTheElectronMatch() {
@@ -144,7 +161,7 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertEqual(CursorPaster.resolvedInsertion("New text", field: "Existing.", selection: nil,
                                                       preFormatted: true, bundleID: "com.google.Chrome"), "New text")
         XCTAssertEqual(CursorPaster.resolvedInsertion(" New text ", field: "", selection: nil,
-                                                      preFormatted: true, bundleID: "com.apple.TextEdit"), "New text")
+                                                      preFormatted: true, bundleID: "com.apple.TextEdit"), " New text ")
     }
     func testLiteralLinksAndNamesSurvivePresentationPasses() {
         let input = "send Jane Smith the notes at https://example.com/brief"
@@ -186,6 +203,13 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertTrue(TranscriptionService.hasAcousticSignal([0, 0, Float(0.00001), 0][...]))
     }
 
+    @MainActor func testSectionBudgetIncludesSelectedModelAndNeverExceedsDeadline() {
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 10, remaining: 20), 14)
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 10, remaining: 5), 5)
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 0, remaining: 20), 4)
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 0, remaining: -1), 0)
+    }
+
     @MainActor func testCleanupSectionsPreferSentenceEndsAndLeaveBreaksOutside() {
         let source = "Read the report. Mark page 15. Save it.\n\n  Next section."
         let ranges = DictationTextPreparation.cleanupSections(in: source, limit: 30)
@@ -210,6 +234,41 @@ final class DictationTextPreparationTests: XCTestCase {
         }
         XCTAssertFalse(result.timedOut)
         XCTAssertEqual(result.text, "They are ready tomorrow.\n\n  Do not send archive-2.txt.\n\nKeep page 15.")
+    }
+
+    @MainActor func testSectionCleanupCannotSplitAnItemAndKeepsExactSeparators() async {
+        let source = "\r\n1. Keep the backup.  \r\n\r\n  They is ready.\r\n"
+        let result = await DictationTextPreparation.cleanSections(
+            in: source, ranges: DictationTextPreparation.cleanupSections(in: source), deadline: .now + .seconds(1)) {
+                $0.hasPrefix("1.") ? "1. Keep\nthe backup." : "They are ready."
+            }
+        XCTAssertEqual(result.text, "\r\n1. Keep the backup.  \r\n\r\n  They are ready.\r\n")
+    }
+
+    @MainActor func testSectionReviewOverlapsNextCleanupAndKeepsItsOwnOriginal() async {
+        let first = "The blue kettles is cold."
+        let second = "The green shelves is empty."
+        let source = first + "\n\n" + second
+        let (started, signalStarted) = AsyncStream<Void>.makeStream()
+        let (next, signalNext) = AsyncStream<Void>.makeStream()
+        let result = await DictationTextPreparation.cleanSections(
+            in: source, ranges: DictationTextPreparation.cleanupSections(in: source),
+            deadline: .now + .seconds(2), review: { original, _ in
+                guard original == first else { return false }
+                signalStarted.yield(())
+                signalStarted.finish()
+                var iterator = next.makeAsyncIterator()
+                return await iterator.next() != nil
+            }) { original in
+                if original == first { return "The blue kettles are cold." }
+                var iterator = started.makeAsyncIterator()
+                _ = await iterator.next()
+                signalNext.yield(())
+                signalNext.finish()
+                return "The green shelves are empty."
+            }
+        XCTAssertFalse(result.timedOut)
+        XCTAssertEqual(result.text, first + "\n\nThe green shelves are empty.")
     }
 
     @MainActor func testSectionTimeoutRetainsEarlierFixAndAllRemainingText() async {

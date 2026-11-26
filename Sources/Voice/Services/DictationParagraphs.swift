@@ -37,7 +37,7 @@ enum DictationParagraphs {
         let numberWord = #"\bnumber[\t ]+(?<named>"# + cardinals + #")\b[,.:]?[\t ]+"#
         // "First we need milk. Secondly, call Noor. Finally, ..." at a sentence start, without a comma.
         let sentenceStart = #"(?:\A[\t ]*|(?<=[.!?:;])[\t ]+)"#
-        let bare = sentenceStart + #"(?:and[\t ]+)?(?<bare>"# + ordinalWords.joined(separator: "|")
+        let bare = sentenceStart + #"(?:(?:and|en|ten)[\t ]+)?(?<bare>"# + (ordinalWords + dutchOrdinals).joined(separator: "|")
             + #")(?:ly)?(?:[\t ]+of[\t ]+all)?,?[\t ]+"#
         let last = sentenceStart + #"(?:and[\t ]+)?(?<last>finally|lastly)[,:][\t ]+"#
         return try! NSRegularExpression(pattern: "(?i)" + boundary + punctuated + "|" + numberWord + "|" + bare + "|" + last)
@@ -65,16 +65,26 @@ enum DictationParagraphs {
         guard input.contains(where: \.isNewline) else { return formatLine(input, isEmail: isEmail) }
         var result = ""
         var cursor = input.startIndex
-        var fence: String?
+        var fence: (marker: Character, length: Int)?
         for span in input.split(whereSeparator: \.isNewline) {
             result += input[cursor..<span.startIndex]
             let line = String(span)
             let trimmed = line.drop(while: \.isWhitespace)
-            if let marker = ["```", "~~~"].first(where: trimmed.hasPrefix) {
-                if fence == nil { fence = marker }
-                else if fence == marker { fence = nil }
+            let marker = trimmed.first
+            let runLength = (marker == "`" || marker == "~")
+                ? trimmed.prefix(while: { $0 == marker }).count : 0
+            if let active = fence {
+                // A shorter fence or a marker followed by content is literal
+                // code. It must not expose the following lines to reflow.
+                if marker == active.marker, runLength >= active.length,
+                   trimmed.dropFirst(runLength).allSatisfy(\.isWhitespace) {
+                    fence = nil
+                }
                 result += line
-            } else if fence != nil || line.first?.isWhitespace == true ||
+            } else if let marker, runLength >= 3 {
+                fence = (marker, runLength)
+                result += line
+            } else if line.first?.isWhitespace == true ||
                         existingStructure.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
                 result += line
             } else {
@@ -87,6 +97,12 @@ enum DictationParagraphs {
     }
 
     private static func formatLine(_ input: String, isEmail: Bool = false) -> String {
+        let trimmed = input.drop(while: \.isWhitespace)
+        if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") { return input }
+        // Preserve already formatted bullet/heading lines, including a single
+        // list item. Inline numbered enumerations still go through detection.
+        if existingStructure.firstMatch(in: input, range: NSRange(input.startIndex..., in: input)) != nil,
+           input.first?.isNumber != true { return input }
         if isEmail, let email = formatEmail(input) { return email }
         if let list = explicitList(input) { return list }
         if let list = countedSpokenList(input) { return list }
@@ -331,10 +347,12 @@ enum DictationParagraphs {
             if counts[i - 1] <= 7, closers.contains(where: { previous == $0 || previous.hasSuffix(", " + $0) }) { cost -= 0.8 }
             return cost
         }
+        // These depend only on the input, not on a DP transition. Compute
+        // them once instead of re-tokenizing every sentence for each candidate.
+        let breakCosts: [Double?] = (0..<n).map { $0 == 0 ? 0 : breakCost($0) }
+        let target = Double(readableTargetWords) + min(10, max(0, Double(total - readableMinimumWords) / 12))
         func paragraphCost(_ words: Int) -> Double {
             if words < readableShortestParagraph { return 8 }
-            // About 26 words a paragraph in a short message, growing to 36 in a long one.
-            let target = Double(readableTargetWords) + min(10, max(0, Double(total - readableMinimumWords) / 12))
             let w = Double(words)
             let off = w < target ? (target - w) / 12 : (w - target) / 18
             return off * off + 0.3
@@ -350,11 +368,13 @@ enum DictationParagraphs {
                 guard best[i].isFinite else { continue }
                 var cost = best[i] + paragraphCost(prefix[j] - prefix[i])
                 if i > 0 {
-                    guard let b = breakCost(i) else { continue }
+                    guard let b = breakCosts[i] else { continue }
                     cost += b
                 }
-                // Below the readable length a topic break still needs 10+ words on each side.
-                if total < readableMinimumWords, i > 0, prefix[j] - prefix[i] < readableShortestParagraph { continue }
+                // Every paragraph from a short topic split needs 10+ words,
+                // including the first one. Otherwise the topic bonus can
+                // isolate a one-word opener such as "Done.".
+                if total < readableMinimumWords, prefix[j] - prefix[i] < readableShortestParagraph { continue }
                 if cost < best[j] { best[j] = cost; from[j] = i }
             }
         }

@@ -1,5 +1,57 @@
 import Foundation
 
+/// A correction is anchored in the exact UTF-16 source that was scored.
+struct LocalWordEdit: Sendable {
+    let start: Int
+    let end: Int
+    let original: String
+    let replacement: String
+
+    var lengthChange: Int { replacement.utf16.count - (end - start) }
+}
+
+/// Apply non-overlapping, verified source edits and carry their locks forward.
+/// All ranges in the returned list are in the edited text, not its input.
+enum LocalWordEdits {
+    static func apply<T>(_ text: String, changes: [T], edit: (T) -> LocalWordEdit)
+        -> (text: String, changes: [T]) {
+        let source = text as NSString
+        var accepted: [(T, LocalWordEdit)] = []
+        var cursor = 0
+        for (change, e) in changes.map({ ($0, edit($0)) }).sorted(by: { $0.1.start < $1.1.start }) {
+            guard e.start >= cursor, e.end > e.start, e.end <= source.length,
+                  !e.replacement.isEmpty, e.original != e.replacement else { continue }
+            let range = NSRange(location: e.start, length: e.end - e.start)
+            guard Range(range, in: text) != nil, source.substring(with: range) == e.original else { continue }
+            accepted.append((change, e))
+            cursor = e.end
+        }
+        let output = NSMutableString(string: text)
+        for (_, e) in accepted.reversed() {
+            output.replaceCharacters(in: NSRange(location: e.start, length: e.end - e.start), with: e.replacement)
+        }
+        return (output as String, accepted.map { $0.0 })
+    }
+
+    static func locks(after edits: [LocalWordEdit], preserving prior: [NSRange] = []) -> [NSRange] {
+        let ordered = edits.sorted { $0.start < $1.start }
+        var result: [NSRange] = []
+        var delta = 0
+        for edit in ordered {
+            result.append(NSRange(location: edit.start + delta, length: edit.replacement.utf16.count))
+            delta += edit.lengthChange
+        }
+        for old in prior {
+            // A later pass should never edit a locked word. If it does, the
+            // new correction already contributes its own replacement lock.
+            guard !ordered.contains(where: { $0.start < old.upperBound && $0.end > old.location }) else { continue }
+            let shift = ordered.filter { $0.end <= old.location }.reduce(0) { $0 + $1.lengthChange }
+            result.append(NSRange(location: old.location + shift, length: old.length))
+        }
+        return result.sorted { $0.location < $1.location }
+    }
+}
+
 /// Flow's small judges in one place, the way COMPUTERUSE's referee does it for computer use: every judge
 /// returns a probability and a short reason, so what Flow did to a dictation can be explained and tuned.
 ///
@@ -11,8 +63,8 @@ import Foundation
 /// | finalPass    | the text                     | rule pass (hesitations, stutters, list tags) | remove fillers |
 /// | realWords    | the text                     | chance every swap made is right (tinyfix)    | fix homophones |
 ///
-/// Reasons never contain transcript text. The real-word fixes themselves (two words each) go to
-/// events.jsonl as `realword.fix` unless privacy mode is on, so the training data sees them.
+/// Reasons never contain transcript text. Word changes belong in the opt-out-aware run record;
+/// the event log holds only numeric diagnostics, including for secure-field delivery failures.
 enum DictationReferee {
     enum Judge: String, Codable, Sendable { case language, contentGuard, pasteSafety, finalPass, realWords }
     enum Action: String, Codable, Sendable { case keep, fix, fallback, skip }
@@ -110,7 +162,7 @@ enum DictationReferee {
         let fixer = RealWordFixer.shared
         guard fixer.model(wait: wait) != nil else {
             fixer.prewarm()
-            return (text, [], Verdict(judge: .realWords, probability: 1, action: .skip, reason: "model loading"))
+            return (text, [], Verdict(judge: .realWords, probability: 1, action: .skip, reason: fixer.readiness))
         }
         let result = fixer.fix(text, mode: mode, protectedTerms: protectedTerms ?? Self.protectedTerms(), wait: wait)
         guard !result.fixes.isEmpty else {
@@ -122,12 +174,12 @@ enum DictationReferee {
                         reason: result.fixes.count == 1 ? "fixed 1 mixed-up word" : "fixed \(result.fixes.count) mixed-up words"))
     }
 
-    /// Writes each fix to events.jsonl (two words, the scores and where), unless privacy mode is on.
+    /// Writes scores and positions only. Text is already captured by the run's stage diff.
     static func trace(_ fixes: [RealWordFixer.Fix], mode: RealWordFixer.Mode, ms: Double) {
         guard !fixes.isEmpty, !BackgroundActivityGate.privacyMode else { return }
         for fix in fixes {
             Telemetry.log("realword.fix", properties: [
-                "mode": mode.rawValue, "from": fix.original, "to": fix.replacement,
+                "mode": mode.rawValue,
                 "margin": (Double(fix.margin) * 100).rounded() / 100, "value": (Double(fix.value) * 100).rounded() / 100,
                 "p": (fix.probability * 1000).rounded() / 1000, "mixup": fix.knownMixup, "offset": fix.location,
                 "ms": (ms * 10).rounded() / 10
@@ -137,33 +189,76 @@ enum DictationReferee {
 
     // MARK: Pipeline entry points
 
-    /// Dictation, after the cleanup and the final word pass: fixes spelling homophones (their/there,
-    /// its/it's, then/than ...) in English sentences. Never waits for the model; code fields are skipped.
-    static func dictationPass(_ text: String, isCode: Bool) -> String {
-        let start = DispatchTime.now().uptimeNanoseconds
-        let result = realWords(text, mode: .dictation, isCode: isCode)
-        trace(result.fixes, mode: .dictation, ms: Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
-        guard !isCode, RealWordFixer.isEnabled else { return result.text }
-        return soundAlikes(result.text, skipping: Set(result.fixes.map { $0.replacement.lowercased() }))
+    /// CPU model scoring is independent of the UI actor. Preserve stage order
+    /// but let new recording events and audio UI proceed while the model scores.
+    static func background<T: Sendable>(collector: FlowRunCollector? = nil, _ work: @escaping @Sendable () -> T) async -> T {
+        let activeCollector = collector ?? FlowRunCollector.current
+        let task = Task.detached(priority: .userInitiated) {
+            FlowRunCollector.$current.withValue(activeCollector) { work() }
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
-    /// whether/weather, their/there, to/too ... read in context by tinynext (SoundAlikeCheck). Words tinyfix
-    /// just changed are left as tinyfix wrote them. Never waits for the model.
+    struct DictationPassResult: Sendable {
+        let text: String
+        let lockedRanges: [NSRange]
+    }
+
+    /// Dictation: preserve the existing text-only API for replay and other callers.
+    static func dictationPass(_ text: String, isCode: Bool) -> String {
+        dictationPassDetailed(text, isCode: isCode).text
+    }
+
+    /// TinyFix and the sound-alike scorer operate on successive immutable drafts.
+    /// A later pass protects the precise occurrence fixed earlier, not every
+    /// identical word in the draft. Length-changing edits update the offsets.
+    static func dictationPassDetailed(_ text: String, isCode: Bool,
+                                      vocabulary: [String] = []) -> DictationPassResult {
+        let start = DispatchTime.now().uptimeNanoseconds
+        guard !Task.isCancelled else { return DictationPassResult(text: text, lockedRanges: []) }
+        let terms = protectedTerms() + vocabulary
+        let result = realWords(text, mode: .dictation, isCode: isCode, protectedTerms: terms)
+        FlowRunCollector.current?.decision("tinyfix", result.verdict.action.rawValue, reason: result.verdict.reason)
+        if result.verdict.action != .skip { FlowRunCollector.current?.model("tinyfix", "tinyfix") }
+        trace(result.fixes, mode: .dictation, ms: Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+        let fixed = result.fixes.map {
+            LocalWordEdit(start: $0.location, end: $0.location + $0.original.utf16.count,
+                          original: $0.original, replacement: $0.replacement)
+        }
+        let locks = LocalWordEdits.locks(after: fixed)
+        guard !isCode, RealWordFixer.isEnabled, !Task.isCancelled else {
+            return DictationPassResult(text: result.text, lockedRanges: locks)
+        }
+        let soundStart = DispatchTime.now().uptimeNanoseconds
+        let sound = SoundAlikeCheck.check(result.text, protectedTerms: terms, protectedRanges: locks)
+        traceSoundAlikes(sound.changes, started: soundStart)
+        let soundEdits = sound.changes.map {
+            LocalWordEdit(start: $0.start, end: $0.end, original: $0.original, replacement: $0.replacement)
+        }
+        return DictationPassResult(text: sound.text, lockedRanges: LocalWordEdits.locks(after: soundEdits, preserving: locks))
+    }
+
+    /// Text-only entry point for callers that do not need to propagate locks.
     static func soundAlikes(_ text: String, skipping: Set<String> = [], wait: Bool = false) -> String {
         let start = DispatchTime.now().uptimeNanoseconds
         let result = SoundAlikeCheck.check(text, protectedTerms: protectedTerms() + Array(skipping), wait: wait)
-        guard !result.changes.isEmpty else { return text }
-        if !BackgroundActivityGate.privacyMode {
-            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
-            for change in result.changes {
-                Telemetry.log("soundalike.fix", properties: [
-                    "from": change.original.lowercased(), "to": change.replacement.lowercased(),
-                    "delta": (Double(change.delta) * 100).rounded() / 100, "learned": change.learned,
-                    "ms": (ms * 10).rounded() / 10
-                ])
-            }
-        }
+        traceSoundAlikes(result.changes, started: start)
         return result.text
+    }
+
+    private static func traceSoundAlikes(_ changes: [SoundAlikeCheck.Decision], started: UInt64) {
+        guard !changes.isEmpty, !BackgroundActivityGate.privacyMode, !Task.isCancelled else { return }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
+        for change in changes {
+            Telemetry.log("soundalike.fix", properties: [
+                "delta": (Double(change.delta) * 100).rounded() / 100, "learned": change.learned,
+                "ms": (ms * 10).rounded() / 10
+            ])
+        }
     }
 
     /// Opt+1, before the polish: fixes mixed-up real words in the selection. `nonWords` is the

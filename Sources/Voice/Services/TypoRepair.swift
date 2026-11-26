@@ -126,12 +126,13 @@ final class TypoRepair: @unchecked Sendable {
     private let lock = NSLock()
     private var lexiconStorage: Lexicon?
     private var loading = false
+    private var retryLexiconAfter = Date.distantPast
     private var userTerms: [String: String] = [:]   // key -> surface
     private var userTermsLoadedAt = Date.distantPast
 
     func prewarm() {
         lock.lock()
-        let start = lexiconStorage == nil && !loading
+        let start = lexiconStorage == nil && !loading && Date() >= retryLexiconAfter
         if start { loading = true }
         lock.unlock()
         TinyNextScorer.shared.prewarm()
@@ -145,6 +146,9 @@ final class TypoRepair: @unchecked Sendable {
         let lex = url.flatMap { Lexicon(words: $0) }
         lock.lock()
         lexiconStorage = lex
+        // Public builds may not ship words.txt. Back off without disabling
+        // TinyNext or permanently preventing a later installation.
+        retryLexiconAfter = lex == nil ? Date().addingTimeInterval(60) : .distantPast
         loading = false
         lock.unlock()
         return lex
@@ -171,6 +175,13 @@ final class TypoRepair: @unchecked Sendable {
     }
 
     var isReady: Bool { lock.lock(); defer { lock.unlock() }; return lexiconStorage != nil }
+
+    var readiness: String {
+        lock.lock(); defer { lock.unlock() }
+        if lexiconStorage != nil { return "ready" }
+        if loading { return "loading" }
+        return Date() < retryLexiconAfter ? "retry-backoff" : "cold"
+    }
 
     /// Letters and digits only, lowercased: "Wispr Flow" -> "wisprflow".
     static func key(_ s: String) -> String {
@@ -360,17 +371,17 @@ final class TypoRepair: @unchecked Sendable {
     private static let wordToken = try! NSRegularExpression(pattern: #"[A-Za-z]+(?:['’][A-Za-z]+)?"#)
 
     private static let overlayLock = NSLock()
-    nonisolated(unsafe) private static var overlayCache: (revision: Int, map: [String: String])?
+    nonisolated(unsafe) private static var overlayCache: (owner: AutoDictionary, revision: Int, map: [String: String])?
 
     /// The bundled pairs plus the misspellings Flow learned from the user's fixes (AutoDictionary, user
     /// overlay file VOICE/typo_dictionary.user.json). Read live: a new entry applies on the next text.
     static func currentPersonalDictionary(learned: AutoDictionary = .shared) -> [String: String] {
-        let revision = learned.currentRevision
+        let snapshot = learned.liveSnapshot()
         overlayLock.lock(); defer { overlayLock.unlock() }
-        if let cache = overlayCache, cache.revision == revision { return cache.map }
+        if let cache = overlayCache, cache.owner === learned, cache.revision == snapshot.revision { return cache.map }
         var map = personalDictionary
-        for (k, v) in learned.liveSpellings() where map[k] == nil { map[k] = v }
-        overlayCache = (revision, map)
+        for (k, v) in snapshot.spellings where map[k] == nil { map[k] = v }
+        overlayCache = (learned, snapshot.revision, map)
         return map
     }
 
@@ -443,9 +454,11 @@ final class TypoRepair: @unchecked Sendable {
         // Words the writer typed in lowercase: a model capitalising one ("Odenst") does not make it a name.
         let typedLowercase = Set((typedText ?? "").split(whereSeparator: { !$0.isLetter && $0 != "'" })
             .map(String.init).filter { $0 == $0.lowercased() })
-        guard let lex = lexicon(wait: wait) else { return (text, []) }
-        // User typo pairs first: exact and cheap, before the model and as the fallback after it.
+        // Exact dictionary rules do not depend on an optional frequency
+        // lexicon being installed. Apply them even on a cold/model-free path.
+        guard !Task.isCancelled else { return (text, []) }
         let text = Self.snapPhrases(Self.applyPersonalDictionary(text), userTerms: protectedTerms)
+        guard let lex = lexicon(wait: wait) else { return (text, []) }
         let scorer = useLM ? TinyNextScorer.shared.ready(wait: wait) : nil
         let userKeys = userKeyMap(protectedTerms)
         let w = Self.weights
@@ -548,7 +561,7 @@ final class TypoRepair: @unchecked Sendable {
             return t.count >= 2
         }
         for i in tokens.indices {
-            if let deadline, ContinuousClock.now >= deadline { break }
+            if Task.isCancelled || (deadline.map { ContinuousClock.now >= $0 } ?? false) { break }
             guard !done.contains(i), suspicious(i) else { continue }
             let t = tokens[i]
             let l = t.lowercased().replacingOccurrences(of: "’", with: "'")
@@ -757,7 +770,10 @@ final class TypoRepair: @unchecked Sendable {
                 let word = String(chars[i..<j])
                 if !word.contains("://"), !word.contains("_"), !word.hasPrefix("www."), c.isLowercase,
                    !(word.count > 1 && word.dropFirst().contains(where: \.isUppercase)) {
-                    chars[i] = Character(c.uppercased())
+                    // Some Unicode uppercase mappings expand (ß -> SS).
+                    // Character(String) traps on those; preserve the original.
+                    let upper = c.uppercased()
+                    if upper.count == 1, let letter = upper.first { chars[i] = letter }
                 }
                 atStart = false
             } else if c == "." || c == "!" || c == "?" {

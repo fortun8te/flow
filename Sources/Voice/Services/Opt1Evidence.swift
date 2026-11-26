@@ -39,7 +39,9 @@ enum Opt1EvidenceLog {
         .appendingPathComponent("VOICE/opt1-evidence", isDirectory: true)
 
     static func enqueue(_ record: Opt1Evidence) {
+        guard isEnabled, !BackgroundActivityGate.privacyMode else { return }
         queue.async {
+            guard isEnabled, !BackgroundActivityGate.privacyMode else { return }
             do { try append(record, in: directory) }
             catch { print("[VOICE-OPT1-EVIDENCE] Could not save a private local evidence row.") }
         }

@@ -249,18 +249,22 @@ enum PillLookBuilder {
             return CGSize(width: m.handsFreeLength, height: h)
         case .processing:
             return CGSize(width: PillWispr.processingWidth, height: h)
-        case .polishing:
-            return CGSize(width: PillWispr.polishingWidth, height: h)
+        case .polishing(let title):
+            let required = text(title, .button) + 13 + 8 + m.statusPadding * 2 + 4
+            return CGSize(width: min(lineMax, max(PillWispr.polishingWidth, required)), height: h)
         case .polished(let auto):
-            guard auto else { return CGSize(width: PillWispr.doneWidth, height: h) }
-            let words = "Cleaned up!  See what's changed"
-            return CGSize(width: m.noticePadding + text(words) + m.noticePadding, height: h)
+            // Reserve the success check before it animates in; otherwise the
+            // final label suddenly overflows the capsule.
+            let first = auto ? "Cleaned up!" : "Done."
+            let second = auto ? "  See what's changed" : " See changes"
+            let required = text(first, .button) + text(second, .button) + 12 + 5 + m.statusPadding * 2 + 4
+            return CGSize(width: min(lineMax, max(auto ? 0 : PillWispr.doneWidth, required)), height: h)
         case .cancelled:
-            return CGSize(width: m.statusPadding + text("Transcript cancelled") + m.statusGap + undoWidth(t) + 5, height: h)
+            return CGSize(width: min(lineMax, m.statusPadding + text("Transcript cancelled") + m.statusGap + undoWidth(skin) + 5 + 4), height: h)
         case .pasted:
-            return CGSize(width: m.statusPadding + text("Pasted") + m.statusGap + undoWidth(t) + 5, height: h)
+            return CGSize(width: min(lineMax, m.statusPadding + 13 + m.statusGap + text("Pasted") + m.statusGap + undoWidth(skin) + 5 + 4), height: h)
         case .hiddenForHour:
-            return CGSize(width: m.statusPadding + text("The Flow Bar will be hidden for an hour") + m.statusGap + undoWidth(t) + 5, height: h)
+            return CGSize(width: min(lineMax, m.statusPadding + text("The Flow Bar will be hidden for an hour") + m.statusGap + undoWidth(skin) + 5 + 4), height: h)
         case .line(let words, let tone):
             let mark: CGFloat = tone == .info ? 0 : m.noticeIcon + 7
             let width = m.noticePadding * 2 + mark + text(words)
@@ -276,7 +280,10 @@ enum PillLookBuilder {
         }
     }
 
-    static func undoWidth(_ t: PillSkin.TypeScale) -> CGFloat { t.width("Undo", .button) + 16 }
+    static func undoWidth(_ t: PillSkin.TypeScale) -> CGFloat { t.width("Undo", .button) + 20 }
+    static func undoWidth(_ skin: PillSkin) -> CGFloat {
+        PillCardText.chipWidth("Undo", skin: skin)
+    }
 }
 
 extension PillSkin.TypeScale {

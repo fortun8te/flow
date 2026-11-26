@@ -5,13 +5,8 @@
 //   start()         — instant: just resets state, no model loading
 //   feed()          — no-op: audio is captured to file by AudioCaptureService
 //   stop()          — resets state only; returns []. Caller must call transcribeFile().
-//   transcribeFile() — passes URL directly to FluidAudio (fastest path, no manual
-//                     resampling or [Float] intermediate). ~150ms for any length.
-//
-// WHY URL-based transcription:
-//   manager.transcribe(url:) lets FluidAudio handle file reading, format conversion,
-//   and chunking internally. Passing [Float] requires manual resampling + a large
-//   array copy across the actor boundary. The URL path is what macparakeet uses.
+//   transcribeFile() — reads bounded blocks into 16 kHz mono samples, decodes
+//                     independent windows, and merges overlapping text.
 //
 // WHY no accumulation in feed():
 //   AudioCaptureService already writes captured 16kHz mono PCM to a .caf file
@@ -69,11 +64,11 @@ final class TranscriptionService: TranscriptionEngine {
         return activeTranscriptions > 0
     }
 
-    private func claimDecoder() throws -> (manager: AsrManager, layers: Int) {
+    private func claimDecoder() throws -> (manager: AsrManager, layers: Int, modelID: SpeechModelID?) {
         workLock.lock(); defer { workLock.unlock() }
         guard let manager = batchManager else { throw TranscriptionError.notInitialized }
         activeTranscriptions += 1
-        return (manager, batchDecoderLayerCount)
+        return (manager, batchDecoderLayerCount, activeModelID)
     }
 
     private func releaseDecoder() {
@@ -86,7 +81,7 @@ final class TranscriptionService: TranscriptionEngine {
         }
     }
     private let preparationLock = NSLock()
-    private var preparation: (id: UUID, task: Task<Void, Error>)?
+    private var preparation: (id: UUID, task: SharedModelTask<Void>)?
 
     // MARK: - Session state
 
@@ -108,7 +103,7 @@ final class TranscriptionService: TranscriptionEngine {
 
     /// Download (if needed) and load Parakeet TDT 0.6B v3. Called once at launch.
     /// Awaiting callers share a preparation. Cancelling a caller does not cancel
-    /// the shared load; that caller receives cancellation after it finishes.
+    /// the shared load; that caller's wait ends immediately.
     func prepare() async throws {
         try Task.checkCancellation()
         guard let task = sharedPreparation() else { return }
@@ -121,13 +116,13 @@ final class TranscriptionService: TranscriptionEngine {
         try Task.checkCancellation()
     }
 
-    private func sharedPreparation() -> Task<Void, Error>? {
+    private func sharedPreparation() -> SharedModelTask<Void>? {
         preparationLock.lock()
         defer { preparationLock.unlock() }
-        if isReady { return nil }
+        if hasPreparedDecoder { return nil }
         if let preparation { return preparation.task }
         let id = UUID()
-        let task = Task { [self] in
+        let task = SharedModelTask<Void> { [self] in
             defer { finishPreparation(id: id) }
             try await prepareOnce()
         }
@@ -139,6 +134,10 @@ final class TranscriptionService: TranscriptionEngine {
         preparationLock.lock()
         defer { preparationLock.unlock() }
         if preparation?.id == id { preparation = nil }
+    }
+
+    private var hasPreparedDecoder: Bool {
+        workLock.withLock { batchManager != nil }
     }
 
     @MainActor private func prepareOnce() async throws {
@@ -181,7 +180,8 @@ final class TranscriptionService: TranscriptionEngine {
 
     /// Begin a new dictation session. Returns immediately — no model loading.
     func start() async throws {
-        guard batchManager != nil else {
+        try Task.checkCancellation()
+        guard hasPreparedDecoder else {
             print("[VOICE-TS] start() FAILED — batchManager nil (model not loaded)")
             throw TranscriptionError.notInitialized
         }
@@ -210,6 +210,11 @@ final class TranscriptionService: TranscriptionEngine {
         audioChunk: [Float],
         chunkStartTime: TimeInterval
     ) async throws -> [TranscriptSegment] {
+        try Task.checkCancellation()
+        guard !audioChunk.isEmpty else { return [] }
+        guard audioChunk.count <= Int(Self.maxAudioDurationSeconds * 16_000) else {
+            throw AudioReadError.tooLong
+        }
         // Write the raw Float32 PCM chunk to a temp .caf file, then hand it
         // to the existing transcribeFile() path. This is the same approach
         // AudioCaptureService uses — FluidAudio works best with file URLs.
@@ -257,15 +262,24 @@ final class TranscriptionService: TranscriptionEngine {
     // MARK: - File transcription (primary path for dictation + crash recovery)
 
     /// Transcribe an audio file. For audio that fits in a single Parakeet
-    /// decode window (≤15 s @ 16 kHz) we hand the URL to FluidAudio unchanged
-    /// — same code path as before. For longer audio we take the chunking
+    /// decode window (≤15 s @ 16 kHz) we decode the samples in one call.
+    /// For longer audio we take the chunking
     /// into our own hands to side-step a boundary-merge bug in FluidAudio's
     /// `ChunkProcessor.mergeByMidpoint` (see VOICE-MERGE comment below).
     func transcribeFile(url: URL) async throws -> [TranscriptSegment] {
+        try Task.checkCancellation()
         let lease = try claimDecoder()
         defer { releaseDecoder() }
         let manager = lease.manager
+        if let id = lease.modelID {
+            let descriptor = SpeechModelCatalog.descriptor(for: id)
+            FlowRunCollector.model("asr", id.rawValue)
+            FlowRunCollector.note("asr-provenance", ["repository": descriptor.repository,
+                                                    "revision": descriptor.pinnedRevision ?? "unknown",
+                                                    "compute": descriptor.computePolicy.rawValue])
+        }
 
+        let timer = PipelineTimer()
         let t0 = Date()
         print("[VOICE-TS] transcribeFile() ENTER — \(url.lastPathComponent) at \(t0)")
 
@@ -304,7 +318,7 @@ final class TranscriptionService: TranscriptionEngine {
         // class of bug where a mis-decoded boundary stomps a correct one.
         // ============================================================
         let samples: [Float]
-        let tReadStart = CFAbsoluteTimeGetCurrent()
+        let readTimer = PipelineTimer()
         do {
             samples = try Self.readSamplesAt16kMono(url: url)
         } catch is CancellationError {
@@ -315,15 +329,27 @@ final class TranscriptionService: TranscriptionEngine {
             print("[VOICE-TS] readSamplesAt16kMono FAILED: \(error.localizedDescription)")
             throw error
         }
-        let readMs = (CFAbsoluteTimeGetCurrent() - tReadStart) * 1000
+        try Task.checkCancellation()
+        let readMs = readTimer.seconds() * 1_000
         fputs("[LATENCY] ASR file-read→[Float] (\(samples.count) samples): \(Int(readMs))ms\n", stderr)
-        let tDecodeStart = CFAbsoluteTimeGetCurrent()
+        let decodeTimer = PipelineTimer()
 
         let maxModelSamples = 240_000              // 15s @ 16kHz (FluidAudio limit)
         let safeChunkSamples = 232_000             // ~14.5s — leaves margin under the model cap
         let overlapSamples   = 32_000              //  2.0s overlap, matches FluidAudio's ChunkProcessor
 
         let boost = vocabularyBoostOverride ?? ASRVocabularyBoost.isEnabled
+        let vocabulary = boost ? ASRVocabularyBoost.captureSnapshot() : nil
+        let rescoreBudget = AcousticRescoreBudget(baseSeconds: DictationDeadline.totalSeconds,
+            secondsPerWord: DictationDeadline.secondsPerWord, maximumSeconds: DictationDeadline.maxTotalSeconds)
+        let rescore: (([Float], ASRResult) async -> ASRVocabularyBoost.Report)? = boost ? { chunk, decoded in
+            guard let vocabulary else {
+                return .init(unboostedText: decoded.text, boostedText: decoded.text,
+                             replacements: [], ctcRan: false, milliseconds: 0)
+            }
+            return await ASRVocabularyBooster.shared.rescore(text: decoded.text, tokenTimings: decoded.tokenTimings,
+                samples: chunk, vocabulary: vocabulary, budget: rescoreBudget)
+        } : nil
         var boostReports: [ASRVocabularyBoost.Report] = []
         let result: ASRResult
         do {
@@ -332,9 +358,9 @@ final class TranscriptionService: TranscriptionEngine {
                 print("[VOICE-MERGE] single-shot decode: \(samples.count) samples (≤ \(maxModelSamples))")
                 var decoderState = TdtDecoderState.make(decoderLayers: lease.layers)
                 let decoded = try await manager.transcribe(samples, decoderState: &decoderState, language: nil)
-                if boost {
-                    let report = await ASRVocabularyBooster.shared.rescore(
-                        text: decoded.text, tokenTimings: decoded.tokenTimings, samples: samples)
+                try Task.checkCancellation()
+                if let rescore {
+                    let report = await rescore(samples, decoded)
                     boostReports.append(report)
                     result = Self.replacingText(of: decoded, with: report)
                 } else {
@@ -350,11 +376,7 @@ final class TranscriptionService: TranscriptionEngine {
                     chunkSamples: safeChunkSamples,
                     overlapSamples: overlapSamples,
                     sampleRate: 16_000,
-                    boost: boost ? { chunk, decoded in
-                        let report = await ASRVocabularyBooster.shared.rescore(
-                            text: decoded.text, tokenTimings: decoded.tokenTimings, samples: chunk)
-                        return report
-                    } : nil,
+                    boost: rescore,
                     reports: &boostReports
                 )
             }
@@ -363,7 +385,8 @@ final class TranscriptionService: TranscriptionEngine {
             throw error
         }
 
-        let decodeMs = (CFAbsoluteTimeGetCurrent() - tDecodeStart) * 1000
+        try Task.checkCancellation()
+        let decodeMs = decodeTimer.seconds() * 1_000
         fputs("[LATENCY] ASR decode (Parakeet inference): \(Int(decodeMs))ms\n", stderr)
         let boostReport: ASRVocabularyBoost.Report? = boost ? ASRVocabularyBoost.Report(
             unboostedText: boostReports.map(\.unboostedText).joined(separator: " | "),
@@ -377,7 +400,7 @@ final class TranscriptionService: TranscriptionEngine {
             print("[VOICE-VOCAB] boosted \(boostReport.replacements.count) span(s) in \(Int(boostReport.milliseconds))ms")
         }
         let trimmed = result.text.trimmingCharacters(in: .whitespaces)
-        let elapsed = Date().timeIntervalSince(t0)
+        let elapsed = timer.seconds()
         print("[VOICE-TS] transcribeFile() OK → (\(trimmed.count) chars) in \(String(format: "%.2f", elapsed))s")
 
         guard !trimmed.isEmpty else {
@@ -406,13 +429,7 @@ final class TranscriptionService: TranscriptionEngine {
         // Qwen3Polisher.mergeWithMLX to pick the higher-confidence span when
         // two transcripts disagree. Falls back to `result.confidence` (the
         // ASR's own overall score) when token timings are unavailable.
-        let segmentConfidence: Float
-        if let timings = result.tokenTimings, !timings.isEmpty {
-            let total = timings.reduce(Float(0)) { $0 + $1.confidence }
-            segmentConfidence = total / Float(timings.count)
-        } else {
-            segmentConfidence = result.confidence
-        }
+        let segmentConfidence = Self.meanConfidence(from: result.tokenTimings, fallback: result.confidence)
 
         return [
             TranscriptSegment(
@@ -431,26 +448,45 @@ final class TranscriptionService: TranscriptionEngine {
     static func wordConfidences(from timings: [TokenTiming]?) -> [ASRWordConfidence]? {
         guard let timings, !timings.isEmpty else { return nil }
         var words: [ASRWordConfidence] = []
-        var current = "", low: Float = 1, start: Double?, end: Double?
+        var current = "", low: Float?, start: Double?, end: Double?
+        var validTimeSpan = true
         func flush() {
             let word = current.trimmingCharacters(in: .whitespacesAndNewlines)
             if !word.isEmpty {
-                words.append(ASRWordConfidence(word: word, confidence: (low * 1000).rounded() / 1000,
-                                               start: start.map { ($0 * 100).rounded() / 100 },
-                                               end: end.map { ($0 * 100).rounded() / 100 }))
+                words.append(ASRWordConfidence(word: word, confidence: low.map { ($0 * 1000).rounded() / 1000 },
+                                               start: validTimeSpan ? start.map { ($0 * 100).rounded() / 100 } : nil,
+                                               end: validTimeSpan ? end.map { ($0 * 100).rounded() / 100 } : nil))
             }
-            current = ""; low = 1; start = nil; end = nil
+            current = ""; low = nil; start = nil; end = nil; validTimeSpan = true
         }
         for timing in timings {
             let piece = timing.token
             if piece.hasPrefix("\u{2581}") || piece.first?.isWhitespace == true { flush() }
-            current += piece.drop(while: { $0 == "\u{2581}" || $0.isWhitespace })
-            if timing.confidence.isFinite, (0...1).contains(timing.confidence) { low = min(low, timing.confidence) }
-            if start == nil { start = timing.startTime }
-            end = timing.endTime
+            let content = piece.drop(while: { $0 == "\u{2581}" || $0.isWhitespace })
+            guard !content.isEmpty else { continue }
+            current += content
+            if timing.confidence.isFinite, (0...1).contains(timing.confidence) {
+                low = min(low ?? timing.confidence, timing.confidence)
+            }
+            if timing.startTime.isFinite, timing.endTime.isFinite,
+               timing.startTime >= 0, timing.endTime >= timing.startTime,
+               timing.endTime <= maxAudioDurationSeconds {
+                start = min(start ?? timing.startTime, timing.startTime)
+                end = max(end ?? timing.endTime, timing.endTime)
+            } else { validTimeSpan = false }
         }
         flush()
         return words.isEmpty ? nil : words
+    }
+
+    static func meanConfidence(from timings: [TokenTiming]?, fallback: Float) -> Float {
+        var total: Double = 0, count = 0
+        for timing in timings ?? [] where timing.confidence.isFinite && (0...1).contains(timing.confidence) {
+            total += Double(timing.confidence)
+            count += 1
+        }
+        if count > 0 { return Float(total / Double(count)) }
+        return fallback.isFinite && (0...1).contains(fallback) ? fallback : 0
     }
 
     // MARK: - Boundary-fix helpers (see [VOICE-MERGE] block above)
@@ -642,7 +678,28 @@ final class TranscriptionService: TranscriptionEngine {
             let trailingOverlapHasSignal: Bool
         }
 
+        struct PendingBoost {
+            let index: Int
+            let start: Int
+            let length: Int
+            let trailingSignal: Bool
+            let decoded: ASRResult
+            let task: Task<ASRVocabularyBoost.Report, Never>
+        }
+        var pending: PendingBoost?
+        defer { pending?.task.cancel() }
+
         var outputs: [ChunkOut] = []
+        func appendOutput(_ result: ASRResult, index: Int, start: Int, length: Int, trailingSignal: Bool) {
+            let txt = result.text.trimmingCharacters(in: .whitespaces)
+            print("[VOICE-MERGE] chunk \(index) start=\(start) len=\(length) conf=\(String(format: "%.3f", result.confidence))")
+            if !txt.isEmpty {
+                outputs.append(ChunkOut(index: index, text: txt, confidence: result.confidence,
+                                        timings: recordingRelativeTimings(result.tokenTimings, chunkStart: start,
+                                                                          sampleRate: sampleRate),
+                                        trailingOverlapHasSignal: trailingSignal))
+            }
+        }
         var chunkStart = 0
         var idx = 0
         var silentWindows = 0
@@ -685,29 +742,45 @@ final class TranscriptionService: TranscriptionEngine {
                 toDecode = slice
             }
 
-            var r = try await manager.transcribe(toDecode, decoderState: &decoderState, language: nil)
+            let decoded = try await manager.transcribe(toDecode, decoderState: &decoderState, language: nil)
             try Task.checkCancellation()
-            // Vocabulary boosting runs per window, before the seam merge, so the
-            // token timings stay on the window's own clock.
-            if let boost {
-                let report = await boost(toDecode, r)
+            // While TDT decoded this window, CTC rescored the preceding one.
+            // Only one CTC task may be outstanding; preserve source order.
+            if let previous = pending {
+                let job = previous.task
+                let report = await withTaskCancellationHandler {
+                    await job.value
+                } onCancel: { job.cancel() }
+                try Task.checkCancellation()
                 reports.append(report)
-                r = replacingText(of: r, with: report)
+                appendOutput(replacingText(of: previous.decoded, with: report),
+                             index: previous.index, start: previous.start,
+                             length: previous.length, trailingSignal: previous.trailingSignal)
+                pending = nil
             }
-            let txt = r.text.trimmingCharacters(in: .whitespaces)
-            print("[VOICE-MERGE] chunk \(idx) start=\(chunkStart) len=\(slice.count) conf=\(String(format: "%.3f", r.confidence))")
-            if !txt.isEmpty {
-                outputs.append(ChunkOut(
-                    index: idx,
-                    text: txt,
-                    confidence: r.confidence,
-                    timings: r.tokenTimings,
-                    trailingOverlapHasSignal: hasAcousticSignal(samples[max(end - overlapSamples, chunkStart)..<end])
-                ))
+            let trailingSignal = hasAcousticSignal(samples[max(end - overlapSamples, chunkStart)..<end])
+            if let boost {
+                let job = Task { await boost(toDecode, decoded) }
+                pending = PendingBoost(index: idx, start: chunkStart, length: slice.count,
+                                       trailingSignal: trailingSignal, decoded: decoded, task: job)
+            } else {
+                appendOutput(decoded, index: idx, start: chunkStart, length: slice.count, trailingSignal: trailingSignal)
             }
             if end == samples.count { break }
             chunkStart += stride
             idx += 1
+        }
+        if let previous = pending {
+            let job = previous.task
+            let report = await withTaskCancellationHandler {
+                await job.value
+            } onCancel: { job.cancel() }
+            try Task.checkCancellation()
+            reports.append(report)
+            appendOutput(replacingText(of: previous.decoded, with: report),
+                         index: previous.index, start: previous.start,
+                         length: previous.length, trailingSignal: previous.trailingSignal)
+            pending = nil
         }
         if silentWindows > 0 { print("[VOICE-MERGE] skipped \(silentWindows) digital-silence windows") }
 
@@ -735,6 +808,9 @@ final class TranscriptionService: TranscriptionEngine {
             )
             merged = joined
             mergedConf = max(mergedConf, r.confidence)
+            // The evidence remains per decoded window, including overlap.
+            // Its timestamps are recording-relative; text merging does not
+            // claim a new forced alignment to the final corrected transcript.
             if let t = r.timings { allTimings.append(contentsOf: t) }
             print("[VOICE-MERGE] chunk \(previous.index)-\(r.index) boundary: kept=\(keptSide) confL=\(String(format: "%.3f", previous.confidence)) confR=\(String(format: "%.3f", r.confidence))")
         }
@@ -752,6 +828,22 @@ final class TranscriptionService: TranscriptionEngine {
     /// Only exact digital silence can be skipped. A faint whisper still goes to the decoder.
     static func hasAcousticSignal(_ samples: ArraySlice<Float>) -> Bool {
         samples.contains { $0 != 0 }
+    }
+
+    /// Offset evidence only after local CTC rescoring has used the window clock.
+    /// Invalid local spans stay invalid instead of turning a negative time valid.
+    static func recordingRelativeTimings(_ timings: [TokenTiming]?, chunkStart: Int, sampleRate: Int) -> [TokenTiming]? {
+        guard let timings, chunkStart >= 0, sampleRate > 0 else { return nil }
+        guard chunkStart > 0 else { return timings }
+        let offset = Double(chunkStart) / Double(sampleRate)
+        guard offset <= maxAudioDurationSeconds else { return nil }
+        return timings.map { timing in
+            guard timing.startTime.isFinite, timing.endTime.isFinite,
+                  timing.startTime >= 0, timing.endTime >= timing.startTime else { return timing }
+            return TokenTiming(token: timing.token, tokenId: timing.tokenId,
+                startTime: timing.startTime + offset, endTime: timing.endTime + offset,
+                confidence: timing.confidence)
+        }
     }
 
     /// The decode with its text replaced by the boosted text (timings kept).

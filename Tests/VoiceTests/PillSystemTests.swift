@@ -217,11 +217,20 @@ struct PillSystemTests {
         #expect(polishing.size == CGSize(width: 136, height: 30))
     }
 
-    @Test("Done is 152 x 30; the cleanup nudge fits its words; a failure is the 91 x 30 error pill with no words")
+    @Test("A loading label has room for the label and spinner")
+    func loadingLabelFits() {
+        let result = look { $0.phase = .polishingSelection; $0.polishTitle = "Loading model…" }
+        let skin = PillSkin.standard
+        let required = skin.type.width("Loading model…", .button) + 13 + 8 + 2 * skin.metrics.statusPadding
+        #expect(result.size.width >= required)
+        #expect(result.size.height == skin.metrics.thickness)
+    }
+
+    @Test("Done has a 152 x 30 minimum; the cleanup nudge fits its words; a failure is the 91 x 30 error pill with no words")
     func finishedAndErrorSizes() {
         let done = look { $0.phase = .polishDone }
         #expect(done.face == .polished(autoCleanup: false))
-        #expect(done.size == CGSize(width: 152, height: 30))
+        #expect(done.size.width >= 152 && done.size.height == 30)
         let cleaned = look { $0.phase = .polishDone; $0.autoCleanup = true }
         #expect(cleaned.face == .polished(autoCleanup: true))
         #expect(cleaned.size.width > 100 && cleaned.size.width != 152)
