@@ -98,6 +98,8 @@ Keep a versioned experiment manifest with code revision, dataset/split hashes, m
 
 ## What still needs implementation and hardware validation
 
+The product target is a measured improvement over **Wispr Flow**, with its actual ASR version recorded. [COMPETITIVE-HILLCLIMB.md](COMPETITIVE-HILLCLIMB.md) defines the same-audio evaluation contract and the personal-vocabulary, false-insertion, meaning and delivery gates. It does not establish a current win. Use failures from that comparison to choose the training problem: an ASR candidate-recall failure needs different work from a wrong ranker decision, cleanup rewrite or paste-boundary error. A custom cleanup model alone cannot correct a word that is missing from both recognition evidence and the candidate set reliably.
+
 The repository has run logging, dataset builders, replay tooling and several model routes. It does not currently include a trained custom ranker, a portable CUDA trainer for it, its tokenizer/export contract, or a verified native benchmark for these proposed models. The private training recordings and installed DOSE1 artifacts are not available in this checkout. This research has not trained or swapped any model.
 
 Candidate collection now has a concrete first step: `WordDecisionEvidence.swift` and `FlowRunLog.swift` retain bounded, validated candidate observations from TinyFix, sound-alike and low-confidence checks, including decisions to keep the original. The records include exact source spans, context, alternatives, scores, rule features and thresholds. They remain observations; the model's selected index is never a gold label. Independent candidate review, feature preparation and the trainer are still required. The runbook describes these remaining interfaces.

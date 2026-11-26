@@ -128,6 +128,10 @@ Use validation to select among prompt/rule/parameter/model variants, then freeze
 
 This loop makes collection useful over time: collect observed corrections and failures, review a batch, regenerate a versioned corpus, train or change one component, compare it with the current baseline, and keep only a verified improvement. Collection by itself does not train a model or guarantee improvement.
 
+### Compare the complete dictation product
+
+Use `scripts/flow_competition.py` and [COMPETITIVE-HILLCLIMB.md](COMPETITIVE-HILLCLIMB.md) to freeze actual audio/context/dictionary identities and compare complete Flow and Wispr captures. Its timing contract is key release to verified insertion, its targets are reviewed against audio, and its optional output reviews are blind and bound to exact output hashes. Missing reviews or incomplete evidence cannot qualify a candidate. The tool consumes locally supplied captures; it does not drive Wispr, access a Canto API, upload recordings or manufacture competitor results. Keep the HTTP cleanup gate for component experiments and the full-pipeline gate for product claims.
+
 ### Evaluation and preparation scripts (`scripts/`)
 
 Several scripts compare Flow's cleanup against reference output, prepare evaluation sets from imported dictation history, and convert or package models. Their names describe their purpose. The ones that read imported dictation history expect that history to be on your own disk. Examples:
