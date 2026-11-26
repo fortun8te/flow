@@ -98,12 +98,16 @@ final class FlowRunCollector: @unchecked Sendable {
     var elapsedMs: Int { Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000) }
 
     func update(_ change: (inout FlowRunRecord) -> Void) {
-        lock.withLock { change(&record) }
+        lock.withLock {
+            guard !written else { return }
+            change(&record)
+        }
     }
 
     /// A stage that produced text. Word changes are taken against the previous text stage.
     func stage(_ name: String, text: String?, ms: Int? = nil, detail: [String: String]? = nil) {
         lock.withLock {
+            guard !written else { return }
             var changes: [String]?
             if let text, let before = lastText, before != text {
                 changes = FlowRunDiff.changes(from: before, to: text)
@@ -115,20 +119,32 @@ final class FlowRunCollector: @unchecked Sendable {
 
     /// The input a following stage is compared with (e.g. after a branch that skipped a stage).
     func setBaseline(_ text: String) {
-        lock.withLock { lastText = text }
+        lock.withLock {
+            guard !written else { return }
+            lastText = text
+        }
     }
 
     func decision(_ stage: String, _ verdict: String, reason: String? = nil) {
-        lock.withLock { record.decisions.append(FlowRunDecision(stage: stage, verdict: verdict, reason: reason)) }
+        lock.withLock {
+            guard !written else { return }
+            record.decisions.append(FlowRunDecision(stage: stage, verdict: verdict, reason: reason))
+        }
     }
 
     func model(_ role: String, _ name: String?) {
         guard let name, !name.isEmpty else { return }
-        lock.withLock { record.models[role] = name }
+        lock.withLock {
+            guard !written else { return }
+            record.models[role] = name
+        }
     }
 
     func timing(_ key: String, _ ms: Int) {
-        lock.withLock { record.timingsMs[key] = ms }
+        lock.withLock {
+            guard !written else { return }
+            record.timingsMs[key] = ms
+        }
     }
 
     var snapshot: FlowRunRecord { lock.withLock { record } }
@@ -140,6 +156,7 @@ final class FlowRunCollector: @unchecked Sendable {
         let done: FlowRunRecord? = lock.withLock {
             guard !written else { return nil }
             written = true
+            lastText = nil
             record.outcome = outcome
             record.output = output
             if let fallback { record.fallbackReason = fallback }

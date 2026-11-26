@@ -107,3 +107,7 @@ They are not a general quality metric. They catch specific, costly failures: los
 ### D1 availability and scheduling
 
 D1 installations are rechecked after a short backoff. Flow accepts the legacy candidate layout or `~/Library/Application Support/Voice/Models/D1/venv/bin/python` with the `d1-2B-mlx8bit` checkpoint directory next to `venv`. The network sandbox is unchanged. A ready, idle D1 may reserve 150 ms from the existing cleanup budget when at least 600 ms remains. Run records distinguish actual decisions from busy, cold, unavailable, invalid, timed-out, cancelled and skipped checks.
+
+### Correction ownership across judges
+
+Accepted TinyFix and sound-alike edits lock their exact UTF-16 occurrences, not every occurrence of the replacement word. Locks move when a later edit changes an earlier word's length. The low-confidence recheck respects those locks and the same dictionary terms; invalid, stale, overlapping and non-finite candidate edits never reach the final text. Completed run records ignore late asynchronous callbacks.

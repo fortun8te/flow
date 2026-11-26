@@ -101,8 +101,9 @@ enum DictationRetryService {
             finalText = DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
             let preparedText = finalText
             let repaired = await DictationReferee.background {
-                let fixed = DictationReferee.dictationPass(preparedText, isCode: false)
-                return LowConfidenceRecheck.recheck(fixed, suspects: asrSuspects, protectedTerms: vocabulary).text
+                let fixed = DictationReferee.dictationPassDetailed(preparedText, isCode: false, vocabulary: vocabulary)
+                return LowConfidenceRecheck.recheck(fixed.text, suspects: asrSuspects,
+                                                     protectedTerms: vocabulary, protectedRanges: fixed.lockedRanges).text
             }
             finalText = ProperNounVocabulary.applyPreferredSpelling(repaired, terms: preferred)
         } else {

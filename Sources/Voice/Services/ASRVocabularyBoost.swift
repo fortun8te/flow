@@ -232,7 +232,8 @@ actor ASRVocabularyBooster {
                 _ = await DictationDeadline.run(seconds: 0.12) { await task.value }
             }
         }
-        guard !Task.isCancelled, !rescoring, let captured = snapshot, captured.key == request.key else {
+        guard !Task.isCancelled, !rescoring, sessionBuild == nil,
+              let captured = snapshot, captured.key == request.key else {
             return report(text, [], ran: false)
         }
         let session = captured.session

@@ -6604,14 +6604,17 @@ extension AppDelegate: NSWindowDelegate {
                 return
             }
             // Real-word pass (tinyfix): their/there, its/it's, then/than in English sentences. Off with cleanup.
+            var lockedWordRanges: [NSRange] = []
             if polishEnabledByUser && cleanupForTask != "none" {
                 let started = CFAbsoluteTimeGetCurrent()
                 let input = finalText
                 let isCode = polishContext == .code
-                finalText = await DictationReferee.background(collector: run) {
-                    DictationReferee.dictationPass(input, isCode: isCode)
+                let repaired = await DictationReferee.background(collector: run) {
+                    DictationReferee.dictationPassDetailed(input, isCode: isCode, vocabulary: userVocab)
                 }
                 guard !Task.isCancelled, !work.isCancelled else { return }
+                finalText = repaired.text
+                lockedWordRanges = repaired.lockedRanges
                 run.stage("tinyfix", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000))
             }
             // tinynext recheck of Parakeet's low-confidence words: a word changes only when a near word reads
@@ -6619,8 +6622,10 @@ extension AppDelegate: NSWindowDelegate {
             if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code {
                 let started = CFAbsoluteTimeGetCurrent()
                 let input = finalText
+                let locks = lockedWordRanges
                 let recheck = await DictationReferee.background(collector: run) {
-                    LowConfidenceRecheck.recheck(input, suspects: parakeetSuspectsAgg, protectedTerms: userVocab)
+                    LowConfidenceRecheck.recheck(input, suspects: parakeetSuspectsAgg,
+                                                 protectedTerms: userVocab, protectedRanges: locks)
                 }
                 guard !Task.isCancelled, !work.isCancelled else { return }
                 finalText = recheck.text

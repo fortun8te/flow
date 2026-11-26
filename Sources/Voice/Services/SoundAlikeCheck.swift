@@ -45,7 +45,7 @@ enum SoundAlikeCheck {
         #"`[^`\n]*`|https?://\S+|www\.\S+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+|(?<![\w])[~/][\w.\-/]+"#)
 
     /// Production entry point. Without the model the text comes back unchanged (and loading starts).
-    static func check(_ text: String, protectedTerms: [String] = [], learned: Set<String>? = nil,
+    static func check(_ text: String, protectedTerms: [String] = [], protectedRanges: [NSRange] = [], learned: Set<String>? = nil,
                       config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
         guard !Task.isCancelled else { return (text, []) }
         guard hasCandidates(text) else {
@@ -56,7 +56,8 @@ enum SoundAlikeCheck {
             FlowRunCollector.current?.decision("soundalike", "skipped", reason: TinyNextScorer.shared.readiness)
             return (text, [])
         }
-        let found = decisions(text, protectedTerms: protectedTerms, learned: learned ?? AutoDictionary.shared.liveSoundAlikes(),
+        let found = decisions(text, protectedTerms: protectedTerms, protectedRanges: protectedRanges,
+                              learned: learned ?? AutoDictionary.shared.liveSoundAlikes(),
                               config: config, scorer: { scorer.score($0) })
         guard !Task.isCancelled else { return (text, []) }
         if !found.isEmpty { FlowRunCollector.current?.model("soundalike", "tinynext") }
@@ -71,12 +72,12 @@ enum SoundAlikeCheck {
     }
 
     /// Every judged word with its best other spelling and the gain, whatever the margin.
-    static func decisions(_ text: String, protectedTerms: [String] = [], learned: Set<String> = [],
+    static func decisions(_ text: String, protectedTerms: [String] = [], protectedRanges: [NSRange] = [], learned: Set<String> = [],
                           config: Config = Config(), scorer: ([String]) -> [Float]) -> [Decision] {
         let ns = text as NSString
         let whole = NSRange(location: 0, length: ns.length)
         let protectedKeys = Set(protectedTerms.map { $0.lowercased() })
-        let skips = skipPattern.matches(in: text, range: whole).map(\.range)
+        let skips = skipPattern.matches(in: text, range: whole).map(\.range) + protectedRanges
         let sentences = sentencePattern.matches(in: text, range: whole).map(\.range)
         let words = wordPattern.matches(in: text, range: whole).map(\.range)
 
@@ -147,12 +148,9 @@ enum SoundAlikeCheck {
 
     /// Applies the decisions that clear their margin, right to left so offsets stay valid.
     static func apply(_ text: String, decisions: [Decision], config: Config = Config()) -> (text: String, changes: [Decision]) {
-        let picked = decisions.filter { $0.delta >= ($0.learned ? config.learnedMargin : config.margin) && $0.replacement != $0.original }
-        guard !picked.isEmpty else { return (text, []) }
-        let mutable = NSMutableString(string: text)
-        for d in picked.sorted(by: { $0.start > $1.start }) {
-            mutable.replaceCharacters(in: NSRange(location: d.start, length: d.end - d.start), with: d.replacement)
+        let picked = decisions.filter { $0.delta.isFinite && $0.delta >= ($0.learned ? config.learnedMargin : config.margin) }
+        return LocalWordEdits.apply(text, changes: picked) {
+            LocalWordEdit(start: $0.start, end: $0.end, original: $0.original, replacement: $0.replacement)
         }
-        return (mutable as String, picked.sorted { $0.start < $1.start })
     }
 }

@@ -37,7 +37,7 @@ enum LowConfidenceRecheck {
 
     /// Production entry point: lexicon and model must already be loaded (or are loaded when `wait`).
     static func recheck(_ text: String, suspects: [String], protectedTerms: [String] = [],
-                        config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
+                        protectedRanges: [NSRange] = [], config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
         guard !Task.isCancelled else { return (text, []) }
         guard !suspects.isEmpty else {
             FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "no-asr-suspects")
@@ -52,7 +52,7 @@ enum LowConfidenceRecheck {
             return (text, [])
         }
         let found = decisions(text, suspects: suspects, protectedTerms: protectedTerms,
-                              lexicon: lexicon, scorer: scorer, config: config)
+                              protectedRanges: protectedRanges, lexicon: lexicon, scorer: scorer, config: config)
         guard !Task.isCancelled else { return (text, []) }
         if !found.isEmpty { FlowRunCollector.current?.model("low-confidence", "tinynext") }
         FlowRunCollector.current?.decision("low-confidence", found.isEmpty ? "no-eligible-candidates" : "scored", reason: "\(found.count) candidates")
@@ -62,7 +62,7 @@ enum LowConfidenceRecheck {
     /// Every flagged word with its best alternative and the gain, whatever the margin. Used by the
     /// production path (through `recheck`) and by the offline sweep that picks the margin on dev.
     static func decisions(_ text: String, suspects: [String], protectedTerms: [String] = [],
-                          lexicon: TypoRepair.Lexicon, scorer: TinyNextScorer.Model,
+                          protectedRanges: [NSRange] = [], lexicon: TypoRepair.Lexicon, scorer: TinyNextScorer.Model,
                           config: Config = Config()) -> [Decision] {
         let ns = text as NSString
         let whole = NSRange(location: 0, length: ns.length)
@@ -73,7 +73,7 @@ enum LowConfidenceRecheck {
         for (k, v) in TypoRepair.personalDictionary {
             protectedKeys.insert(k.lowercased()); protectedKeys.insert(v.lowercased())
         }
-        let codeRanges = skipPattern.matches(in: text, range: whole).map(\.range)
+        let codeRanges = skipPattern.matches(in: text, range: whole).map(\.range) + protectedRanges
         let sentences = sentencePattern.matches(in: text, range: whole).map(\.range)
         let words = wordPattern.matches(in: text, range: whole).map(\.range)
 
@@ -157,12 +157,9 @@ enum LowConfidenceRecheck {
 
     /// Applies the decisions whose gain clears `margin`, right to left so offsets stay valid.
     static func apply(_ text: String, decisions: [Decision], margin: Float) -> (text: String, changes: [Decision]) {
-        let picked = decisions.filter { $0.delta >= margin && $0.replacement != $0.original }
-        guard !picked.isEmpty else { return (text, []) }
-        let mutable = NSMutableString(string: text)
-        for d in picked.sorted(by: { $0.start > $1.start }) {
-            mutable.replaceCharacters(in: NSRange(location: d.start, length: d.end - d.start), with: d.replacement)
+        let picked = decisions.filter { $0.delta.isFinite && $0.delta >= margin }
+        return LocalWordEdits.apply(text, changes: picked) {
+            LocalWordEdit(start: $0.start, end: $0.end, original: $0.original, replacement: $0.replacement)
         }
-        return (mutable as String, picked.sorted { $0.start < $1.start })
     }
 }
