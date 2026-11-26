@@ -848,19 +848,12 @@ final class Qwen3Polisher {
     /// share zero letters once tokenized. Soundex maps both halves of an
     /// ASR-shattered proper noun onto the same code sequence.
     nonisolated static func prioritizeVocabulary(_ vocab: [String], suspects: [String]?) -> [String] {
-        guard let suspects, !suspects.isEmpty else { return vocab }
+        guard vocab.count > 1, let suspects, !suspects.isEmpty else { return vocab }
 
-        // Section E: in-memory cache keyed on combined (vocab, suspects) hash.
-        // The polish hot-path can hit this with the same `(vocab, suspects)`
-        // tuple multiple times per dictation (polish + merge prompt build),
-        // and soundex scoring on a 60-entry vocab against 16 suspects is
-        // measurable. FIFO eviction at capacity 16 — small dictation surface,
-        // no need for true LRU. Hashing directly via Hasher avoids the
-        // string-join + interpolation allocation the previous key required.
-        var hasher = Hasher()
-        hasher.combine(vocab)
-        hasher.combine(suspects)
-        let cacheKey = hasher.finalize()
+        // Repeated polish/merge prompt construction shares a bounded snapshot.
+        // Exact bytes and array boundaries belong to the key, not just a hash:
+        // canonical-equivalent Strings may still carry different prompt bytes.
+        let cacheKey = PromptTerms.RankingCache.Key(vocabulary: vocab, suspects: suspects)
         if let cached = vocabPrioritizationCache.read(cacheKey) {
             return cached
         }
@@ -891,39 +884,12 @@ final class Qwen3Polisher {
             }
             return best
         }
-        let result = vocab.sorted { score($0) > score($1) }
+        let result = PromptTerms.ranked(vocab, score: score)
         vocabPrioritizationCache.write(cacheKey, value: result)
         return result
     }
 
-    /// Tiny FIFO cache for `prioritizeVocabulary`. NSLock makes it safe to
-    /// call from any actor / queue since the surrounding function is
-    /// `nonisolated`. Capacity 16 — when full, drop the oldest entry.
-    private final class VocabCache: @unchecked Sendable {
-        private let lock = NSLock()
-        private var order: [Int] = []
-        private var store: [Int: [String]] = [:]
-        private let capacity: Int
-        init(capacity: Int) { self.capacity = capacity }
-        func read(_ key: Int) -> [String]? {
-            lock.lock(); defer { lock.unlock() }
-            return store[key]
-        }
-        func write(_ key: Int, value: [String]) {
-            lock.lock(); defer { lock.unlock() }
-            if store[key] != nil {
-                store[key] = value
-                return
-            }
-            if order.count >= capacity, let oldest = order.first {
-                order.removeFirst()
-                store.removeValue(forKey: oldest)
-            }
-            order.append(key)
-            store[key] = value
-        }
-    }
-    nonisolated private static let vocabPrioritizationCache = VocabCache(capacity: 16)
+    nonisolated private static let vocabPrioritizationCache = PromptTerms.RankingCache(capacity: 16)
 
     /// Tiny Soundex implementation (standard American Soundex):
     ///   1. Keep the first letter (uppercase).

@@ -61,10 +61,8 @@ actor GeneralCleanupModel {
     nonisolated static func entry(id: String) -> Entry? {
         guard id != WhisperNowTunedPolisher.settingValue, id != WhisperNowTunedPolisher.legacySettingValue,
               id != "s1-mini", id != "qwen3",
-              let data = try? Data(contentsOf: catalogURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let models = json["models"] as? [[String: Any]],
-              let row = models.first(where: { $0["id"] as? String == id }),
+              let catalog = CleanupModelCatalog.load(from: catalogURL),
+              let row = catalog.row(id: id),
               let path = row["file"] as? String else { return nil }
         let expanded = (path as NSString).expandingTildeInPath
         let file = expanded.hasPrefix("/") ? URL(fileURLWithPath: expanded)
@@ -75,7 +73,7 @@ actor GeneralCleanupModel {
                      timeoutBase: limits.timeoutBase, timeoutPerWord: limits.timeoutPerWord,
                      timeoutMax: limits.timeoutMax, coldWait: limits.coldWait,
                      idleStop: limits.idleStop, contextSize: limits.contextSize,
-                     prompt: (row["prompt"] as? String) ?? (json["prompt"] as? String),
+                     prompt: (row["prompt"] as? String) ?? catalog.prompt,
                      server: (row["server"] as? String).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
                      extraArguments: row["args"] as? [String] ?? [])
     }

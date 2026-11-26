@@ -5990,14 +5990,12 @@ extension AppDelegate: NSWindowDelegate {
             // so the model knows e.g. "GitHub" not "get hub".
             let parakeetSuspectsAgg = segments.compactMap { $0.suspectWords }.flatMap { $0 }
             let formatterSuspects = TextFormatter.suspectsForPolish(formatted)
-            let suspectWords = Array(Set(parakeetSuspectsAgg + formatterSuspects))
+            let suspectWords = PromptTerms.orderedUnique(parakeetSuspectsAgg, formatterSuspects)
             // Merge built-in dictionary terms with the user's auto-learned
             // proper nouns (brand names, frequent contacts). Auto-learned
             // first so they take priority in any de-duplication.
             let preferredWords = ProperNounVocabulary.preferredSpellingTerms()
-            var seenWords = Set<String>()
-            let userVocab = (preferredWords + ProperNounVocabulary.current() + CombinedDictionary.terms())
-                .filter { seenWords.insert($0.lowercased()).inserted }
+            let userVocab = PromptTerms.orderedUnique(preferredWords, ProperNounVocabulary.current(), CombinedDictionary.terms())
             let polishTimer = PipelineTimer()
             // Short-utterance bypass: when RecordingCoordinator flagged the
             // current clip as 16-36KB ("ok"/"yeah"/"no" territory), skip the
@@ -6804,7 +6802,8 @@ extension AppDelegate: NSWindowDelegate {
                         if CleanupLevel.current != .none && polishEnabled {
                             finalText = await Qwen3Polisher.shared.polish(
                                 formatted, suspectWords: nil,
-                                userVocabulary: Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms())),
+                                userVocabulary: PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                                    ProperNounVocabulary.current(), CombinedDictionary.terms()),
                                 cleanupLevel: CleanupLevel.current.rawValue,
                                 personalityStyle: PersonalityStyle.current.rawValue)
                         }

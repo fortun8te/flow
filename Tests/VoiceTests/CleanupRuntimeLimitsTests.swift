@@ -56,4 +56,42 @@ final class CleanupRuntimeLimitsTests: XCTestCase {
         XCTAssertNil(CleanupRuntimeLimits.weightBytes(nil))
         XCTAssertNil(CleanupRuntimeLimits.weightBytes("3000000000"))
     }
+
+    func testJSONBooleansNeverBecomeNumericRuntimeSettings() throws {
+        let keys = ["timeoutBase", "timeoutPerWord", "timeoutMax", "coldWait", "idleStop", "contextSize"]
+        for value in [false, true] {
+            let data = try JSONSerialization.data(withJSONObject: Dictionary(uniqueKeysWithValues: keys.map { ($0, value) }))
+            let row = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(CleanupRuntimeLimits(row), CleanupRuntimeLimits([:]))
+            XCTAssertNil(CleanupRuntimeLimits.weightBytes(row["contextSize"]))
+        }
+        // NSNumber bridges 0 and 1 to Bool too; rejecting `as? Bool` would also
+        // reject legitimate numeric zero/one values in a JSON catalog.
+        let data = Data(#"{"timeoutBase":0,"coldWait":0,"timeoutMax":1,"contextSize":1,"bytes":1}"#.utf8)
+        let row = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let limits = CleanupRuntimeLimits(row)
+        XCTAssertEqual(limits.timeoutBase, 0)
+        XCTAssertEqual(limits.coldWait, 0)
+        XCTAssertEqual(limits.timeoutMax, 1)
+        XCTAssertEqual(limits.contextSize, 1)
+        XCTAssertEqual(CleanupRuntimeLimits.weightBytes(row["bytes"]), 1)
+    }
+
+    func testWeightSizePreservesIntegerPrecisionBeyondDoubleMantissa() throws {
+        let data = Data(#"{"bytes":9007199254740993}"#.utf8)
+        let row = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(CleanupRuntimeLimits.weightBytes(row["bytes"]), 9_007_199_254_740_993)
+        XCTAssertEqual(CleanupRuntimeLimits.weightBytes(NSNumber(value: Int64.max)), Int64.max)
+        XCTAssertNil(CleanupRuntimeLimits.weightBytes(NSNumber(value: UInt64.max)))
+        XCTAssertEqual(CleanupRuntimeLimits.weightBytes(NSNumber(value: 3_000_000_000.0)), 3_000_000_000)
+        XCTAssertNil(CleanupRuntimeLimits.weightBytes(NSDecimalNumber(string: "9007199254740992.5")),
+                     "A fractional Decimal must not round into an integer through Double")
+    }
+
+    func testContextMustFitTheServerIntegerArgument() {
+        XCTAssertEqual(CleanupRuntimeLimits(["contextSize": Int32.max]).contextSize, Int(Int32.max))
+        for value in [Double(Int32.max) + 1, 1e12, Double(UInt32.max)] {
+            XCTAssertEqual(CleanupRuntimeLimits(["contextSize": value]).contextSize, 8192)
+        }
+    }
 }

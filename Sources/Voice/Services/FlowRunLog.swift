@@ -41,7 +41,7 @@ struct FlowRunDecision: Codable, Equatable, Sendable {
 struct FlowRunRecord: Codable, Equatable, Sendable {
     static let currentSchema = 2
     /// Bump when the interpretation of pipeline outputs or learning evidence changes.
-    static let currentPipeline = 5
+    static let currentPipeline = 6
 
     var schemaVersion = FlowRunRecord.currentSchema
     /// "dictation", "opt1", or "followup" (a later line about an earlier run).

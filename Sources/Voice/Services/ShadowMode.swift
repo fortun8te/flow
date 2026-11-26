@@ -936,9 +936,10 @@ final class ShadowModeController: @preconcurrency FnKeyTapDelegate {
             return skipped("short_clip", input: formatted,
                            final: finalize(formatted))
         }
-        let suspects = Array(Set(segments.compactMap(\.suspectWords).flatMap { $0 }
-                                 + TextFormatter.suspectsForPolish(formatted)))
-        let vocabulary = Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms()))
+        let suspects = PromptTerms.orderedUnique(segments.compactMap(\.suspectWords).flatMap { $0 },
+                                                TextFormatter.suspectsForPolish(formatted))
+        let vocabulary = PromptTerms.orderedUnique(ProperNounVocabulary.preferredSpellingTerms(),
+                                                 ProperNounVocabulary.current(), CombinedDictionary.terms())
         let observer = ShadowCleanupObserver()
         let sectionObservations = ShadowSectionCleanupObservations()
         let polishContext = context?.polishContext ?? .default

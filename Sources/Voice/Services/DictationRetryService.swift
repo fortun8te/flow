@@ -103,9 +103,9 @@ enum DictationRetryService {
             TypoRepair.shared.prewarm()
             Task(priority: .utility) { await DraftDecisionGate.prewarmIfEnabled() }
             let asrSuspects = segments.compactMap(\.suspectWords).flatMap { $0 }
-            let suspects = Array(Set(asrSuspects + TextFormatter.suspectsForPolish(formatted)))
+            let suspects = PromptTerms.orderedUnique(asrSuspects, TextFormatter.suspectsForPolish(formatted))
             let preferred = ProperNounVocabulary.preferredSpellingTerms()
-            let vocabulary = Array(Set(preferred + ProperNounVocabulary.current() + CombinedDictionary.terms()))
+            let vocabulary = PromptTerms.orderedUnique(preferred, ProperNounVocabulary.current(), CombinedDictionary.terms())
             let personality = PersonalityStyle.current.rawValue
             let level = cleanupLevel.rawValue
             let polishDraft: @Sendable (String, Bool) async -> String = { text, isSection in

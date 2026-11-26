@@ -18,12 +18,18 @@ final class SharedModelTask<Value: Sendable>: @unchecked Sendable {
             // The underlying work owns its lease until it actually ends, even
             // if cancellation already released every waiter. This also runs
             // when cancellation happens before operation starts.
-            defer { onCompletion() }
+            let result: Result<Value, Error>
             do {
                 try Task.checkCancellation()
-                state.finish(.success(try await operation()))
+                result = .success(try await operation())
             }
-            catch { state.finish(.failure(error)) }
+            catch { result = .failure(error) }
+            // Completion owns resources such as the model's inference lease.
+            // Release them before waking a consumer that may start the next
+            // operation. Explicit cancel() still releases waiters immediately,
+            // without releasing that lease until the underlying work ends.
+            onCompletion()
+            state.finish(result)
         }
     }
 

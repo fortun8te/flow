@@ -169,4 +169,75 @@ final class SharedModelTaskTests: XCTestCase {
         await fulfillment(of: [completed], timeout: 2)
         XCTAssertEqual(count.value, 100)
     }
+
+    func testCompletionBookkeepingFinishesBeforeResultReachesWaiter() async {
+        enum Failure: Error { case invalidWeights }
+        // The completion callback owns the inference lease. A published result
+        // must not let the next window run before that lease is released.
+        for fails in [false, true] {
+            let entered = expectation(description: "completion callback entered")
+            let premature = expectation(description: "result must wait for completion bookkeeping")
+            premature.isInverted = true
+            let returned = expectation(description: "result returned after completion bookkeeping")
+            let release = DispatchSemaphore(value: 0)
+            let count = CompletionCount()
+            let load = SharedModelTask<Int>(onCompletion: {
+                entered.fulfill()
+                if release.wait(timeout: .now() + 2) != .success {
+                    XCTFail("Test did not release completion callback")
+                }
+                count.increment()
+            }) {
+                if fails { throw Failure.invalidWeights }
+                return 42
+            }
+            let waiter = Task {
+                do {
+                    let value = try await load.value
+                    XCTAssertFalse(fails)
+                    XCTAssertEqual(value, 42)
+                } catch {
+                    XCTAssertTrue(fails)
+                    XCTAssertTrue(error is Failure)
+                }
+                if count.value == 0 { premature.fulfill() }
+                returned.fulfill()
+            }
+            await fulfillment(of: [entered], timeout: 1)
+            await fulfillment(of: [premature], timeout: 0.05)
+            release.signal()
+            await fulfillment(of: [returned], timeout: 1)
+            await waiter.value
+            XCTAssertEqual(count.value, 1)
+        }
+    }
+
+    func testOwnerCancellationDoesNotWaitForCompletionBookkeeping() async {
+        let entered = expectation(description: "completion callback entered")
+        let cancelled = expectation(description: "cancelled waiter returned")
+        let completed = expectation(description: "completion callback finished")
+        let release = DispatchSemaphore(value: 0)
+        let count = CompletionCount()
+        let load = SharedModelTask<Int>(onCompletion: {
+            entered.fulfill()
+            if release.wait(timeout: .now() + 2) != .success {
+                XCTFail("Test did not release completion callback")
+            }
+            count.increment()
+            completed.fulfill()
+        }) { 42 }
+        let waiter = Task {
+            do { _ = try await load.value; XCTFail("Cancelled owner published its result") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            cancelled.fulfill()
+        }
+        await fulfillment(of: [entered], timeout: 1)
+        load.cancel()
+        await fulfillment(of: [cancelled], timeout: 1)
+        XCTAssertEqual(count.value, 0)
+        release.signal()
+        await fulfillment(of: [completed], timeout: 1)
+        await waiter.value
+        XCTAssertEqual(count.value, 1)
+    }
 }
