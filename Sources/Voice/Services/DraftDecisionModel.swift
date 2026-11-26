@@ -78,7 +78,12 @@ actor DraftDecisionModel {
 
     /// Starts loading asynchronously without sending a draft. Cold decisions skip the model.
     func prewarm() {
-        guard worker == nil else { return }
+        if let worker {
+            // Refresh only an idle, ready worker. Never overwrite a startup or
+            // in-flight request watchdog just because another recording begins.
+            if worker.ready && pending == nil { scheduleIdle(worker.id) }
+            return
+        }
         startWorker()
     }
 

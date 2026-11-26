@@ -325,6 +325,15 @@ class RecordingCoordinator {
 
     // MARK: - Recording Control
 
+    private func warmDictationAssistants() {
+        guard (UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true),
+              CleanupLevel.current != .none else { return }
+        RealWordFixer.shared.prewarm()
+        // Also starts TinyNext; the lexicon and model load on separate utility queues.
+        TypoRepair.shared.prewarm()
+        Task(priority: .utility) { await DraftDecisionGate.prewarmIfEnabled() }
+    }
+
     /// Start recording from the configured audio source.
     func startRecording() {
         guard state.isRecording || state.transcribingCount < 3 else {
@@ -342,7 +351,12 @@ class RecordingCoordinator {
         }
 
         vlog("[VOICE-RC] isRecording: false → true at \(Date()) (SYNC, before any Task)")
-        RealWordFixer.shared.prewarm()   // tinyfix weights load once, off the main thread, while he speaks
+        // Kick off independent auxiliary loads while the microphone captures audio.
+        // None of these warmups is required for recording or final delivery.
+        warmDictationAssistants()
+        if ASRVocabularyBoost.isEnabled {
+            Task(priority: .utility) { await ASRVocabularyBooster.shared.prewarm() }
+        }
         currentPasteTarget = CursorPaster().captureTargetSnapshot()
         state.isRecording = true
         state.isPaused = false
@@ -391,8 +405,15 @@ class RecordingCoordinator {
         elapsedTimer?.invalidate()
         elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, !self.state.isPaused else { return }
+                guard let self, self.currentSessionId == sessionId,
+                      self.state.isRecording, !self.state.isPaused else { return }
                 self.state.elapsedSeconds += 1
+                // D1 normally idles out after 60 s. Keep it warm during long recordings.
+                if self.state.elapsedSeconds % 30 == 0,
+                   (UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true),
+                   CleanupLevel.current != .none {
+                    await DraftDecisionGate.prewarmIfEnabled()
+                }
             }
         }
 
@@ -1074,6 +1095,7 @@ class RecordingCoordinator {
 
     func togglePause() {
         state.isPaused.toggle()
+        if !state.isPaused && state.isRecording { warmDictationAssistants() }
     }
 
     // MARK: - Fetch & Search
@@ -1422,17 +1444,27 @@ class RecordingCoordinator {
                 // Anthropic, …) instead of phonetic mis-decodes. Requires
                 // a separate CTC model (~110MB) that downloads on first use.
                 // Failures here are non-fatal (path still works without it).
-                do {
-                    let ctcModels = try await CtcModels.downloadAndLoad()
-                    try await manager.configureVocabularyBoosting(
-                        vocabulary: CombinedDictionary.vocabularyContext(),
-                        ctcModels: ctcModels
-                    )
-                    vlog("[VOICE-LP] vocabulary boosting configured (\(CombinedDictionary.terms().count) terms, \(ProperNounVocabulary.customTerms().count) user-learned with strong boost)")
-                } catch {
-                    vlog("[VOICE-LP] vocabulary boosting unavailable: \(error.localizedDescription)")
+                if ASRVocabularyBoost.isEnabled {
+                    if let ctcModels = await ASRVocabularyBooster.shared.cachedCTCModels() {
+                        do {
+                            try await manager.configureVocabularyBoosting(
+                                vocabulary: CombinedDictionary.vocabularyContext(),
+                                ctcModels: ctcModels
+                            )
+                        } catch {
+                            vlog("[VOICE-LP] vocabulary boosting unavailable: \(error.localizedDescription)")
+                        }
+                    } else {
+                        // Don't delay live ASR for a 110 MB model download.
+                        Task(priority: .utility) { await ASRVocabularyBooster.shared.prewarmCTCModels() }
+                    }
                 }
+                guard !Task.isCancelled, self.slidingWindowManager === manager else { return }
                 try await manager.startStreaming(source: .microphone)
+                guard !Task.isCancelled, self.slidingWindowManager === manager else {
+                    await manager.cancel()
+                    return
+                }
             } catch {
                 vlog("[VOICE-LP] Failed to start sliding window: \(error.localizedDescription)")
                 return
@@ -1447,6 +1479,7 @@ class RecordingCoordinator {
                 let volatile = await manager.volatileTranscript
                 let isConfirmed = update.isConfirmed
                 await MainActor.run {
+                    guard !Task.isCancelled, self.slidingWindowManager === manager else { return }
                     var parts: [String] = []
                     if !confirmed.isEmpty { parts.append(confirmed) }
                     if !volatile.isEmpty && volatile != confirmed { parts.append(volatile) }

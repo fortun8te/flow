@@ -34,6 +34,20 @@ final class DraftDecisionModelTests: XCTestCase {
         XCTFail("The worker did not process a fresh request after its late reply")
     }
 
+    func testPrewarmRefreshesIdleWorker() async {
+        let model = stub()
+        await model.prewarm()
+        let ready = await waitForReady(model)
+        XCTAssertTrue(ready)
+        try? await Task.sleep(for: .milliseconds(650))
+        await model.prewarm()
+        try? await Task.sleep(for: .milliseconds(600))
+        let stillReady = await model.isReady
+        XCTAssertTrue(stillReady, "A fresh recording should extend an idle worker's lifetime")
+        let result = await model.decide(state: "The blue kettle is cold.", questions: questions)
+        XCTAssertEqual(result, ["same": ["yes": 0.92, "no": 0.08]])
+    }
+
     func testMalformedReplyDropsWorker() async {
         let model = stub()
         await model.prewarm()

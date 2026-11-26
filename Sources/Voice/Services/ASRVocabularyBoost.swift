@@ -196,6 +196,8 @@ actor ASRVocabularyBooster {
     static let shared = ASRVocabularyBooster()
 
     private var ctcModels: CtcModels?
+    private var ctcLoad: Task<CtcModels, Error>?
+    private var buildingSession = false
     private var session: VocabularyBoostingSession?
     private var sessionKey: String?
     private var unavailable = false
@@ -211,6 +213,8 @@ actor ASRVocabularyBooster {
         }
         guard let timings = tokenTimings, !timings.isEmpty, !samples.isEmpty,
               let session = await currentSession() else { return report(text, [], ran: false) }
+        // Capture the matching guard vocabulary before rescore suspends.
+        let guardWords = knownOther
         guard session.hasCTCRescoringCandidates(text: text, tokenTimings: timings) else {
             return report(text, [], ran: false)
         }
@@ -219,13 +223,34 @@ actor ASRVocabularyBooster {
         let replacements = output.replacements.filter(\.shouldReplace).map {
             "\($0.originalWord) → \($0.replacementWord ?? "")"
         }
-        let guarded = ASRVocabularyBoost.guardedText(unboosted: text, boosted: output.text, knownOther: knownOther)
+        let guarded = ASRVocabularyBoost.guardedText(unboosted: text, boosted: output.text, knownOther: guardWords)
         let kept = replacements.filter { r in !guarded.rejected.contains { $0.hasPrefix(r.components(separatedBy: " → ")[0]) } }
         return report(guarded.text, kept, ran: true, rejected: guarded.rejected)
     }
 
     /// Loads the CTC model and session ahead of the first dictation.
     func prewarm() async { _ = await currentSession() }
+
+    /// Live preview never waits for a cold download; the final batch path
+    /// and preview use the same cached encoder on subsequent recordings.
+    func cachedCTCModels() -> CtcModels? { ctcModels }
+
+    func prewarmCTCModels() async {
+        guard !unavailable else { return }
+        do { _ = try await loadCTCModels() }
+        catch { unavailable = true }
+    }
+
+    private func loadCTCModels() async throws -> CtcModels {
+        if let ctcModels { return ctcModels }
+        if let ctcLoad { return try await ctcLoad.value }
+        let task = Task { try await CtcModels.downloadAndLoad() }
+        ctcLoad = task
+        defer { ctcLoad = nil }
+        let loaded = try await task.value
+        ctcModels = loaded
+        return loaded
+    }
 
     private func currentSession() async -> VocabularyBoostingSession? {
         guard !unavailable else { return nil }
@@ -234,9 +259,13 @@ actor ASRVocabularyBooster {
         let thresholds = ASRVocabularyBoost.thresholds()
         let key = terms.joined(separator: "\u{1F}") + "|\(thresholds.cbw ?? -99)|\(thresholds.minSimilarity ?? -99)"
         if key == sessionKey, let session { return session }
+        // Actor reentrancy previously let a prewarm and two ASR windows all
+        // start the same download/build. A cold concurrent request keeps its ASR.
+        guard !buildingSession else { return nil }
+        buildingSession = true
+        defer { buildingSession = false }
         do {
-            if ctcModels == nil { ctcModels = try await CtcModels.downloadAndLoad() }
-            guard let ctcModels else { return nil }
+            let ctcModels = try await loadCTCModels()
             let vocabulary = CustomVocabularyContext(terms: terms.map(ASRVocabularyBoost.vocabularyTerm))
             let made = try await VocabularyBoostingSession(vocabulary: vocabulary, ctcModels: ctcModels,
                                                            thresholds: thresholds)

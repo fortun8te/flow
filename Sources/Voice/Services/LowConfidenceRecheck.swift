@@ -71,9 +71,40 @@ enum LowConfidenceRecheck {
             return [".", "!", "?", ":", "\n"].contains(ns.substring(with: NSRange(location: j, length: 1)))
         }
 
+        struct Job {
+            let range: NSRange
+            let word: String
+            let candidates: [String]
+            let contexts: [String]
+        }
         var out: [Decision] = []
+        var jobs: [Job] = []
+        var batchCount = 0
+        var considered = 0
+
+        func flush() {
+            guard !jobs.isEmpty else { return }
+            let contexts = jobs.flatMap(\.contexts)
+            let scores = scorer.score(contexts)
+            if scores.count == contexts.count {
+                var offset = 0
+                for job in jobs {
+                    let span = scores[offset..<(offset + job.candidates.count)]
+                    if span.allSatisfy(\.isFinite),
+                       let best = (1..<job.candidates.count).max(by: { span[offset + $0] < span[offset + $1] }) {
+                        out.append(Decision(start: job.range.location, end: job.range.upperBound,
+                                            original: job.word, replacement: job.candidates[best],
+                                            delta: span[offset + best] - span[offset]))
+                    }
+                    offset += job.candidates.count
+                }
+            }
+            jobs.removeAll(keepingCapacity: true)
+            batchCount = 0
+        }
+
         for (i, r) in words.enumerated() {
-            if out.count >= config.maxFlagged { break }
+            if considered >= config.maxFlagged || Task.isCancelled { break }
             let word = ns.substring(with: r)
             let key = word.lowercased()
             guard flagged.contains(key), key.count >= 4, key.allSatisfy({ $0 >= "a" && $0 <= "z" }),
@@ -100,11 +131,14 @@ enum LowConfidenceRecheck {
             let candidates = [word] + pool.map { alt -> String in
                 starts && word.first!.isUppercase ? alt.prefix(1).uppercased() + alt.dropFirst() : alt
             }
-            let scores = scorer.score(candidates.map { left + $0 + right })
-            guard let bestIndex = (1..<candidates.count).max(by: { scores[$0] < scores[$1] }) else { continue }
-            out.append(Decision(start: r.location, end: r.upperBound, original: word,
-                                replacement: candidates[bestIndex], delta: scores[bestIndex] - scores[0]))
+            // Bound temporary tensors; TinyNext runs these contexts together.
+            if batchCount + candidates.count > 32 { flush() }
+            jobs.append(Job(range: r, word: word, candidates: candidates,
+                            contexts: candidates.map { left + $0 + right }))
+            batchCount += candidates.count
+            considered += 1
         }
+        if !Task.isCancelled { flush() }
         return out
     }
 

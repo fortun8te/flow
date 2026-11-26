@@ -79,11 +79,15 @@ enum DictationTextPreparation {
     /// fail validation and all remaining source text pass through verbatim.
     static func cleanSections(in source: String, ranges: [Range<String.Index>],
                               deadline: ContinuousClock.Instant,
+                              review: (@Sendable (String, String) async -> Bool)? = nil,
                               using cleanup: @escaping @Sendable (String) async -> String?) async
         -> (text: String, timedOut: Bool) {
         var parts: [String] = []
         var cursor = source.startIndex
         var timedOut = false
+        // Review one guarded draft while the cleanup engine works on the next.
+        // The original section stays in its slot until its own review resolves.
+        var pending: (index: Int, edited: String, task: Task<Bool, Never>)?
         for range in ranges {
             if Task.isCancelled { break }
             let remaining = ContinuousClock.now.duration(to: deadline)
@@ -100,11 +104,35 @@ enum DictationTextPreparation {
                WhisperNowContentGuard.trip(source: original, output: edited) == nil,
                !WhisperNowContentGuard.shortened(source: original, output: edited),
                Qwen3Polisher.reviewIdentifiersPreserved(edited, original: original) {
-                parts.append(edited)
+                if let review, original != edited {
+                    // Never queue multiple reviews behind the single-request D1 worker.
+                    if let previous = pending {
+                        let vetoed = await previous.task.value
+                        if !vetoed && !Task.isCancelled { parts[previous.index] = previous.edited }
+                        pending = nil
+                    }
+                    let slot = parts.count
+                    parts.append(original)
+                    let left = ContinuousClock.now.duration(to: deadline)
+                    let seconds = min(0.2, Double(left.components.seconds) + Double(left.components.attoseconds) / 1e18)
+                    let task = Task {
+                        // The optional reviewer is fail-open, like the existing D1 gate.
+                        // Bound even a misbehaving reviewer by the original section deadline.
+                        await DictationDeadline.run(seconds: seconds) { await review(original, edited) } ?? false
+                    }
+                    pending = (slot, edited, task)
+                } else {
+                    parts.append(edited)
+                }
             } else {
                 parts.append(original)
             }
             cursor = range.upperBound
+        }
+        if let previous = pending {
+            if Task.isCancelled { previous.task.cancel() }
+            let vetoed = await previous.task.value
+            if !vetoed && !Task.isCancelled { parts[previous.index] = previous.edited }
         }
         parts.append(String(source[cursor...]))
         return (parts.joined(), timedOut)

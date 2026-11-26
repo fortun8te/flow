@@ -60,7 +60,7 @@ The score does not overrule the coverage rule. It is recorded in the trace so th
 
 ## Draft meaning check
 
-`DraftDecisionGate` asks the local `DraftDecisionModel` (a small optional process) whether an edit kept the meaning. It waits at most 150 ms (`timeout`). Only one request is in flight, and no draft is queued. The check is on by default (`voice.draftDecisionModelEnabled`) and is off in privacy mode.
+`DraftDecisionGate` asks the local `DraftDecisionModel` (a small optional process) whether an edit kept the meaning. It waits at most 150 ms (`timeout`). Only one request is in flight, and no draft is queued. The check is on by default (`voice.draftDecisionModelEnabled`) and is off in privacy mode. Capture start warms the worker on every recording path, and a long recording refreshes its idle timer. For sectioned dictations, one guarded section is reviewed while the next is cleaned; the final non-sectioned review uses the same word-scaled deadline as cleanup.
 
 **Why.** It is a second opinion for edits that have already passed the guards. It cannot add latency to a dictation, so it has a strict deadline.
 

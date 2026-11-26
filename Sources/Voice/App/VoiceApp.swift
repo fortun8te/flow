@@ -6377,6 +6377,7 @@ extension AppDelegate: NSWindowDelegate {
                 : (skipPolish ? "short-clip" : nil)
             let t2OutcomeObserver = recognizedT2 ? ShadowCleanupObserver() : nil
             let longProse = formatted.count > 1_200
+            let draftWords = formatted.split(whereSeparator: { $0.isWhitespace }).count
             var editedBySection = false
             var finalText: String
             var cleanupRoute = "skipped-level-off"
@@ -6464,7 +6465,6 @@ extension AppDelegate: NSWindowDelegate {
                 // separate bounded window and preserve each unedited section.
                 // Longer drafts earn more time (1.5 s + 12 ms a word, at most 6 s): mid-length dictations
                 // used to miss the flat 1.5 s about two times in three and paste rules-only text (21 Nov 2026).
-                let draftWords = formatted.split(whereSeparator: { $0.isWhitespace }).count
                 let shortBudget = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
                                                                      words: draftWords)
                 // Long dictations try the PC first (RemoteCleanup); its time counts inside the same budgets below.
@@ -6483,12 +6483,14 @@ extension AppDelegate: NSWindowDelegate {
                     let ranges = DictationTextPreparation.cleanupSections(in: formatted)
                     let budget = longProse ? DictationDeadline.sectionBudgetSeconds(count: ranges.count) : shortBudget
                     let deadline = remoteStarted + .seconds(budget)
-                    let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline) { section in
-                        let edited = await polishDraft(section, true)
-                        let vetoed = await DraftDecisionGate.shouldKeepOriginal(section, edited: edited, deadline: deadline)
-                        if vetoed { run.decision("decision-gate", "kept-section", reason: "meaning check vetoed a section edit") }
-                        return vetoed ? nil : edited
-                    }
+                    let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline,
+                        review: { section, edited in
+                            let vetoed = await DraftDecisionGate.shouldKeepOriginal(section, edited: edited, deadline: deadline)
+                            if vetoed { run.decision("decision-gate", "kept-section", reason: "meaning check vetoed a section edit") }
+                            return vetoed
+                        }) { section in
+                            await polishDraft(section, true)
+                        }
                     finalText = result.text
                     if result.timedOut { traceFallback = finalText == formatted ? "deadline" : "partial-deadline" }
                 } else {
@@ -6533,12 +6535,15 @@ extension AppDelegate: NSWindowDelegate {
             if let fallback = traceFallback { run.decision("cleanup", "fallback", reason: fallback) }
             // Check the proposed cleanup only within the existing key-up budget.
             // A cold or busy reviewer leaves the ordinary cleanup result in place.
-            if traceModelWillRun, !editedBySection, !recordingState.isCancelled(for: mySession) {
-                let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt)
+            if (traceModelWillRun || cleanupRoute == "remote-pc"), !editedBySection,
+               !recordingState.isCancelled(for: mySession) {
+                let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
+                                                                   words: draftWords)
                 if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText,
                     deadline: ContinuousClock.now + .seconds(remaining)) {
                     let partial = finalText.utf8.count <= 600 &&
-                        DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt) > 0.05
+                        DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
+                                                           words: draftWords) > 0.05
                         ? Qwen3Polisher.recoverAnchoredSpelling(original: formatted, proposed: finalText) : nil
                     finalText = partial ?? formatted
                     traceFallback = "decision-meaning"
@@ -7387,9 +7392,7 @@ extension AppDelegate: HotkeyServiceDelegate {
 
         // [VOICE-TIMING] hotkey press received at the gate-passed boundary
         print("[VOICE-TIMING] hotkey press received at \(Date())")
-        if Qwen3Polisher.isEnabled, CleanupLevel.current != .none {
-            Task(priority: .utility) { await DraftDecisionGate.prewarmIfEnabled() }
-        }
+        // Auxiliary model warmups are owned by RecordingCoordinator for every capture route.
         // === Path 2: re-press while transcribing — start fresh alongside ===
         // The prior finishRecording() task keeps running to completion: its
         // transcript will still polish and paste at the cursor via pasteChain.

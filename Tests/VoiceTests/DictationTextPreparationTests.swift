@@ -212,6 +212,32 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertEqual(result.text, "They are ready tomorrow.\n\n  Do not send archive-2.txt.\n\nKeep page 15.")
     }
 
+    @MainActor func testSectionReviewOverlapsNextCleanupAndKeepsItsOwnOriginal() async {
+        let first = "The blue kettles is cold."
+        let second = "The green shelves is empty."
+        let source = first + "\n\n" + second
+        let (started, signalStarted) = AsyncStream<Void>.makeStream()
+        let (next, signalNext) = AsyncStream<Void>.makeStream()
+        let result = await DictationTextPreparation.cleanSections(
+            in: source, ranges: DictationTextPreparation.cleanupSections(in: source),
+            deadline: .now + .seconds(2), review: { original, _ in
+                guard original == first else { return false }
+                signalStarted.yield(())
+                signalStarted.finish()
+                var iterator = next.makeAsyncIterator()
+                return await iterator.next() != nil
+            }) { original in
+                if original == first { return "The blue kettles are cold." }
+                var iterator = started.makeAsyncIterator()
+                _ = await iterator.next()
+                signalNext.yield(())
+                signalNext.finish()
+                return "The green shelves are empty."
+            }
+        XCTAssertFalse(result.timedOut)
+        XCTAssertEqual(result.text, first + "\n\nThe green shelves are empty.")
+    }
+
     @MainActor func testSectionTimeoutRetainsEarlierFixAndAllRemainingText() async {
         let source = "They is ready tomorrow.\n\nDo not send it.\n\nKeep page 15."
         let ranges = DictationTextPreparation.cleanupSections(in: source)
