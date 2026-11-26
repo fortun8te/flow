@@ -186,6 +186,13 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertTrue(TranscriptionService.hasAcousticSignal([0, 0, Float(0.00001), 0][...]))
     }
 
+    @MainActor func testSectionBudgetIncludesSelectedModelAndNeverExceedsDeadline() {
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 10, remaining: 20), 14)
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 10, remaining: 5), 5)
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 0, remaining: 20), 4)
+        XCTAssertEqual(DictationTextPreparation.sectionRequestSeconds(tuned: 4, general: 0, remaining: -1), 0)
+    }
+
     @MainActor func testCleanupSectionsPreferSentenceEndsAndLeaveBreaksOutside() {
         let source = "Read the report. Mark page 15. Save it.\n\n  Next section."
         let ranges = DictationTextPreparation.cleanupSections(in: source, limit: 30)

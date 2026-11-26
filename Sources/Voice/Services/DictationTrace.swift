@@ -121,16 +121,18 @@ enum DictationDeadline {
         guard seconds.isFinite, seconds > 0, !Task.isCancelled else { return nil }
         // AsyncStream.next() wakes on parent cancellation as well as timeout.
         // A child that ignores cancellation cannot keep the caller suspended.
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(seconds)
         let (stream, continuation) = AsyncStream<T>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let operation = Task {
-            guard !Task.isCancelled else { return }
+            defer { continuation.finish() }
+            guard !Task.isCancelled, clock.now < deadline else { return }
             let result = await work()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, clock.now <= deadline else { return }
             continuation.yield(result)
-            continuation.finish()
         }
         let timer = Task {
-            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            do { try await Task.sleep(until: deadline, clock: clock) } catch { return }
             continuation.finish()
         }
         defer {

@@ -256,7 +256,11 @@ actor WhisperNowTunedPolisher {
             guard !inFlight else { return false }
             shutdown()
         }
-        if let starting { return await starting.value }
+        if let starting {
+            let ok = await starting.value
+            return ok && process?.isRunning == true && runningModelURL == Self.modelFile()
+                && runningChatProfile == Self.activeChatProfile && runningAdapterURLs == Self.servedAdapterFiles
+        }
         guard Self.isInstalled else { return false }
         guard !Self.usesT2Contracts || Self.supportsCleanupControls || Self.supportsSelectedTextPolish else { return false }
         // Back-off: a server that died three times in five minutes, or failed to start in the last
@@ -268,9 +272,11 @@ actor WhisperNowTunedPolisher {
         starting = task
         let ok = await task.value
         starting = nil
-        if ok { scheduleIdleStop() }
+        let ready = ok && isRunning
+        if ready { scheduleIdleStop() }
         else { lastStartFailure = Date() }
-        return ok
+        return ready && runningModelURL == Self.modelFile()
+            && runningChatProfile == Self.activeChatProfile && runningAdapterURLs == Self.servedAdapterFiles
     }
 
     /// Starts the server in the background without waiting (used when a dictation finds it cold).
@@ -386,9 +392,10 @@ actor WhisperNowTunedPolisher {
                     _ = try? await complete("[Polish: light]\nokay cool", port: freePort,
                                             budgetText: "okay cool", quickPolish: true)
                 }
-                return true
+                return self.process === process && process.isRunning && !Task.isCancelled
             }
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, self.process === process else { return false }
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return false }
         }
         Telemetry.log("cleanup.whispernow_server", properties: ["event": "start_failed"])
         shutdown()
@@ -565,6 +572,8 @@ actor WhisperNowTunedPolisher {
             if (error as? URLError)?.code == .timedOut { throw Failure.timeout }
             throw Failure.httpError
         }
+        guard !Task.isCancelled else { throw Failure.cancelled }
+        guard self.port == port, self.process?.isRunning == true else { throw Failure.notReady }
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw Failure.httpError }
         return try Self.parseReply(data)
     }

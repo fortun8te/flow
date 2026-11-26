@@ -5935,6 +5935,7 @@ extension AppDelegate: NSWindowDelegate {
         let capturedRichAppContextForTask = capturedRichAppContext
         let personalityForTask = AppWritingCategory.style(for: capturedTargetForTask)
         let cleanupForTask = CleanupLevel.current.rawValue
+        let polishEnabledByUser = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
 
         // Each finish gets its OWN Task. We intentionally do NOT cancel the
         // previous pendingFinishTask — if the user re-pressed the hotkey
@@ -6227,10 +6228,6 @@ extension AppDelegate: NSWindowDelegate {
             // polisher itself reads) — that one stays for backward compat,
             // this one is the new user-visible setting wired into the UI.
             // ============================================================
-            let polishEnabledByUser: Bool = {
-                if UserDefaults.standard.object(forKey: "polishEnabled") == nil { return true }
-                return UserDefaults.standard.bool(forKey: "polishEnabled")
-            }()
             // ============================================================
             // OPTIMISTIC PASTE — "type now, refine after".
             // Storage key `optimisticPaste` (defaults to false). When true
@@ -6303,7 +6300,7 @@ extension AppDelegate: NSWindowDelegate {
             // Used to gate optimistic paste: there's no point doing the
             // "paste-now, replace-after" dance if polish was going to be a
             // no-op anyway (short clip, polish disabled, non-English, etc.).
-            let polishWillRun = CleanupLevel.current != .none && polishEnabledByUser && !skipPolish
+            let polishWillRun = cleanupForTask != "none" && polishEnabledByUser && !skipPolish
 
             // Optimistic paste: paste TextFormatter output immediately, BEFORE
             // the LLM round trip. The post-polish replace is best-effort.
@@ -6370,7 +6367,7 @@ extension AppDelegate: NSWindowDelegate {
             // fall back to `formatted` if Qwen3 returns whitespace/empty.
             // Dictation trace (numbers and labels only): which engine was asked, and why a fallback was used.
             var traceEngine: String = {
-                if CleanupLevel.current == .none || !polishEnabledByUser { return "off" }
+                if cleanupForTask == "none" || !polishEnabledByUser { return "off" }
                 switch Qwen3Polisher.effectiveAutomaticCleanupModel {
                 case WhisperNowTunedPolisher.settingValue:
                     if WhisperNowTunedPolisher.usesT4 { return WhisperNowTunedPolisher.dictationAdapter(for: formatted).traceName }
@@ -6382,16 +6379,16 @@ extension AppDelegate: NSWindowDelegate {
             // dose1-t1 is ready when its files are installed. The others count as ready when selected.
             var traceEngineReady = (traceEngine.hasPrefix("dose1-") || traceEngine == WhisperNowTunedPolisher.DictationAdapter.t4.traceName
                 || traceEngine == WhisperNowTunedPolisher.DictationAdapter.v3c.traceName) ? WhisperNowTunedPolisher.isInstalled : traceEngine != "off"
-            var traceModelWillRun = CleanupLevel.current != .none && polishEnabledByUser && !skipPolish
-            var traceFallback: String? = (CleanupLevel.current == .none || !polishEnabledByUser) ? "level-off"
+            var traceModelWillRun = cleanupForTask != "none" && polishEnabledByUser && !skipPolish
+            var traceFallback: String? = (cleanupForTask == "none" || !polishEnabledByUser) ? "level-off"
                 : (skipPolish ? "short-clip" : nil)
             let t2OutcomeObserver = recognizedT2 ? ShadowCleanupObserver() : nil
-            let longProse = formatted.count > 1_200
             let draftWords = formatted.split(whereSeparator: { $0.isWhitespace }).count
+            let longProse = formatted.count > DictationTextPreparation.sectionLimit || DictationDeadline.isLong(words: draftWords)
             var editedBySection = false
             var finalText: String
             var cleanupRoute = "skipped-level-off"
-            if (recognizedT2 ? cleanupForTask == "none" : CleanupLevel.current == .none) || !polishEnabledByUser {
+            if cleanupForTask == "none" || !polishEnabledByUser {
                 vlog("[VOICE] Polish skipped (cleanupLevel=none or polishEnabled=false) — rule-based only")
                 finalText = formatted
             } else if skipPolish {
@@ -6507,9 +6504,12 @@ extension AppDelegate: NSWindowDelegate {
                 } else {
                     cleanupRoute = "local"
                     run.update { $0.settings["budgetSeconds"] = String(format: "%.2f", shortBudget) }
-                    let localLeft = max(0.05, shortBudget - RemoteCleanup.seconds(since: remoteStarted))
+                    let localLeft = max(0, shortBudget - RemoteCleanup.seconds(since: remoteStarted))
                     let reserve = await DraftDecisionGate.reservation(for: formatted, available: localLeft)
-                    let answer = await DictationDeadline.run(seconds: max(0.05, localLeft - reserve)) { await polishDraft(formatted, false) }
+                    // Account for the reservation query itself; an expired
+                    // cleanup budget is not a fresh 50 ms model invocation.
+                    let generationLeft = max(0, shortBudget - RemoteCleanup.seconds(since: remoteStarted) - reserve)
+                    let answer = await DictationDeadline.run(seconds: generationLeft) { await polishDraft(formatted, false) }
                     finalText = answer ?? formatted
                     if answer == nil {
                         traceFallback = "deadline"

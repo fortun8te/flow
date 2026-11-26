@@ -19,8 +19,10 @@ enum OptOneLayout {
 
     static func looksLikeCode(_ text: String) -> Bool {
         if text.contains("`") || text.contains("{") || text.contains("}") || text.contains("</") || text.contains("=>") { return true }
-        let semicolons = text.filter { $0 == ";" }.count
-        return semicolons >= 2
+        // Semicolons in ordinary enumerations do not make a message code.
+        // Require actual syntax cues before opting out of prose layout.
+        return text.range(of: #"(?m)^\s*(?:let|var|const|func|def|class|struct|import|return)\s+[^\n]*[;=()]"#,
+                          options: .regularExpression) != nil
     }
 
     /// Only the exact deterministic layout, or a pure case/whitespace change,

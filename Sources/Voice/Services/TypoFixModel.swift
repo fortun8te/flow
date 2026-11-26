@@ -217,9 +217,9 @@ actor TypoFixModel {
         let boundaries = whitespace.matches(in: text, range: whole).compactMap { match -> (NSRange, Double)? in
             let range = match.range
             guard range.location > 0, range.upperBound < ns.length else { return nil }
-            let before = ns.substring(with: NSRange(location: max(0, range.location - min(12, range.location)),
-                                                     length: min(12, range.location)))
-            let gap = ns.substring(with: range)
+            guard let indices = Range(range, in: text) else { return nil }
+            let before = text[..<indices.lowerBound].suffix(12)
+            let gap = text[indices]
             let newlineCount = gap.filter(\.isNewline).count
             let penalty: Double
             if newlineCount >= 2 { penalty = 0 }

@@ -82,3 +82,7 @@ A companion app can drive Flow over distributed notifications and read Flow's st
 ### Concurrent model ownership
 
 General cleanup admits one request per llama-server and publishes model readiness before its shared startup task completes. A settings change cannot tear down an active request. Batch CTC builds are keyed by the exact dictionary and settings; cold loads do not block final recognition, and a warm dictionary rebuild can be joined for up to 120 ms. Each CTC decode retains its own guard vocabulary. Multi-window dictation overlaps the next TDT decode with the preceding CTC rescore while preserving the original window order and keeping at most one outstanding CTC task.
+
+### Opt+1 and cleanup latency
+
+At capture start Flow refreshes the selected cleanup engine. Launch/wake Opt+1 warmup does not start another large fallback editor if the selected typing model is installed. Section routing uses the existing 60-word threshold or section character limit; per-section request budgets include any selected general model allowance but cannot extend the outer deadline. The deadline primitive also checks the absolute monotonic cutoff before accepting a reply. Paragraph layout precomputes its sentence-boundary costs once. Existing explicit list lines are preserved; ordinary semicolon-delimited prose is not treated as code merely for using semicolons.

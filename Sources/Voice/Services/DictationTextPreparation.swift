@@ -75,6 +75,12 @@ enum DictationTextPreparation {
         return ranges
     }
 
+    static func sectionRequestSeconds(tuned: Double, general: Double, remaining: Double) -> Double {
+        // General inference is attempted before the tuned fallback; it has
+        // its own allowance, but neither can extend the outer deadline.
+        min(max(0, remaining), max(0, tuned) + max(0, general))
+    }
+
     /// Keep successful sections if a later call times out. Sections that
     /// fail validation and all remaining source text pass through verbatim.
     static func cleanSections(in source: String, ranges: [Range<String.Index>],
@@ -95,8 +101,10 @@ enum DictationTextPreparation {
             let original = String(source[range])
             // A long section gets the model's own request time (4 s + 30 ms a word), inside the overall deadline.
             // A flat 4 s let one slow 160-word section under load drop the cleanup of the whole dictation (22 Nov 2026).
-            let seconds = min(WhisperNowTunedPolisher.timeout(for: original),
-                              Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1e18)
+            let words = original.split(whereSeparator: \.isWhitespace).count
+            let seconds = sectionRequestSeconds(tuned: WhisperNowTunedPolisher.timeout(for: original),
+                general: GeneralCleanupModel.liveExtraSeconds(words: words),
+                remaining: Double(remaining.components.seconds) + Double(remaining.components.attoseconds) / 1e18)
             let reply = await DictationDeadline.run(seconds: seconds) { await cleanup(original) }
             guard let answer = reply else { timedOut = true; break }
             parts.append(String(source[cursor..<range.lowerBound]))
@@ -107,6 +115,7 @@ enum DictationTextPreparation {
                 if let review, original != edited {
                     // Never queue multiple reviews behind the single-request D1 worker.
                     if let previous = pending {
+                        if Task.isCancelled { previous.task.cancel() }
                         let vetoed = await previous.task.value
                         if !vetoed && !Task.isCancelled { parts[previous.index] = previous.edited }
                         pending = nil

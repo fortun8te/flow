@@ -1456,8 +1456,14 @@ final class Qwen3Polisher {
 
     func prewarmQuickPolish() async {
         TypoRepair.shared.prewarm()
-        await TypoFixModel.shared.prepareInBackground()
+        RealWordFixer.shared.prewarm()
         await DraftDecisionGate.prewarmIfEnabled()
+        // The selected typing model is the Opt+1 route. Do not load an
+        // additional large fallback editor just to leave it idle in RAM.
+        if TypoFixModel.isAvailable {
+            await TypoFixModel.shared.prepareInBackground()
+            return
+        }
         if WhisperNowTunedPolisher.hasQuickPolishAdapter {
             _ = await WhisperNowTunedPolisher.shared.prepare()
             return
@@ -1589,7 +1595,8 @@ final class Qwen3Polisher {
         let base = result ?? original
         let laidOut = await DictationReferee.background {
             let snapped = TypoRepair.shared.snapVocabulary(base, protectedTerms: terms)
-            return OptOneLayout.apply(source: original, edited: snapped)
+            let safe = OptOneReferee.finalize(snapped, source: original) ?? base
+            return OptOneLayout.apply(source: original, edited: safe)
         }
         return Task.isCancelled ? (nil, false) : (laidOut, false)
     }

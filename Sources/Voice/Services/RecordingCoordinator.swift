@@ -328,6 +328,9 @@ class RecordingCoordinator {
     private func warmDictationAssistants() {
         guard (UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true),
               CleanupLevel.current != .none else { return }
+        // Refresh the chosen cleanup model while audio is being captured,
+        // rather than discovering a cold or changed server at key release.
+        if Qwen3Polisher.isEnabled { Qwen3Polisher.shared.prewarm() }
         RealWordFixer.shared.prewarm()
         // Also starts TinyNext; the lexicon and model load on separate utility queues.
         TypoRepair.shared.prewarm()
