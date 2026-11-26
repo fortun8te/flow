@@ -51,8 +51,10 @@ enum DictationTraceLog {
     private static let writeLock = NSLock()
 
     static func append(_ trace: DictationTrace) {
+        guard !BackgroundActivityGate.privacyMode else { return }
         writeLock.lock()
         defer { writeLock.unlock() }
+        guard !BackgroundActivityGate.privacyMode else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
@@ -204,8 +206,10 @@ struct DictationTrainingRecord: Codable, Equatable {
     var level: String?
     var style: String?
     var pasteVerdict: String?
-    /// For kind "edit": the field's text after the user changed the pasted dictation.
+    /// For kind "edit": the corrected insertion when targetScope is "pasted-span".
     var editedField: String?
+    var feedbackSource: String?
+    var targetScope: String?
 }
 
 enum DictationTrainingLog {

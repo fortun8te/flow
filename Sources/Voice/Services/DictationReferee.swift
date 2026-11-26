@@ -63,8 +63,8 @@ enum LocalWordEdits {
 /// | finalPass    | the text                     | rule pass (hesitations, stutters, list tags) | remove fillers |
 /// | realWords    | the text                     | chance every swap made is right (tinyfix)    | fix homophones |
 ///
-/// Reasons never contain transcript text. The real-word fixes themselves (two words each) go to
-/// events.jsonl as `realword.fix` unless privacy mode is on, so the training data sees them.
+/// Reasons never contain transcript text. Word changes belong in the opt-out-aware run record;
+/// the event log holds only numeric diagnostics, including for secure-field delivery failures.
 enum DictationReferee {
     enum Judge: String, Codable, Sendable { case language, contentGuard, pasteSafety, finalPass, realWords }
     enum Action: String, Codable, Sendable { case keep, fix, fallback, skip }
@@ -174,12 +174,12 @@ enum DictationReferee {
                         reason: result.fixes.count == 1 ? "fixed 1 mixed-up word" : "fixed \(result.fixes.count) mixed-up words"))
     }
 
-    /// Writes each fix to events.jsonl (two words, the scores and where), unless privacy mode is on.
+    /// Writes scores and positions only. Text is already captured by the run's stage diff.
     static func trace(_ fixes: [RealWordFixer.Fix], mode: RealWordFixer.Mode, ms: Double) {
         guard !fixes.isEmpty, !BackgroundActivityGate.privacyMode else { return }
         for fix in fixes {
             Telemetry.log("realword.fix", properties: [
-                "mode": mode.rawValue, "from": fix.original, "to": fix.replacement,
+                "mode": mode.rawValue,
                 "margin": (Double(fix.margin) * 100).rounded() / 100, "value": (Double(fix.value) * 100).rounded() / 100,
                 "p": (fix.probability * 1000).rounded() / 1000, "mixup": fix.knownMixup, "offset": fix.location,
                 "ms": (ms * 10).rounded() / 10
@@ -255,7 +255,6 @@ enum DictationReferee {
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
         for change in changes {
             Telemetry.log("soundalike.fix", properties: [
-                "from": change.original.lowercased(), "to": change.replacement.lowercased(),
                 "delta": (Double(change.delta) * 100).rounded() / 100, "learned": change.learned,
                 "ms": (ms * 10).rounded() / 10
             ])

@@ -33,14 +33,14 @@ The Swift module is called `Voice` for compatibility with older builds; the prod
 6. **Finalise.** `DictationTextPreparation.finalize` runs `DictationFinalPass.apply` (fillers, stutters, list markup), the user's own replacements (`WisprImportService.applyReplacements`), American spelling (`AmericanSpelling.swift`), and restores the case of filenames that appear once in the source.
 7. **Rule repair.** `RecordingCoordinator` runs `RealWordFixer` (homophones such as their/there). `LowConfidenceRecheck` then looks at words the recogniser flagged below confidence 0.6, and `DictationReferee` records the judgement of each check.
 8. **Layout.** `TextFormatter` and `DictationParagraphs` apply list and paragraph layout.
-9. **Paste.** `CursorPaster` sends the text at the cursor and `PasteReadback` reads the field back to decide whether it landed. An unknown result never triggers a second paste.
+9. **Paste.** `CursorPaster` captures the live field/selection, and `SmartInsertion` resolves boundary spaces, quotes, brackets, punctuation and partial-word/literal insertion. A dispatch receipt retains the exact inserted text and UTF-16 range. `PasteReadback` reads the field back to decide whether it landed. An unknown result never triggers a second paste.
 10. **Record.** The run is written to the local run log and the trace, with numbers and labels only in the trace (see [DATA.md](DATA.md)).
 
 ### Deadlines and fallbacks
 
 | Limit | Value | Behaviour when hit | Where |
 |---|---|---|---|
-| Short dictation budget | 1.5 s from key release | Cleanup for the remaining sections is skipped; each timed-out section keeps its source text | `DictationTrace.swift` header, `DictationTextPreparation.swift` |
+| Default dictation budget | 1.8 s + 15 ms per word, capped at 6 s, plus any explicitly selected general-model allowance | Cleanup for the remaining sections is skipped; each timed-out section keeps its source text | `DictationDeadline` in `DictationTrace.swift`, `DictationTextPreparation.swift` |
 | Per-section model time | the model's own request time (4 s + 30 ms per word, for DOSE1), capped by what remains of the deadline | Section keeps its source text | `DictationTextPreparation.swift`, `WhisperNowTunedPolisher.timeout(for:)` |
 | Minimum useful remainder | 50 ms | Treated as timed out | `DictationTextPreparation.swift` |
 | Draft second opinion | 150 ms | Maximum wait for the local meaning check (`DraftDecisionGate.swift`) |
@@ -86,3 +86,13 @@ General cleanup admits one request per llama-server and publishes model readines
 ### Opt+1 and cleanup latency
 
 At capture start Flow refreshes the selected cleanup engine. Launch/wake Opt+1 warmup does not start another large fallback editor if the selected typing model is installed. Section routing uses the existing 60-word threshold or section character limit; per-section request budgets include any selected general model allowance but cannot extend the outer deadline. The deadline primitive also checks the absolute monotonic cutoff before accepting a reply. Paragraph layout precomputes its sentence-boundary costs once. Existing explicit list lines are preserved; ordinary semicolon-delimited prose is not treated as code merely for using semicolons.
+
+### Context-aware insertion and correction evidence
+
+`SmartInsertion.swift` contains the Foundation-only boundary rules. Preformatted text retains its casing. Non-preformatted text uses a conservative list of sentence starters when continuing a sentence, preserving names, acronyms and abbreviation periods. Partial selections within words, contractions and URL/email fragments stay joined. Spaces travel in the same paste payload, preserving a single undoable paste.
+
+When an editor hides its full field value, `CursorPaster` can read bounded `AXStringForRange` context for spacing. That partial context never upgrades delivery to verified. Fallback memory for unreadable fields is invalidated by clicks, app switches and external keyboard activity. The tracker stores counters only. Before sending keys, the paster rechecks submission ownership, field, caret and clipboard ownership. Invalid or overflowing UTF-16 ranges cannot authorize a typed fallback.
+
+Only verified insertions can start `CorrectionLearner`. `CorrectionEvidence` derives the exact baseline from the receipt, then isolates changes inside the inserted range. Edits elsewhere, appended text, cleared fields and ambiguous ranges are excluded. A common notification invalidates pending observations before any Flow-authored paste, selected-text edit or typed fallback. Stable external edits are recorded as `observed-edit` proposals; they are not approved training labels. Schema 2 run records distinguish pipeline output, boundary-adapted insertion, feedback provenance and runtime identity.
+
+The automatic dictionary deduplicates observations across polling, imports and restarts, requires user-edit corroboration before promoting replacements, and retains negative Undo evidence. The offline model improvement loop exports reviewed examples, keeps duplicate families in one persistent split, replays fixed cases and compares candidates through explicit quality/latency gates. It never changes installed models by itself. See [TRAINING.md](TRAINING.md) and [CUSTOM-MODEL-PLAN.md](CUSTOM-MODEL-PLAN.md).

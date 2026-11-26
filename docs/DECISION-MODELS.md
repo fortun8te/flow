@@ -62,7 +62,7 @@ The score does not overrule the coverage rule. It is recorded in the trace so th
 
 `DraftDecisionGate` asks the local `DraftDecisionModel` (a small optional process) whether an edit kept the meaning. It waits at most 150 ms (`timeout`). Only one request is in flight, and no draft is queued. The check is on by default (`voice.draftDecisionModelEnabled`) and is off in privacy mode. Capture start warms the worker on every recording path, and a long recording refreshes its idle timer. For sectioned dictations, one guarded section is reviewed while the next is cleaned; the final non-sectioned review uses the same word-scaled deadline as cleanup.
 
-**Why.** It is a second opinion for edits that have already passed the guards. It cannot add latency to a dictation, so it has a strict deadline.
+**Why.** It is a second opinion for edits that have already passed the guards. It has a strict deadline within the shared cleanup budget; its latency benefit or cost must be measured on the actual device.
 
 ## Real-word fixer
 
@@ -91,6 +91,8 @@ The score does not overrule the coverage rule. It is recorded in the trace so th
 - `unknown`: anything else.
 
 A late readable miss keeps the recovery path available even if the first read was inconclusive. Flow can retry by typing only after both reads show that the paste failed and the target supports typed fallback.
+
+The baseline field, selected range and post-paste caret must all be valid UTF-16 boundaries. A malformed range is unknown even when the visible field did not change. The paster also rechecks the target, field and caret immediately before typed fallback. A dispatch receipt is delivery metadata; only a verified readback establishes an insertion that correction learning may observe. Verification does not approve the wording for training.
 
 ## Speaker clustering
 

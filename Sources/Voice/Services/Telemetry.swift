@@ -44,10 +44,8 @@ enum Telemetry {
         ).first else { return nil }
         let dir = appSupport.appendingPathComponent("Voice", isDirectory: true)
         if !FileManager.default.fileExists(atPath: dir.path) {
-            try? FileManager.default.createDirectory(
-                at: dir,
-                withIntermediateDirectories: true
-            )
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
         }
         return dir.appendingPathComponent("events.jsonl")
     }
@@ -59,17 +57,15 @@ enum Telemetry {
     nonisolated(unsafe) static var isSuppressed = false
 
     static func log(_ event: String, properties: [String: Any] = [:]) {
-        if isSuppressed { return }
-        let timestamp = isoFormatter.string(from: Date())
+        guard !isSuppressed, !BackgroundActivityGate.privacyMode else { return }
+        let at = Date()
         let payload = sanitize(properties)
-        var record: [String: Any] = [
-            "ts": timestamp,
-            "event": event
-        ]
-        for (k, v) in payload { record[k] = v }
-
         queue.async {
+            guard !isSuppressed, !BackgroundActivityGate.privacyMode else { return }
             guard let url = logURL else { return }
+            // The shared date formatter is confined to this queue too.
+            var record: [String: Any] = ["ts": isoFormatter.string(from: at), "event": event]
+            for (k, v) in payload where k != "ts" && k != "event" { record[k] = v }
             rotateIfNeeded(at: url)
             guard let data = try? JSONSerialization.data(
                 withJSONObject: record,
@@ -80,6 +76,7 @@ enum Telemetry {
             line.append(0x0A)  // newline
 
             if FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
                 if let handle = try? FileHandle(forWritingTo: url) {
                     defer { try? handle.close() }
                     _ = try? handle.seekToEnd()
@@ -87,6 +84,7 @@ enum Telemetry {
                 }
             } else {
                 try? line.write(to: url, options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             }
         }
     }
@@ -183,7 +181,7 @@ enum Telemetry {
         return out
     }
 
-    /// Rotate the log if it has grown past the 5MB ceiling.
+    /// Rotate the log if it has grown past the configured ceiling.
     /// Single backup slot — events.jsonl.1 — overwritten each rotation.
     private static func rotateIfNeeded(at url: URL) {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),

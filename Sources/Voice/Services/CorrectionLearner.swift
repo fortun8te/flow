@@ -9,15 +9,14 @@
 // it — without the user ever opening a settings pane.
 //
 // HOW IT WORKS
-//   1. After a successful auto-paste, VoiceApp hands us (pastedText, snapshot)
-//      where `snapshot` captures the focused AX element at paste time.
-//   2. We schedule a one-shot check ~5s later (cancellable). Any new paste
-//      cancels the prior pending check, so rapid-fire dictation doesn't pile
-//      up overlapping diffs.
-//   3. On the check we re-read the element's current text via AX. We locate
-//      the region where our pasted text landed and diff it token-by-token
-//      against what's there now. Single-word SUBSTITUTIONS are the signal:
-//      a token VOICE wrote was replaced by a different, plausible new term.
+//   1. After a verified auto-paste, VoiceApp supplies a receipt with the exact
+//      target, original selection and inserted payload. The field must match
+//      the reconstructed baseline before observation begins.
+//   2. Checks at 8 and 30 seconds require external keyboard activity and a
+//      stable field. A new Flow edit cancels the pending observation.
+//   3. Only changes contained inside the known inserted span are proposals.
+//      Single-word SUBSTITUTIONS feed the dictionary; the corrected insertion
+//      is logged as an observed edit for independent review, not a gold label.
 //   4. Plausible new terms get added to the boosted vocabulary (persisted,
 //      feeds ASR boosting via UserDictionary → CombinedDictionary, and the
 //      polish vocab via ProperNounVocabulary) and surfaced via a toast.
@@ -28,7 +27,7 @@
 // read right after the verified paste, and only what changed inside the pasted text
 // counts. The old alignment matched a short paste against earlier text in the same
 // field and queued "Smaller", "empty", "start" and "pale" as corrections he never
-// made. Opt+1 results he keeps are evidence; Opt+1 Undo is negative evidence.
+// made. Retained Opt+1 results are weak evidence; Opt+1 Undo is negative evidence.
 //
 // GUARDRAILS (AutoDictionary.classify + editedSpan): never crash on denied /
 // stale AX, never learn when the field was cleared, skip common English
@@ -67,33 +66,47 @@ final class CorrectionLearner {
         /// The field right after the paste, and where the paste sits in it (UTF-16).
         let baseline: String
         let pastedRange: NSRange
+        let editSerial: Int
         var observed: Set<String> = []
     }
     private var pending: Pending?
     private var checkTask: Task<Void, Never>?
     private var keepTasks: [UUID: Task<Void, Never>] = [:]
+    private var insertionObserver: NSObjectProtocol?
 
     init(dictionary: AutoDictionary = .shared) {
         self.dictionary = dictionary
+        insertionObserver = NotificationCenter.default.addObserver(forName: .flowWillInsertText,
+                                                                    object: nil, queue: .main) { [weak self] _ in
+            // The notification is delivered on the main queue before Flow sends its own edit.
+            MainActor.assumeIsolated { self?.cancelPending() }
+        }
+    }
+
+    deinit {
+        if let insertionObserver { NotificationCenter.default.removeObserver(insertionObserver) }
+        checkTask?.cancel()
+        for task in keepTasks.values { task.cancel() }
     }
 
     // MARK: - Public entry point
 
     /// Record a freshly-pasted transcript + its target element, and schedule
     /// delayed correction checks. Cancels any prior pending check.
-    func track(pastedText: String, snapshot: CursorPaster.PasteTargetSnapshot, dictationID: String? = nil) {
+    func track(receipt: CursorPaster.PasteReceipt, dictationID: String? = nil) {
+        cancelPending()
         // Only meaningful when we can actually re-read the field later.
-        guard AXIsProcessTrusted(), snapshot.focusedElement != nil else { return }
-        let trimmed = pastedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !BackgroundActivityGate.privacyMode, AXIsProcessTrusted(), receipt.target.focusedElement != nil else { return }
+        let trimmed = receipt.insertedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 3 else { return }
-        checkTask?.cancel()
-        pending = nil
-        // The paste is verified, so the field now holds it: this is the baseline every edit is read against.
-        guard let baseline = paster.currentText(of: snapshot), baseline.utf16.count <= 20_000 else { return }
-        let range = (baseline as NSString).range(of: trimmed, options: .backwards)
-        guard range.location != NSNotFound else { return }
-        pending = Pending(pasted: pastedText, snapshot: snapshot, dictationID: dictationID,
-                          baseline: baseline, pastedRange: range)
+        // A repeated phrase elsewhere in the field must never become our correction anchor.
+        guard let range = receipt.insertedRange, let before = receipt.before.value,
+              let replaced = receipt.replacedRange ?? receipt.before.caret,
+              let expected = CorrectionEvidence.baseline(before: before, replacing: replaced, inserted: receipt.insertedText),
+              let baseline = paster.currentText(of: receipt.target), baseline.utf16.count <= 20_000,
+              baseline.utf16.elementsEqual(expected.utf16) else { return }
+        pending = Pending(pasted: receipt.insertedText, snapshot: receipt.target, dictationID: dictationID,
+                          baseline: baseline, pastedRange: range, editSerial: receipt.editSerial)
 
         let delays = checkDelays
         let settle = settleDelay
@@ -113,17 +126,27 @@ final class CorrectionLearner {
         }
     }
 
+    /// A new Flow edit or Undo invalidates the earlier observation window.
+    func cancelPending(dictationID: String? = nil) {
+        if let dictationID, pending?.dictationID != dictationID { return }
+        checkTask?.cancel()
+        checkTask = nil
+        pending = nil
+    }
+
     /// Opt+1 replaced a selection and the field shows it. Kept for `keepDelay` without an Undo, it counts.
-    func trackPolish(diffID: UUID, original: String, polished: String, target: CursorPaster.PasteTargetSnapshot) {
+    func trackPolish(diffID: UUID, original: String, polished: String, expectedField: String,
+                     target: CursorPaster.PasteTargetSnapshot) {
         keepTasks[diffID]?.cancel()
+        guard !BackgroundActivityGate.privacyMode else { return }
         let delay = keepDelay
         keepTasks[diffID] = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
             self.keepTasks[diffID] = nil
-            // Still there: he kept it. (Changed or gone: no evidence either way.)
-            guard let field = self.paster.currentText(of: target),
-                  field.contains(polished.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
+            // Passive retention is weak evidence only; do not match another occurrence of the text.
+            guard !BackgroundActivityGate.privacyMode, let field = self.paster.currentText(of: target),
+                  field.utf16.elementsEqual(expectedField.utf16) else { return }
             self.report(self.dictionary.observe(before: original, after: polished, source: .opt1Kept, operation: diffID))
         }
     }
@@ -131,42 +154,55 @@ final class CorrectionLearner {
     /// Opt+1 Undo: negative evidence for every learned fix in the undone edit.
     func polishUndone(diffID: UUID, original: String, candidate: String) {
         keepTasks.removeValue(forKey: diffID)?.cancel()
+        cancelPending()
+        guard !BackgroundActivityGate.privacyMode else { return }
         report(dictionary.observeUndo(original: original, candidate: candidate, operation: diffID))
     }
 
     // MARK: - The delayed check
 
     private func readField() -> String? {
-        guard let pending else { return nil }
+        guard !BackgroundActivityGate.privacyMode, let pending else { return nil }
+        let current = paster.captureTargetSnapshot()
+        guard current.bundleId == pending.snapshot.bundleId,
+              let focused = current.focusedElement, let expected = pending.snapshot.focusedElement,
+              CFEqual(focused, expected) else { return nil }
         return paster.currentText(of: pending.snapshot)
     }
 
     private func runCheck(current: String) {
-        guard var state = pending else { return }
+        guard !BackgroundActivityGate.privacyMode, var state = pending,
+              PasteInteractionTracker.shared.editSerial != state.editSerial else { return }
         // Field cleared (or emptied) → never learn.
         guard !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, current != state.baseline else { return }
-        guard let edit = Self.editedSpan(baseline: state.baseline, pastedRange: state.pastedRange, current: current) else { return }
+        guard let corrected = CorrectionEvidence.correctedInsertion(baseline: state.baseline,
+                                                                    pastedRange: state.pastedRange, current: current),
+              let edit = Self.editedSpan(baseline: state.baseline, pastedRange: state.pastedRange, current: current) else { return }
         let signature = edit.before + "\u{1F}" + edit.after
         guard state.observed.insert(signature).inserted else { return }
         pending = state
 
-        // Training signal: what the field holds after the user corrected the dictation.
-        if current.utf16.count <= 8_000 {
+        // A review proposal, not a gold label. Never store the unrelated surrounding field.
+        if corrected.utf16.count <= 8_000 {
             DictationTrainingLog.append(DictationTrainingRecord(kind: "edit", id: state.dictationID, recordedAt: Date(),
-                app: state.snapshot.bundleId, finalText: state.pasted, editedField: current))
+                app: state.snapshot.bundleId, finalText: state.pasted, editedField: corrected,
+                feedbackSource: "observed-edit", targetScope: "pasted-span"))
             // The same correction also lands on the dictation's run record (runs.jsonl), as an "edited" follow-up.
             if let dictationID = state.dictationID, !dictationID.isEmpty {
                 FlowRunLog.followup(id: dictationID, kind: "dictation", followup: "edited",
-                                    app: state.snapshot.bundleId, editedText: current)
+                                    app: state.snapshot.bundleId, editedText: corrected,
+                                    feedbackSource: "observed-edit", targetScope: "pasted-span")
             }
         }
-        report(dictionary.observe(before: edit.before, after: edit.after, source: .dictationEdit))
+        report(dictionary.observe(before: edit.before, after: edit.after, source: .dictationEdit,
+                                  evidenceID: state.dictationID))
     }
 
     /// The words he changed inside the pasted text: the baseline and the current field share a prefix and
     /// a suffix; what is between them must lie inside the paste. Edits elsewhere, typing after the paste,
     /// or a new paste give nil. Both sides are widened to whole words.
     nonisolated static func editedSpan(baseline: String, pastedRange: NSRange, current: String) -> (before: String, after: String)? {
+        guard CorrectionEvidence.correctedInsertion(baseline: baseline, pastedRange: pastedRange, current: current) != nil else { return nil }
         let a = Array(baseline.utf16), b = Array(current.utf16)
         var p = 0
         while p < a.count, p < b.count, a[p] == b[p] { p += 1 }

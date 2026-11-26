@@ -93,6 +93,33 @@ final class PasteReadbackTests: XCTestCase {
                                              replacing: NSRange(location: 0, length: 0)), .unknown)
     }
 
+    func testMalformedOrSplitSurrogateCaretNeverAuthorizesTyping() {
+        for range in [NSRange(location: NSNotFound, length: 0), NSRange(location: 1, length: Int.max),
+                      NSRange(location: 3, length: 0), NSRange(location: 1, length: 0)] {
+            let unchanged = look("😀", caret: range)
+            XCTAssertEqual(PasteReadback.verdict(before: unchanged, after: unchanged,
+                inserted: "blue", replacing: range), .unknown)
+            XCTAssertNil(PasteReadback.insertionRange(before: unchanged, inserted: "blue", replacing: range))
+        }
+    }
+
+    func testReplacementRangeMustMatchTheLiveSelection() {
+        let before = look("blue kettle", caret: NSRange(location: 0, length: 4))
+        XCTAssertEqual(PasteReadback.verdict(before: before, after: before, inserted: "green",
+            replacing: NSRange(location: 5, length: 6)), .unknown)
+        XCTAssertNil(PasteReadback.insertionRange(before: before, inserted: "green",
+            replacing: NSRange(location: 5, length: 6)))
+    }
+
+    func testInsertionReceiptContainsExactSmartPaddingAndUTF16Length() {
+        let before = look("😀kettle", caret: NSRange(location: 2, length: 0))
+        XCTAssertEqual(PasteReadback.insertionRange(before: before, inserted: " blue ", replacing: nil),
+                       NSRange(location: 2, length: 6))
+        XCTAssertNil(PasteReadback.insertionRange(before: look(nil, caret: before.caret), inserted: "blue", replacing: nil))
+        XCTAssertNil(PasteReadback.insertionRange(before: look("😀kettle", caret: before.caret, same: false),
+                                                 inserted: "blue", replacing: nil))
+    }
+
     // MARK: - Steps: one look, two looks, one fallback, never twice
 
     func testVerifiedFinishesWithoutAnotherLook() {

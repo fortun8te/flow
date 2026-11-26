@@ -69,11 +69,11 @@ final class TranscriptionService: TranscriptionEngine {
         return activeTranscriptions > 0
     }
 
-    private func claimDecoder() throws -> (manager: AsrManager, layers: Int) {
+    private func claimDecoder() throws -> (manager: AsrManager, layers: Int, modelID: SpeechModelID?) {
         workLock.lock(); defer { workLock.unlock() }
         guard let manager = batchManager else { throw TranscriptionError.notInitialized }
         activeTranscriptions += 1
-        return (manager, batchDecoderLayerCount)
+        return (manager, batchDecoderLayerCount, activeModelID)
     }
 
     private func releaseDecoder() {
@@ -265,6 +265,13 @@ final class TranscriptionService: TranscriptionEngine {
         let lease = try claimDecoder()
         defer { releaseDecoder() }
         let manager = lease.manager
+        if let id = lease.modelID {
+            let descriptor = SpeechModelCatalog.descriptor(for: id)
+            FlowRunCollector.model("asr", id.rawValue)
+            FlowRunCollector.note("asr-provenance", ["repository": descriptor.repository,
+                                                    "revision": descriptor.pinnedRevision ?? "unknown",
+                                                    "compute": descriptor.computePolicy.rawValue])
+        }
 
         let t0 = Date()
         print("[VOICE-TS] transcribeFile() ENTER — \(url.lastPathComponent) at \(t0)")

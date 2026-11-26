@@ -38,7 +38,9 @@ struct FlowRunDecision: Codable, Equatable, Sendable {
 }
 
 struct FlowRunRecord: Codable, Equatable, Sendable {
-    static let currentSchema = 1
+    static let currentSchema = 2
+    /// Bump when the interpretation of pipeline outputs or learning evidence changes.
+    static let currentPipeline = 2
 
     var schemaVersion = FlowRunRecord.currentSchema
     /// "dictation", "opt1", or "followup" (a later line about an earlier run).
@@ -49,6 +51,10 @@ struct FlowRunRecord: Codable, Equatable, Sendable {
     var startedAt: Date?
     /// Flow's build.
     var flowBuild: String?
+    var flowVersion: String?
+    /// Present in receipt-built candidates; nil for builds without a source fingerprint.
+    var sourceSHA256: String?
+    var pipelineVersion: Int?
     /// The app the text went to (bundle id).
     var app: String?
     /// Dictation: the raw ASR transcript. Opt+1: the selected text.
@@ -72,8 +78,12 @@ struct FlowRunRecord: Codable, Equatable, Sendable {
     var output: String?
     /// For kind "followup": "undo", "original-shown", "edited", "undo-paste".
     var followup: String?
-    /// For an "edited" follow-up: the field's text after the change.
+    /// For an "edited" follow-up: only the corrected insertion when targetScope is "pasted-span".
+    /// Legacy rows may contain the whole field and are never supervised targets.
     var editedText: String?
+    /// "observed-edit" is a stable field change after keyboard activity, not human approval.
+    var feedbackSource: String?
+    var targetScope: String?
 }
 
 /// Collects one run's stages while it happens. Thread-safe; pass it down or reach it through the
@@ -90,6 +100,9 @@ final class FlowRunCollector: @unchecked Sendable {
     init(kind: String, id: String, app: String?, input: String?, startedAt: Date = Date()) {
         record = FlowRunRecord(kind: kind, id: id, recordedAt: startedAt, startedAt: startedAt,
                                flowBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+                               flowVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                               sourceSHA256: Bundle.main.object(forInfoDictionaryKey: "FlowSourceSHA256") as? String,
+                               pipelineVersion: FlowRunRecord.currentPipeline,
                                app: app, input: input)
         lastText = input
     }
@@ -260,8 +273,9 @@ enum FlowRunLog {
     /// Best effort, off the main thread: a failed write never blocks a paste.
     static func append(_ record: FlowRunRecord, synchronously: Bool = false) {
         // Tests never write into the real store unless they point it at a folder of their own.
-        if directoryOverride == nil, !isEnabled || isRunningTests { return }
-        let work = { write(record) }
+        guard isEnabled else { return }
+        if directoryOverride == nil, isRunningTests { return }
+        let work: @Sendable () -> Void = { write(record) }
         if synchronously { queue.sync(execute: work) } else { queue.async(execute: work) }
     }
 
@@ -269,8 +283,8 @@ enum FlowRunLog {
     static func flush() { queue.sync {} }
 
     /// A copy of `record` with every field that holds typed or spoken text removed: input, output, ASR words,
-    /// suspect words, edited text, and each stage's text, word changes and detail. Timings, models, labels and
-    /// decisions stay. Used for dictation into a secure (password) field, so a password never reaches runs.jsonl.
+    /// suspect words, edited text, and each stage's text, word changes and detail. Decision values can
+    /// include word swaps too, so they are redacted along with free-form fallback reasons and audio paths.
     static func withoutText(_ record: FlowRunRecord) -> FlowRunRecord {
         var clean = record
         clean.input = nil
@@ -278,6 +292,13 @@ enum FlowRunLog {
         clean.editedText = nil
         clean.asrWords = nil
         clean.suspectWords = nil
+        clean.audioPath = nil
+        clean.fallbackReason = nil
+        // Some routes keep auxiliary recognizer transcripts in settings.
+        clean.settings = [:]
+        clean.decisions = record.decisions.map {
+            FlowRunDecision(stage: $0.stage, verdict: "redacted", reason: nil)
+        }
         clean.stages = record.stages.map { stage in
             var scrubbed = stage
             scrubbed.text = nil
@@ -289,6 +310,8 @@ enum FlowRunLog {
     }
 
     private static func write(_ record: FlowRunRecord) {
+        // A queued write must obey a privacy switch changed after enqueueing.
+        guard isEnabled else { return }
         do {
             let fm = FileManager.default
             try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -362,8 +385,10 @@ enum FlowRunLog {
     }
 
     /// A later line about an earlier run (Undo, Original shown, edited after paste).
-    static func followup(id: String, kind: String, followup: String, app: String? = nil, editedText: String? = nil) {
+    static func followup(id: String, kind: String, followup: String, app: String? = nil, editedText: String? = nil,
+                         feedbackSource: String? = nil, targetScope: String? = nil) {
         append(FlowRunRecord(kind: "followup", id: id, recordedAt: Date(), app: app,
-                             input: nil, outcome: kind, followup: followup, editedText: editedText))
+                             input: nil, outcome: kind, followup: followup, editedText: editedText,
+                             feedbackSource: feedbackSource, targetScope: targetScope))
     }
 }

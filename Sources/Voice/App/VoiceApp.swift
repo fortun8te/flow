@@ -3707,6 +3707,9 @@ extension AppDelegate {
             return
         }
 
+        // Flow's own replacement must not be mistaken for a user correction of a recent dictation.
+        CorrectionLearner.shared.cancelPending()
+
         recordingState.polishWords = text.split(whereSeparator: \.isWhitespace).count
         recordingState.isPolishingSelection = true
         recordingState.polishDiff = nil
@@ -3886,7 +3889,7 @@ extension AppDelegate {
                     }
                 }
             }
-            evidenceOutcome = .applied
+            evidenceOutcome = verified ? .applied : .unconfirmed
             self.quickPolishTimingHistory.record(modelSamples)
             let diff = PolishDiff(original: text, polished: polished, undoAvailable: true, model: madeBy)
             appliedText = polished
@@ -3899,8 +3902,9 @@ extension AppDelegate {
             self.recordingState.polishDiff = diff
             PillHaptics.polishFinished()
             // Auto-dictionary: a result he keeps (no Undo) is evidence for the fixes in it.
-            if !BackgroundActivityGate.privacyMode {
-                CorrectionLearner.shared.trackPolish(diffID: diff.id, original: text, polished: polished, target: selection.target)
+            if verified, !BackgroundActivityGate.privacyMode {
+                CorrectionLearner.shared.trackPolish(diffID: diff.id, original: text, polished: polished,
+                                                    expectedField: expectedFull, target: selection.target)
             }
         }
     }
@@ -6036,7 +6040,9 @@ extension AppDelegate: NSWindowDelegate {
                 guard !Task.isCancelled else { return }
                 fputs("[LATENCY] ASR warning threshold reached; still waiting for the transcript\n", stderr)
             }
-            let segments = await coordinator.stopRecording(claiming: claimed)
+            let segments = await FlowRunCollector.$current.withValue(run) {
+                await coordinator.stopRecording(claiming: claimed)
+            }
             slowWarning.cancel()
             let parakeetMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
             let transcriptAtMs = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
@@ -6875,6 +6881,7 @@ extension AppDelegate: NSWindowDelegate {
                     level: cleanupForTask, style: personalityForTask,
                     stagesMs: traceStages, pasteVerdict: nil, recordedAt: Date())
                 let traceGate = OneShotGate()
+                var dispatchedReceipt: CursorPaster.PasteReceipt?
                 // Set when the paste was refused for a secure (password) field. Text from such a dictation is never logged.
                 var pasteTargetSecure = false
                 func recordPaste(_ verdict: String) {
@@ -6883,17 +6890,18 @@ extension AppDelegate: NSWindowDelegate {
                     trace.pasteVerdict = verdict
                     DictationTraceLog.append(trace)
                     run.timing("pasteAtMs", Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000))
-                    run.finish(outcome: verdict, output: finalText, fallback: trace.fallbackReason, secureField: secure)
+                    run.finish(outcome: verdict, output: dispatchedReceipt?.insertedText ?? finalText,
+                               fallback: trace.fallbackReason, secureField: secure)
                     let runID = run.snapshot.id
                     Task { @MainActor in self.lastDictationRunID = runID }
                     // Training copy with text: every dictation, whatever happened to the paste.
                     DictationTrainingLog.append(DictationTrainingRecord(
                         id: claimed?.sessionId.uuidString, recordedAt: Date(), app: capturedTargetForTask,
-                        audioPath: claimed?.audioURL?.path, durationSeconds: Int(duration),
+                        audioPath: secure ? nil : claimed?.audioURL?.path, durationSeconds: Int(duration),
                         asrRaw: secure ? nil : rawText,
                         rulesText: secure ? nil : formatted, modelOutput: secure ? nil : modelOutputForTraining,
-                        finalText: secure ? nil : finalText,
-                        engine: trace.engine, fallbackReason: trace.fallbackReason, level: trace.level,
+                        finalText: secure ? nil : (dispatchedReceipt?.insertedText ?? finalText),
+                        engine: trace.engine, fallbackReason: secure ? nil : trace.fallbackReason, level: trace.level,
                         style: trace.style, pasteVerdict: verdict))
                 }
                 if autoPaste {
@@ -6936,6 +6944,13 @@ extension AppDelegate: NSWindowDelegate {
                             guard self != nil else { return false }
                             return work.mayDeliver
                         },
+                        onDispatched: { receipt in
+                            dispatchedReceipt = receipt
+                            // Record boundary adaptation as its own stage, so cleanup and paste are distinguishable.
+                            run.stage("paste-boundary", text: receipt.insertedText,
+                                      detail: ["changed": "\(receipt.insertedText != finalText)",
+                                               "rangeKnown": "\(receipt.insertedRange != nil)"])
+                        },
                         completion: { [weak self] result in
                             // A sent event is not a completed delivery: keep the FIFO
                             // slot until readback has either verified or attempted fallback.
@@ -6972,9 +6987,8 @@ extension AppDelegate: NSWindowDelegate {
                             }
                             // Learning starts only after the paste is verified in the field.
                             // A sent event is not enough, and unknown or not-landed starts nothing.
-                            guard work.mayDeliver, verdict == .verified, let target = claimed?.pasteTarget else { return }
-                            CorrectionLearner.shared.track(pastedText: finalText, snapshot: target,
-                                                           dictationID: claimed?.sessionId.uuidString)
+                            guard work.mayDeliver, verdict == .verified, let receipt = dispatchedReceipt else { return }
+                            CorrectionLearner.shared.track(receipt: receipt, dictationID: run.snapshot.id)
                         },
                         onFailure: { [weak self] reason in
                             skippedInSecureField = reason == .secureField
@@ -7146,6 +7160,7 @@ extension AppDelegate: NSWindowDelegate {
 
     func undoLastPaste() {
         guard !recordingState.lastPastedText.isEmpty else { return }
+        CorrectionLearner.shared.cancelPending(dictationID: lastDictationRunID)
         if let id = lastDictationRunID { FlowRunLog.followup(id: id, kind: "dictation", followup: "undo-paste") }
         dismissUndoPasteToast()
         showToast("Use Undo in the original app")

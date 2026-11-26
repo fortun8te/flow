@@ -43,20 +43,21 @@ final class DictationTextPreparationTests: XCTestCase {
 
     func testPasteSpacingUsesBothSidesOfTheLiveSelection() {
         let chrome = "com.google.Chrome"
-        func paste(_ text: String, into field: String, at location: Int, replacing length: Int = 0) -> String {
+        func paste(_ text: String, into field: String, at location: Int, replacing length: Int = 0,
+                   preFormatted: Bool = true) -> String {
             let selection = NSRange(location: location, length: length)
             let insertion = CursorPaster.resolvedInsertion(text, field: field, selection: selection,
-                                                          preFormatted: true, bundleID: chrome)
+                                                          preFormatted: preFormatted, bundleID: chrome)
             return (field as NSString).replacingCharacters(in: selection, with: insertion)
         }
 
-        XCTAssertEqual(paste(" there ", into: "Hello ", at: 6), "Hello there")
+        XCTAssertEqual(paste(" there ", into: "Hello ", at: 6, preFormatted: false), "Hello there")
         XCTAssertEqual(paste("there", into: "Hello", at: 5), "Hello there")
-        XCTAssertEqual(paste(" there ", into: "Hello, friend", at: 5), "Hello there, friend")
-        XCTAssertEqual(paste("a ", into: "HelloBRIDGEworld", at: 5, replacing: 6), "Helloaworld")
+        XCTAssertEqual(paste(" there ", into: "Hello, friend", at: 5, preFormatted: false), "Hello there, friend")
+        XCTAssertEqual(paste("a ", into: "HelloBRIDGEworld", at: 5, replacing: 6, preFormatted: false), "Helloaworld")
         XCTAssertEqual(paste("there", into: "Hello old world", at: 5, replacing: 5), "Hello there world")
-        XCTAssertEqual(paste(" detail ", into: "Read () now", at: 6), "Read (detail) now")
-        XCTAssertEqual(paste(" 🎉 ", into: "Done ", at: 5), "Done 🎉")
+        XCTAssertEqual(paste(" detail ", into: "Read () now", at: 6, preFormatted: false), "Read (detail) now")
+        XCTAssertEqual(paste(" 🎉 ", into: "Done ", at: 5, preFormatted: false), "Done 🎉")
         XCTAssertEqual(paste("one", into: "👩🏽‍💻 two", at: "👩🏽‍💻 ".utf16.count), "👩🏽‍💻 one two")
         XCTAssertEqual(paste("World.", into: "Hello .", at: 6), "Hello World.")
         XCTAssertEqual(paste(", then leave.", into: "Take it", at: 7), "Take it, then leave.")
@@ -131,6 +132,9 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertFalse(CursorPaster.rememberedPasteApplies(recordedBundle: "com.t3tools.t3code", currentBundle: "com.t3tools.t3code",
                                                            age: 20, sameField: false, sameWindowTitle: true,
                                                            interactionSincePaste: true))
+        XCTAssertFalse(CursorPaster.rememberedPasteApplies(recordedBundle: "com.example.editor", currentBundle: "com.example.editor",
+                                                           age: 20, sameField: true, sameWindowTitle: true,
+                                                           interactionSincePaste: true), "An identical field can have a different caret after a click or key")
     }
 
     func testADifferentOrUnknownWindowTitleBreaksTheElectronMatch() {
@@ -144,7 +148,7 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertEqual(CursorPaster.resolvedInsertion("New text", field: "Existing.", selection: nil,
                                                       preFormatted: true, bundleID: "com.google.Chrome"), "New text")
         XCTAssertEqual(CursorPaster.resolvedInsertion(" New text ", field: "", selection: nil,
-                                                      preFormatted: true, bundleID: "com.apple.TextEdit"), "New text")
+                                                      preFormatted: true, bundleID: "com.apple.TextEdit"), " New text ")
     }
     func testLiteralLinksAndNamesSurvivePresentationPasses() {
         let input = "send Jane Smith the notes at https://example.com/brief"

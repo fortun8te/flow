@@ -4,7 +4,7 @@
 //
 // EVIDENCE
 //   - A dictation he edits in the field after the paste (CorrectionLearner reads it back via Accessibility).
-//   - An Opt+1 result he keeps (not undone within the keep window).
+//   - An Opt+1 result left in the field (weak evidence, never sufficient on its own).
 //   - A name he keeps writing across dictations (ProperNounVocabulary.learnFrom).
 //   - History: his Wispr Flow edits and Flow's own saved edits (AutoDictionarySeed).
 //   Negative evidence: Opt+1 Undo, and editing a learned fix back to what was heard.
@@ -13,8 +13,8 @@
 //   - Each fix becomes heard -> written. Only small swaps count: 1-3 words for 1-3 words, never a rewrite.
 //   - Never a common English word as the written side, never a change of meaning: two ordinary words
 //     ("pale" -> "start"), a changed number, an added or dropped negation are all thrown away.
-//   - Promotion: a clear name he typed himself goes live on first sight; everything else needs 2 sightings
-//     (a recurring name 3). Growth is capped; pending entries decay after 60 days.
+//   - Promotion: a clear name he typed himself goes live on first sight; everything else needs 2 independent
+//     sightings and a user edit (a recurring name needs 3, vocabulary only). Pending entries decay after 60 days.
 //   - Undo removes a live entry. It stays out for 30 days, and for good after a second undo.
 //
 // ROUTES (all read live; no restart)
@@ -56,6 +56,11 @@ struct AutoDictionaryEntry: Codable, Equatable, Sendable {
     var replaces: Bool
     var examples: [Example]
     var sources: [String: Int]
+    /// Stable run IDs (or a context fingerprint for old callers) and their evidence source.
+    /// Optional so version-one stores remain readable.
+    var observations: [String: String]? = nil
+    /// Weak model observations must not make an older imported spelling look newer.
+    var lastOwnEditAt: Date? = nil
 
     var key: String { AutoDictionary.key(heard, written) }
 }
@@ -81,6 +86,8 @@ final class AutoDictionary: @unchecked Sendable {
         static let maxPending = 400
         static let maxExamples = 3
         static let maxPairsPerObservation = 3
+        static let maxEvidenceRecords = 128
+        static let maxPassiveEvidence = 8
         static let pendingDecaySeconds: TimeInterval = 60 * 86_400
         static let undoCooldownSeconds: TimeInterval = 30 * 86_400
         static let permanentUndos = 2
@@ -162,8 +169,8 @@ final class AutoDictionary: @unchecked Sendable {
     private var checkedAt = Date.distantPast
     /// Bumped on every change; consumers cache on it.
     private(set) var revision = 0
-    /// Opt+1 keeps, by operation, so an Undo after the keep can take the sighting back.
-    private var keptKeys: [UUID: [String]] = [:]
+    /// A delayed keep or replay must not revive an operation that was already undone.
+    private var undoneOperations: Set<String> = []
     private var suspendSaves = false
     var judgeProvider: () -> WordJudge? = { WordJudge.lexicon(wait: false) }
 
@@ -203,6 +210,22 @@ final class AutoDictionary: @unchecked Sendable {
         return entries.values.filter { $0.status == .live && kinds.contains($0.kind) }
     }
 
+    /// An alias with more than one learned target needs context. Keep the terms
+    /// as vocabulary, but never let dictionary iteration order choose a rewrite.
+    /// Check across all kinds so a spelling cannot disagree with a learned name.
+    private static func unambiguousLiveEntries(_ entries: [AutoDictionaryEntry]) -> [AutoDictionaryEntry] {
+        let active = entries.filter { $0.status == .live }
+        var targets: [String: Set<String>] = [:]
+        for entry in active { targets[normalized(entry.heard), default: []].insert(normalized(entry.written)) }
+        return active.filter { targets[normalized($0.heard)]?.count == 1 }
+    }
+
+    private func liveMappings(_ kinds: Set<AutoDictionaryEntry.Kind>) -> [AutoDictionaryEntry] {
+        lock.lock(); defer { lock.unlock() }
+        reloadIfChangedLocked()
+        return Self.unambiguousLiveEntries(Array(entries.values)).filter { kinds.contains($0.kind) }
+    }
+
     /// Learned names and terms: the speech model boosts them and the polish keeps their spelling.
     func liveNames() -> [String] {
         var seen = Set<String>()
@@ -211,14 +234,14 @@ final class AutoDictionary: @unchecked Sendable {
 
     /// Learned heard -> written replacements (names and phrases).
     func liveReplacements() -> [(heard: String, written: String)] {
-        live([.name, .phrase]).filter { $0.replaces && $0.heard.lowercased() != $0.written.lowercased() }
+        liveMappings([.name, .phrase]).filter { $0.replaces && $0.heard.lowercased() != $0.written.lowercased() }
             .sorted { $0.heard < $1.heard }.map { ($0.heard.lowercased(), $0.written) }
     }
 
     /// Learned misspellings, lowercase keys: the user overlay of the typo dictionary.
     func liveSpellings() -> [String: String] {
         var out: [String: String] = [:]
-        for e in live([.spelling]) { out[e.heard.lowercased()] = e.written }
+        for e in liveMappings([.spelling]) { out[e.heard.lowercased()] = e.written }
         return out
     }
 
@@ -238,35 +261,46 @@ final class AutoDictionary: @unchecked Sendable {
     /// One piece of evidence: Flow wrote `before`, Jordan (or a kept Opt+1) made it `after`.
     @discardableResult
     func observe(before: String, after: String, source: Source, now: Date = Date(),
-                 operation: UUID? = nil, judge: WordJudge? = nil) -> [Event] {
+                 operation: UUID? = nil, evidenceID: String? = nil, judge: WordJudge? = nil) -> [Event] {
         guard before != after, let judge = judge ?? judgeProvider() else { return [] }
         let pairs = Self.substitutions(before: before, after: after)
         guard !pairs.isEmpty else { return [] }
         lock.lock(); defer { lock.unlock() }
         reloadIfChangedLocked()
+        let observation = Self.observationID(evidenceID ?? operation?.uuidString, source: source, before: before, after: after)
+        guard !undoneOperations.contains(observation) else { return [] }
         var events: [Event] = []
-        var touched: [String] = []
+        var seenPairs = Set<String>()
+        let ambiguousHeard = Set(Dictionary(grouping: pairs, by: { $0.heard.lowercased() })
+            .filter { Set($0.value.map { $0.written.lowercased() }).count > 1 }.keys)
         for pair in pairs.prefix(Rules.maxPairsPerObservation) {
+            guard !ambiguousHeard.contains(pair.heard.lowercased()) else { continue }
+            guard seenPairs.insert(Self.key(pair.heard, pair.written)).inserted else { continue }
             // Editing a learned fix back is an undo of that fix, never a new fix the other way.
             // (Sound-alikes go both ways in different sentences, so they are only counted.)
             if let reverse = entries[Self.key(pair.written, pair.heard)], reverse.kind != .soundAlike {
-                if reverse.status == .live, let e = undoLocked(key: reverse.key, now: now) { events.append(e) }
+                // Replaying an older history edit must not veto newer user evidence.
+                if source.isOwnEdit, reverse.status == .live, now >= (reverse.lastOwnEditAt ?? reverse.lastSeen),
+                   let e = undoLocked(key: reverse.key, now: now) { events.append(e) }
                 continue
             }
             guard let classified = Self.classify(pair, judge: judge) else { continue }
             // A misspelling is stored lowercase: "Teh" at a sentence start teaches "teh" -> "the".
             let pair = classified.kind == .spelling
                 ? Pair(heard: pair.heard.lowercased(), written: pair.written.lowercased(), writtenAtSentenceStart: false) : pair
+            if source.isOwnEdit {
+                guard let retractions = retractEarlierSnapshotLocked(pair: pair, observation: observation, now: now) else { continue }
+                events += retractions
+            }
             let example = AutoDictionaryEntry.Example(before: Self.clip(before, around: pair.heard),
                                                      after: Self.clip(after, around: pair.written),
                                                      source: source.rawValue, at: now)
             if let e = sightLocked(pair: pair, kind: classified.kind, replaces: classified.replaces,
-                                   clearName: classified.clearName, source: source, example: example, now: now) {
+                                   clearName: classified.clearName, source: source, example: example,
+                                   observation: observation, now: now) {
                 events.append(e)
             }
-            touched.append(Self.key(pair.heard, pair.written))
         }
-        if let operation, !touched.isEmpty { keptKeys[operation] = touched }
         pruneLocked(now: now)
         saveLocked()
         return events
@@ -274,7 +308,8 @@ final class AutoDictionary: @unchecked Sendable {
 
     /// A fix known only as the two words (Wispr's dictionary rows): no sentence around it.
     @discardableResult
-    func observePair(heard: String, written: String, source: Source, now: Date = Date(), judge: WordJudge? = nil) -> [Event] {
+    func observePair(heard: String, written: String, source: Source, now: Date = Date(),
+                     evidenceID: String? = nil, judge: WordJudge? = nil) -> [Event] {
         guard let judge = judge ?? judgeProvider() else { return [] }
         let h = heard.trimmingCharacters(in: .whitespacesAndNewlines), w = written.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty, !w.isEmpty, h != w, h.split(separator: " ").count <= 3, w.split(separator: " ").count <= 3 else { return [] }
@@ -283,10 +318,13 @@ final class AutoDictionary: @unchecked Sendable {
         if classified.kind == .spelling { pair = Pair(heard: h.lowercased(), written: w.lowercased(), writtenAtSentenceStart: false) }
         lock.lock(); defer { lock.unlock() }
         reloadIfChangedLocked()
+        let observation = Self.observationID(evidenceID, source: source, before: h, after: w)
+        guard !undoneOperations.contains(observation) else { return [] }
         if let reverse = entries[Self.key(w, h)], reverse.kind != .soundAlike { return [] }
         let example = AutoDictionaryEntry.Example(before: h, after: w, source: source.rawValue, at: now)
         let event = sightLocked(pair: pair, kind: classified.kind, replaces: classified.replaces,
-                                clearName: classified.clearName, source: source, example: example, now: now)
+                                clearName: classified.clearName, source: source, example: example,
+                                observation: observation, now: now)
         pruneLocked(now: now)
         saveLocked()
         return event.map { [$0] } ?? []
@@ -303,13 +341,14 @@ final class AutoDictionary: @unchecked Sendable {
     func removeAll() {
         lock.lock(); defer { lock.unlock() }
         entries = [:]
-        keptKeys = [:]
+        undoneOperations = []
         saveLocked()
     }
 
     /// A name seen again in his own dictations (no fix involved): vocabulary only, after 3 sightings.
     @discardableResult
-    func observeRecurringName(_ name: String, context: String, now: Date = Date(), judge: WordJudge? = nil) -> [Event] {
+    func observeRecurringName(_ name: String, context: String, now: Date = Date(),
+                              evidenceID: String? = nil, judge: WordJudge? = nil) -> [Event] {
         guard let judge = judge ?? judgeProvider() else { return [] }
         let word = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard Self.isNameLike(word, atSentenceStart: false, judge: judge) else { return [] }
@@ -318,7 +357,9 @@ final class AutoDictionary: @unchecked Sendable {
         let example = AutoDictionaryEntry.Example(before: Self.clip(context, around: word), after: Self.clip(context, around: word),
                                                  source: Source.recurringName.rawValue, at: now)
         let event = sightLocked(pair: Pair(heard: word, written: word, writtenAtSentenceStart: false), kind: .name,
-                                replaces: false, clearName: false, source: .recurringName, example: example, now: now)
+                                replaces: false, clearName: false, source: .recurringName, example: example,
+                                observation: Self.observationID(evidenceID, source: .recurringName,
+                                                                before: context, after: context), now: now)
         pruneLocked(now: now)
         saveLocked()
         return event.map { [$0] } ?? []
@@ -329,14 +370,16 @@ final class AutoDictionary: @unchecked Sendable {
     func observeUndo(original: String, candidate: String, operation: UUID? = nil, now: Date = Date()) -> [Event] {
         lock.lock(); defer { lock.unlock() }
         reloadIfChangedLocked()
+        let observation = Self.observationID(operation?.uuidString, source: .opt1Kept, before: original, after: candidate)
+        guard undoneOperations.insert(observation).inserted else { return [] }
         var events: [Event] = []
-        if let operation, let keys = keptKeys.removeValue(forKey: operation) {
-            for key in keys {
-                guard var e = entries[key] else { continue }
-                e.count = max(0, e.count - 1)
-                e.sources[Source.opt1Kept.rawValue] = max(0, (e.sources[Source.opt1Kept.rawValue] ?? 1) - 1)
-                if e.count == 0 && e.status == .pending { entries[key] = nil } else { entries[key] = e }
-            }
+        let persisted = entries.values.filter { $0.observations?[observation] == Source.opt1Kept.rawValue }.map(\.key)
+        for key in persisted {
+            guard var e = entries[key] else { continue }
+            guard e.observations?.removeValue(forKey: observation) == Source.opt1Kept.rawValue else { continue }
+            e.count = max(0, e.count - 1)
+            e.sources[Source.opt1Kept.rawValue] = max(0, (e.sources[Source.opt1Kept.rawValue] ?? 1) - 1)
+            if e.count == 0 && e.status == .pending { entries[key] = nil } else { entries[key] = e }
         }
         for pair in Self.substitutions(before: original, after: candidate) {
             let key = Self.key(pair.heard, pair.written)
@@ -365,30 +408,64 @@ final class AutoDictionary: @unchecked Sendable {
     // MARK: Evidence rules
 
     private func sightLocked(pair: Pair, kind: AutoDictionaryEntry.Kind, replaces: Bool, clearName: Bool,
-                             source: Source, example: AutoDictionaryEntry.Example, now: Date) -> Event? {
+                             source: Source, example: AutoDictionaryEntry.Example,
+                             observation: String, now: Date) -> Event? {
         let key = Self.key(pair.heard, pair.written)
         var e = entries[key] ?? AutoDictionaryEntry(
             heard: pair.heard, written: pair.written, kind: kind, status: .pending, count: 0, undos: 0,
             firstSeen: now, lastSeen: now, liveSince: nil, removedAt: nil, replaces: replaces, examples: [], sources: [:])
         if e.status == .removed {
             // Out for good after two undos; otherwise back to pending only after the cooldown.
-            guard e.undos < Rules.permanentUndos, let at = e.removedAt,
+            guard source.isOwnEdit, e.undos < Rules.permanentUndos, let at = e.removedAt,
                   now.timeIntervalSince(at) >= Rules.undoCooldownSeconds else { return nil }
             e.status = .pending
             e.count = 0
+            e.sources = [:]
+            e.observations = [:]
+            e.liveSince = nil
+            e.lastOwnEditAt = nil
             e.removedAt = nil
         }
-        // His own casing wins: the latest written form is kept.
-        if pair.written != e.written, pair.written.lowercased() == e.written.lowercased() { e.written = pair.written }
-        e.count += 1
-        e.lastSeen = now
+        let hasOwnEvidence = e.sources.contains { Source(rawValue: $0.key)?.isOwnEdit == true && $0.value > 0 }
+        let previousOwnDate = e.lastOwnEditAt ?? (hasOwnEvidence ? e.lastSeen : .distantPast)
+        func refreshOwnSpelling() {
+            guard source.isOwnEdit, now >= previousOwnDate else { return }
+            if pair.written.lowercased() == e.written.lowercased() { e.written = pair.written }
+            e.lastOwnEditAt = now
+            e.lastSeen = max(e.lastSeen, now)
+        }
+        var observations = e.observations ?? [:]
+        if let previous = observations[observation] {
+            // A user edit can strengthen evidence from the same run, but it
+            // is still one observation. Repeated polling never adds a vote.
+            guard source.isOwnEdit, Source(rawValue: previous)?.isOwnEdit != true else {
+                if pair.written != e.written { refreshOwnSpelling(); entries[key] = e }
+                return nil
+            }
+            e.sources[previous] = max(0, (e.sources[previous] ?? 0) - 1)
+        } else {
+            // Keep the persisted evidence ledger bounded without forgetting
+            // identities and then counting an old replay as new evidence.
+            guard observations.count < Rules.maxEvidenceRecords else {
+                refreshOwnSpelling()
+                entries[key] = e
+                return nil
+            }
+            if source == .opt1Kept, (e.sources[source.rawValue] ?? 0) >= Rules.maxPassiveEvidence { return nil }
+            e.count += 1
+        }
+        observations[observation] = source.rawValue
+        e.observations = observations
+        refreshOwnSpelling()
+        e.lastSeen = max(e.lastSeen, now)
         e.sources[source.rawValue, default: 0] += 1
         if !e.examples.contains(where: { $0.before == example.before && $0.after == example.after }) {
             e.examples.append(example)
             if e.examples.count > Rules.maxExamples { e.examples.removeFirst(e.examples.count - Rules.maxExamples) }
         }
         var event: Event?
-        if e.status == .pending, e.count >= Self.needed(kind: e.kind, source: source, clearName: clearName) {
+        if e.status == .pending, Self.hasPromotionEvidence(e),
+           e.count >= Self.needed(kind: e.kind, source: source, clearName: clearName) {
             let liveCount = entries.values.filter { $0.status == .live }.count
             if liveCount < Rules.maxLive {
                 e.status = .live
@@ -398,6 +475,50 @@ final class AutoDictionary: @unchecked Sendable {
         }
         entries[key] = e
         return event
+    }
+
+    /// A later settled read of the same edit supersedes its earlier target.
+    /// An old imported snapshot cannot restore that superseded vote.
+    private func retractEarlierSnapshotLocked(pair: Pair, observation: String, now: Date) -> [Event]? {
+        let conflicts = entries.values.filter {
+            $0.heard.lowercased() == pair.heard.lowercased() && $0.written.lowercased() != pair.written.lowercased()
+                && $0.observations?[observation] != nil
+        }
+        guard !conflicts.contains(where: { ($0.lastOwnEditAt ?? $0.lastSeen) > now }) else { return nil }
+        var events: [Event] = []
+        for var entry in conflicts {
+            guard let previous = entry.observations?.removeValue(forKey: observation) else { continue }
+            entry.count = max(0, entry.count - 1)
+            entry.sources[previous] = max(0, (entry.sources[previous] ?? 1) - 1)
+            let wasLive = entry.status == .live
+            if entry.count == 0 || !Self.hasPromotionEvidence(entry) {
+                entry.status = .pending
+                entry.liveSince = nil
+            }
+            entries[entry.key] = entry.count == 0 ? nil : entry
+            if wasLive && entry.status != .live {
+                events.append(Event(change: .removed, heard: entry.heard, written: entry.written, kind: entry.kind))
+            }
+        }
+        return events
+    }
+
+    /// Model output left on screen is weak evidence. Only recurring names
+    /// without text replacements may become vocabulary without a user edit.
+    private static func hasPromotionEvidence(_ entry: AutoDictionaryEntry) -> Bool {
+        if entry.sources.contains(where: { Source(rawValue: $0.key)?.isOwnEdit == true && $0.value > 0 }) { return true }
+        return !entry.replaces && entry.heard.lowercased() == entry.written.lowercased()
+            && (entry.sources[Source.recurringName.rawValue] ?? 0) >= Rules.recurringNameSightings
+    }
+
+    /// Stable across processes and imports. The fingerprint is only for
+    /// duplicate detection, not authentication or privacy protection.
+    static func observationID(_ id: String?, source: Source, before: String, after: String) -> String {
+        if let id, !id.isEmpty { return "run:" + (UUID(uuidString: id)?.uuidString.lowercased() ?? id) }
+        let text = source.rawValue + "\u{1F}" + before + "\u{1F}" + after
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in text.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
+        return "context:" + String(hash, radix: 16)
     }
 
     static func needed(kind: AutoDictionaryEntry.Kind, source: Source, clearName: Bool) -> Int {
@@ -413,6 +534,10 @@ final class AutoDictionary: @unchecked Sendable {
         e.status = .removed
         e.removedAt = now
         e.count = 0
+        e.sources = [:]
+        e.observations = [:]
+        e.liveSince = nil
+        e.lastOwnEditAt = nil
         entries[key] = e
         return wasLive ? Event(change: .removed, heard: e.heard, written: e.written, kind: e.kind) : nil
     }
@@ -624,6 +749,7 @@ final class AutoDictionary: @unchecked Sendable {
     private struct File: Codable {
         var version: Int
         var entries: [AutoDictionaryEntry]
+        var undoneOperations: [String]? = nil
     }
 
     private func reloadIfChangedLocked(force: Bool = false) {
@@ -637,11 +763,27 @@ final class AutoDictionary: @unchecked Sendable {
         decoder.dateDecodingStrategy = .iso8601
         if let data = try? Data(contentsOf: storeURL), let file = try? decoder.decode(File.self, from: data) {
             entries = Dictionary(file.entries.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+            undoneOperations = Set(file.undoneOperations ?? [])
         } else if !force {
             entries = [:]
+            undoneOperations = []
         }
         revision += 1
-        if force { mirrorLocked() }
+        // Older builds promoted passive model output by repeated keeps. Keep
+        // those entries visible for review but stop applying them automatically.
+        var repaired = false
+        for (key, var e) in entries where e.status == .live && !Self.hasPromotionEvidence(e) {
+            e.status = .pending
+            e.liveSince = nil
+            entries[key] = e
+            repaired = true
+        }
+        // Rebuild old serialized overlays too: older builds picked one target
+        // for conflicting live aliases even when the entries themselves are valid.
+        let hasConflictingAliases = Self.unambiguousLiveEntries(Array(entries.values)).count
+            < entries.values.filter { $0.status == .live }.count
+        if repaired || hasConflictingAliases { saveLocked() }
+        else if force { mirrorLocked() }
     }
 
     private func saveLocked() {
@@ -654,11 +796,15 @@ final class AutoDictionary: @unchecked Sendable {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
             let list = entries.values.sorted { ($0.status.rawValue, $0.written.lowercased()) < ($1.status.rawValue, $1.written.lowercased()) }
-            try encoder.encode(File(version: 1, entries: list)).write(to: storeURL, options: .atomic)
+            try encoder.encode(File(version: 2, entries: list, undoneOperations: undoneOperations.sorted()))
+                .write(to: storeURL, options: .atomic)
             try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
             var spellings: [String: String] = [:]
-            for e in entries.values where e.status == .live && e.kind == .spelling { spellings[e.heard.lowercased()] = e.written }
+            for e in Self.unambiguousLiveEntries(Array(entries.values)) where e.kind == .spelling {
+                spellings[e.heard.lowercased()] = e.written
+            }
             try encoder.encode(spellings).write(to: overlayURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: overlayURL.path)
             loadedStamp = (try? FileManager.default.attributesOfItem(atPath: storeURL.path))?[.modificationDate] as? Date
         } catch {
             print("[VOICE-AUTODICT] could not save the learned dictionary: \(error.localizedDescription)")
