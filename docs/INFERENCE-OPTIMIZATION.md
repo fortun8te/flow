@@ -66,6 +66,8 @@ Measure sustained bandwidth on the actual machine before using a bandwidth/model
 
 `scripts/run_flow_candidate.py` talks only to an already-running loopback OpenAI-compatible endpoint. It does not launch servers, install weights, alter Flow settings or retry a failed attempt. It runs complete dataset rounds instead of repeating a single prompt consecutively, and retains every attempt's output, latency, finish reason, error and available server token counts. An authored warmup is recorded separately. Use at least **six measured attempts per case**.
 
+The client reuses its actual connection, with an absolute I/O watchdog covering headers and body. A slow drip cannot renew a per-socket timeout indefinitely: expiry shuts down the socket, joins the watchdog and records the failed attempt. There is no background request worker or retry. Oversized requests/responses, incomplete or ambiguous HTTP framing, duplicate/non-finite JSON and non-text completion shapes fail explicitly. Exact CRLF prompt/prefix bytes are preserved. See [TRAINING.md](TRAINING.md#replay-a-candidate-locally) for the 2 MiB payload/256 KiB configuration limits, verified multi-file artifact manifest, output reservation and aborted-run handling. HTTP cancellation does not establish that the server has finished internal GPU work; drain the owned process before changing its configuration.
+
 Start from the exact replay command in [TRAINING.md](TRAINING.md), with the actual artifact, prompt, runtime identity and editing contract. Add:
 
 ```sh
@@ -105,11 +107,14 @@ python3 scripts/flow_engine_tune.py \
 The report verifies frozen dataset/prediction hashes, complete case alignment, attempt records, chronological nonoverlapping runs, stable outputs and matching workload/model/prompt identity. Only runtime identity and cache policy may vary for the candidate. Its initial screening policy requires:
 
 - At least six attempts per case and a successful separate warmup.
-- No empty, truncated, timed-out, malformed or failed attempt, and exact output agreement across all attempts and all three runs.
-- At most 10% symmetric drift between controls in median, p95 and per-case median latency.
-- Candidate median latency at least 5% lower than **both** controls, no worse p95, and no case median more than 5% slower than the faster control.
+- No empty, truncated, timed-out, malformed or failed attempt, and exact output agreement across all attempts and all three runs. Explicitly reviewed newline-only targets use the same narrow layout exception as the quality gate.
+- No switch in reported server model identity within or between the runs. A consistently missing identity is reported as unavailable and does not attest model loading.
+- At most 10% symmetric drift between controls in median, p95 and each case's median **and p95** latency.
+- Candidate median latency at least 5% lower than **both** controls, no worse aggregate p95, and no case median **or p95** more than 5% slower than the faster control.
 
 These are explicit pilot thresholds, not a confidence interval or a validated production SLO. Too few samples, control drift or request failures makes the result inconclusive. A candidate that changes output needs the reviewed quality gate in `flow_hillclimb.py`, plus native checks; it cannot claim a lossless engine win. A report can mark `eligibleForReview`; it always leaves `promoted: false`.
+
+The added per-case p95 checks close a concrete gap in an aggregate-only tail gate: a short case can become twice as slow at its tail while a long case still determines the aggregate p95. Invented regression fixtures hold medians steady, double only a short case's tail, and verify rejection for candidate regression or an inconclusive result for control drift. The existing 5% per-case allowance now applies to both median and tail; it remains a screening policy, not an empirically established production threshold. Measured overruns and reported generation counts above the configured cap are failures even if a sample's status claims success.
 
 The HTTP runner is nonstreaming. It measures request wall time and, only when **every successful sample supplies actual completion token usage**, reports `completionTokensPerRequestSecond`. That is completion throughput including request/prefill overhead. It is **not decode tokens/second or time to first token**. Missing usage stays missing. Do not count stream chunks, estimate tokens from characters or label whole-request elapsed time as decode time. A future streaming probe must timestamp first generated token separately and validate the server's usage semantics.
 
@@ -124,3 +129,34 @@ The HTTP runner is nonstreaming. It measures request wall time and, only when **
 After a candidate clears replay, build the native candidate app on macOS. Verify selected-text behavior, sectioned deadlines, fallback/readback, rapid successive dictations, recording overlap, memory after idle eviction, and fresh chronological examples. Preserve the baseline artifact/configuration and restore it if any guard, delivery, audio or quality regression appears. Save failures and negative results alongside successes so the next experiment starts from evidence rather than repeating the same guesses.
 
 For the custom-model path and honest implementation gaps, see [CUSTOM-MODEL-PLAN.md](CUSTOM-MODEL-PLAN.md) and [CUSTOM-MODEL-EXPERIMENTS.md](CUSTOM-MODEL-EXPERIMENTS.md).
+
+## 6. Reproduce harness measurements
+
+These measurements cover Python replay bookkeeping and a deliberately broken local HTTP response. **No cleanup-model throughput, native app latency, GPU memory use or on-device model-quality improvement was measured.**
+
+Run from this checkout with the trusted baseline commit already present in local Git:
+
+```sh
+python3 scripts/benchmark_replay_harness.py \
+  --baseline 533db16c4c449132337916ee9fe78ae8235aae08 \
+  --cases 250 --repetitions 12 --output-bytes 8192
+python3 -m unittest discover -s Tests -p 'test_flow_replay_transport.py'
+python3 -m unittest discover -s Tests -p 'test_flow_engine_tune.py'
+```
+
+`benchmark_replay_harness.py` loads that local commit's runner/export code, creates invented deterministic outputs, retains every attempt, writes/hashes a temporary JSONL file, and removes it afterward. Its memory probe excludes preallocated case fixtures and uses Python `tracemalloc`, not process RSS or model-memory accounting. It also runs the old/new clients against the same fabricated server behavior: two response bytes every 20 ms with an 80 ms declared deadline. Request bodies are invented; no existing model server or personal data is used. Deadline watchdogs are cancelled and joined, which the transport regression tests check after successful and timed-out requests.
+
+Observed on Linux, Python **3.12.14**, on 26 November 2026:
+
+| Measurement | Baseline `533db16` | Updated harness |
+|---|---:|---:|
+| Cases / retained attempts | 250 / 3,000 | 250 / 3,000 |
+| Peak traced Python allocations during replay + write/hash | 76.630 MiB | 3.238 MiB |
+| Retained traced Python allocations after write/hash | 24.499 MiB | 2.920 MiB |
+| Prediction JSONL bytes | 27,325,320 | 27,325,320 |
+| Slow-drip elapsed time, 80 ms declared deadline | 2,044.04 ms | 81.08 ms |
+| Requests sent for that failed slow-drip attempt | 1 | 1 |
+
+Both memory runs produced SHA-256 `8cff051fa4f76048fa40580bb94b2a22f0585e167be9a932637af9364fe795ed`, confirming identical retained prediction bytes. Sharing identical immutable outputs and streaming the JSONL/hash cut peak traced allocation by about **95.8%** in this repeated-output workload. Gains depend on output repetition and corpus size; all distinct outputs still require their own evidence. Both slow-drip samples correctly retained a deadline failure, but the old client waited for the whole response before returning it. The updated client interrupts I/O at its deadline; observed return time includes thread scheduling and cleanup overhead. One fault-injection run is not a latency distribution or a model speed benchmark.
+
+The real loopback integration test also verifies that one authored warmup plus six scored requests use one TCP connection, and that a failed connection is closed before the next independent request. It validates the resulting private prediction/manifest pair with `flow_engine_tune.load_run` rather than checking only an HTTP response.

@@ -53,6 +53,20 @@ DOSE1 is the default cleanup model. It is a fine-tune of the WhisperNow LFM3 1.7
 
 `GeneralCleanupModel.swift` reads `~/Library/Application Support/VOICE/Models/cleanup-models.json`. Each entry's `id` can be selected with `voice.cleanupModel`, and the setting is read on every dictation. When a general model is missing, still loading, out of memory, slow, or fails the content guard, the dictation goes through DOSE1 as before. A model that fails to load is not retried for ten minutes.
 
+`CleanupModelCatalog` indexes model IDs once per file revision. Warm readiness, deadline and selection checks reuse that immutable snapshot; replacing the file takes effect on the next check without changing an already captured request. The reader accepts regular files up to 4 MiB. Missing, malformed, oversized and non-regular files invalidate the previous snapshot. Duplicate IDs retain the first row, as before. Catalog booleans are invalid numeric settings and retain the existing runtime defaults; integer weight sizes retain their exact value without a floating-point round trip. Context sizes must be positive integers within `Int32.max`, matching the integer argument accepted by [llama.cpp's context-size parser](https://github.com/ggml-org/llama.cpp/blob/master/common/arg.cpp).
+
+The synthetic lookup benchmark is separate from inference timing. Build and run it with:
+
+```sh
+swiftc -O Sources/Voice/Services/BoundedLocalFileCache.swift \
+  Sources/Voice/Services/CleanupModelCatalog.swift scripts/benchmark_cleanup_catalog.swift \
+  -o /tmp/flow-catalog-benchmark
+/tmp/flow-catalog-benchmark 4 2000 5
+/tmp/flow-catalog-benchmark 64 2000 5
+```
+
+On Linux x86_64 with Swift 6.2.1, the five-repeat medians for 2,000 warm lookups were 45.93 ms before / 15.22 ms cached for a 4-model, 595-byte catalog, and 599.96 ms before / 15.19 ms cached for a 64-model, 9,097-byte catalog. These are catalog lookup improvements (3.0× and 39.5×), not Mac inference or end-to-end dictation speedups. The script alternates measurement order, checks equivalent results and emits every timing sample.
+
 ### S1-mini
 
 S1-mini is used for English recognition normalisation only. It is not a general editing model. The caller keeps the original transcript for every output that is not accepted. Its licence is Apache-2.0 with an additional naming term. The notice files are in `Sources/Voice/Resources/ModelNotices/S1-mini/`.
@@ -70,6 +84,10 @@ S1-mini is used for English recognition normalisation only. It is not a general 
 - **TinyFix real-word swaps** (`RealWordFixer.swift`): a Swift port of the tinyfix model and its swap rules. Weights (`tinyfix.bin`) are not included, so the fixer needs them before it can run.
 - **tinynext scorer** (`TinyNextScorer.swift`): a 12.5M-parameter causal language model run with Accelerate, used only to score candidate spellings in context. Weights (`tinynext-v2.q8`) are not included.
 - **Typo repair** (`TypoRepair.swift`): keyboard-weighted edit distance over a frequency dictionary (`words.txt`, not included), with tinynext scoring each candidate.
+
+Prompt vocabulary and suspect lists use `PromptTerms.orderedUnique` across live dictation, saved-dictation retry, restored audio and shadow replay. Preferred spellings precede other vocabulary; ASR suspects precede formatter hints. Case-insensitive duplicates keep the first spelling and position, and blank terms are dropped. This matters because model prompts include only a prefix of these lists: unordered set iteration could previously change which names or suspect words were sent between processes.
+
+Qwen's phonetic ranking computes each vocabulary term's score once per cache miss and explicitly retains the incoming priority on ties. Its existing exact-code / three-character-prefix / first-letter scores remain 4 / 2 / 1. The fixed 64-term production-helper regression matches the former ranking with 64 score evaluations instead of 1,044 comparator-driven evaluations; this is a work-count check, not an inference timing claim. The 16-entry FIFO cache now keys separate vocabulary and suspect arrays by exact UTF-8 bytes, preventing hash-only collisions or canonical Unicode equivalence from returning another spelling.
 
 ## Packaging and pinning
 

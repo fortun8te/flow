@@ -77,13 +77,15 @@ A companion app can drive Flow over distributed notifications and read Flow's st
 - `voice.privacyMode` is the master switch. When it is on, run records are not written and the other local helpers stop (`VoiceApp.swift`, `BackgroundActivityGate`).
 - Run records have their own switch, `flow.saveRunRecords` (default on). See [DATA.md](DATA.md).
 - API keys live in the Keychain (`SecretStore.swift`, `KeychainAccess`).
-- The database and audio files live under `~/Library/Application Support/Voice/`, with audio pruned by size (`StorageService.pruneAudioBySize`).
+- The database and audio files live under `~/Library/Application Support/Voice/`. Automatic audio pruning is disabled; both pruning entry points are compatibility no-ops. Explicitly captured audio remains until explicitly removed. See [DATA.md](DATA.md) for the archive's scope, including privacy mode.
 
 ### Concurrent model ownership
 
 General cleanup admits one request per llama-server and publishes model readiness before its shared startup task completes. A settings change cannot tear down an active request. Batch CTC builds are keyed by the exact dictionary and settings; cold loads do not block final recognition, and a warm dictionary rebuild can be joined for up to 120 ms. Each CTC decode retains its own guard vocabulary. Multi-window dictation overlaps the next TDT decode with the preceding CTC rescore while preserving the original window order and keeping at most one outstanding CTC task.
 
 `SharedModelTask` lets each caller cancel its wait without cancelling model preparation needed by the next dictation. Explicit owner shutdown invalidates the load; generation checks prevent a late completion from publishing readiness or replacing a newer server. WhisperNow, TypoFix, General, S1 and Qwen share this primitive. Qwen meeting/dictation callers also join the same 4B load. A ready selected General model skips unnecessary DOSE1 fallback preparation; cold General retains that fallback. Catalog number validation prevents integer conversion traps, and load headroom includes actual weight-file size when metadata omits it.
+
+Successful and failed shared work releases its completion-owned resources before waking its consumers. This prevents the next CTC window from observing a completed task while its model lease is still busy. Explicit cancellation still wakes a waiter promptly without pretending that underlying native work has stopped. General-model selection uses one bounded, revision-aware catalog snapshot, and prompt vocabulary keeps preferred spellings and source priority through deduplication and phonetic-ranking ties. See [ENGINE.md](ENGINE.md) for measured helper-level work reductions and [HARNESS-VALIDATION.md](HARNESS-VALIDATION.md) for verification scope.
 
 ### Opt+1 and cleanup latency
 
@@ -93,7 +95,7 @@ At capture start Flow refreshes the selected cleanup engine. Launch/wake Opt+1 w
 
 ### Context-aware insertion and correction evidence
 
-`SmartInsertion.swift` contains the Foundation-only boundary rules. Preformatted text retains its casing. Non-preformatted text uses a conservative list of sentence starters when continuing a sentence, preserving names, acronyms and abbreviation periods. Partial selections within words, contractions and URL/email fragments stay joined. Spaces travel in the same paste payload, preserving a single undoable paste.
+`SmartInsertion.swift` contains the Foundation-only boundary rules. Preformatted text retains its casing. Non-preformatted text uses a conservative list of sentence starters when continuing a sentence, preserving names, acronyms and abbreviation periods. Partial selections within words, contractions and URL/email fragments stay joined. Unicode opening/closing categories cover fullwidth and corner brackets without adding interior spaces. Quotation-mark properties also keep literal list, heading and fence markers inside existing curly or corner quotes instead of adding unintended outer line breaks. Spaces travel in the same paste payload, preserving a single undoable paste.
 
 When an editor hides its full field value, `CursorPaster` can read bounded `AXStringForRange` context for spacing. That partial context never upgrades delivery to verified. Fallback memory for unreadable fields is invalidated by clicks, app switches and external keyboard activity. The tracker stores counters only. Before sending keys, the paster rechecks submission ownership, field, caret and clipboard ownership. Invalid or overflowing UTF-16 ranges cannot authorize a typed fallback.
 
