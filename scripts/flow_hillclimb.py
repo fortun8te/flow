@@ -11,14 +11,14 @@ reserve test for the final frozen candidate. No real text is included in reports
 import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-import json
 import importlib.util
 import math
 from pathlib import Path
 import re
 import statistics
 
-from export_flow_runs import EXPORT_SCHEMA, SPLIT_POLICY, canonical, case_hash, digest, has_reviewed_target, line_break_payload, write_private
+from export_flow_runs import (EXPORT_SCHEMA, SCOPES, SPLIT_POLICY, canonical, case_hash, digest, fingerprint,
+                              has_reviewed_target, line_break_payload, strict_json_loads, write_private)
 
 _distance_spec = importlib.util.spec_from_file_location("flow_text_metrics", Path(__file__).resolve().parents[1] / "bench/text_metrics.py")
 _distance_module = importlib.util.module_from_spec(_distance_spec)
@@ -37,63 +37,158 @@ def read_jsonl(path):
 
 
 def parse_jsonl(contents, label="predictions"):
-    rows = []
+    return list(_jsonl_rows(contents, label))
+
+
+def _jsonl_rows(contents, label):
     # JSONL is LF-delimited; Unicode line/paragraph separators are legal
     # literal JSON string contents and must not split a reviewed payload.
-    for number, line in enumerate(contents.split("\n"), 1):
+    start = number = 0
+    while start < len(contents):
+        end = contents.find("\n", start)
+        if end < 0:
+            end = len(contents)
+        line = contents[start:end]
+        start, number = end + 1, number + 1
         if not line.strip():
             continue
-        value = json.loads(line)
+        value = strict_json_loads(line)
         if not isinstance(value, dict):
             raise ValueError(f"{label}:{number}: expected an object")
-        rows.append(value)
-    return rows
+        yield value
 
 
 def load_dataset(directory, split):
     directory = Path(directory)
-    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schemaVersion") != EXPORT_SCHEMA or manifest.get("splitPolicy") != SPLIT_POLICY:
+    if split not in {"train", "valid", "test"}:
+        raise ValueError("unknown dataset split")
+    manifest = strict_json_loads((directory / "manifest.json").read_bytes())
+    if (not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int
+            or manifest["schemaVersion"] != EXPORT_SCHEMA or manifest.get("splitPolicy") != SPLIT_POLICY):
         raise ValueError("unsupported dataset manifest")
-    if manifest.get("supervisedBlocked"):
+    if type(manifest.get("supervisedBlocked", False)) is not bool:
+        raise ValueError("invalid dataset integrity status")
+    if manifest.get("supervisedBlocked", False):
         raise ValueError("dataset source integrity is unverified; freeze a complete stable source snapshot and re-export")
-    name = split + ".jsonl"
-    # Validate all supervised files so the identifier really describes this whole snapshot.
-    verified = {}
-    for filename in ("train.jsonl", "valid.jsonl", "test.jsonl"):
-        content = (directory / filename).read_bytes().decode("utf-8")
-        if digest(content) != manifest["files"][filename]["sha256"]:
-            raise ValueError(f"{filename}: hash mismatch; export may be incomplete or edited")
-        verified[filename] = content
-    identity = digest(canonical({key: manifest["files"][key] for key in ("train.jsonl", "valid.jsonl", "test.jsonl")}))
+    filenames = ("train.jsonl", "valid.jsonl", "test.jsonl")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("dataset manifest has no file inventory")
+    for filename in filenames:
+        entry = files.get(filename)
+        if (not isinstance(entry, dict) or type(entry.get("rows")) is not int or entry["rows"] < 0
+                or not isinstance(entry.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None):
+            raise ValueError("invalid supervised file hash or row count")
+    identity = digest(canonical({key: files[key] for key in filenames}))
     if identity != manifest.get("datasetID"):
         raise ValueError("datasetID does not match manifest")
-    rows = parse_jsonl(verified[name], name)
-    if len(rows) != manifest["files"][name]["rows"]:
-        raise ValueError("dataset row count mismatch")
-    seen = set()
-    for row in rows:
-        if not isinstance(row.get("id"), str) or row["id"] in seen:
-            raise ValueError("missing or duplicate case id")
-        seen.add(row["id"])
-        if not row.get("trainingEligible") or row.get("label") != "human-reviewed" or row.get("split") != split:
-            raise ValueError("evaluation requires independently reviewed examples in the requested split")
-        if not isinstance(row.get("input"), str) or not has_reviewed_target(row):
-            raise ValueError("evaluation requires nonempty text targets or explicitly reviewed newline-only layout targets")
-        for key in ("mustContain", "mustNotContain"):
-            literals = row.get(key, [])
-            if not isinstance(literals, list) or any(not isinstance(value, str) or not value for value in literals):
-                raise ValueError("literal constraints must be lists of nonempty strings")
-            if any((value in row["target"]) != (key == "mustContain") for value in literals):
-                raise ValueError("literal constraints contradict the reviewed target")
-        expected = case_hash(row)
-        if row.get("caseHash") != expected:
-            raise ValueError("caseHash does not match the reviewed case")
-    return manifest, rows
+    registry = None
+    # Legacy schema-2 snapshots did not bind the history. Continue accepting
+    # those while checking actual cross-split overlap below; never ignore a
+    # declared, missing or mismatched lock in a current exporter snapshot.
+    if "splitLockSHA256" in manifest:
+        locked = (directory / "split-lock.json").read_bytes().decode("utf-8")
+        if digest(locked) != manifest["splitLockSHA256"]:
+            raise ValueError("split-lock hash mismatch; restore the complete frozen snapshot")
+        registry = strict_json_loads(locked)
+        if (not isinstance(registry, dict) or registry.get("policy") != SPLIT_POLICY
+                or not isinstance(registry.get("assignments"), dict) or not isinstance(registry.get("groups", {}), dict)):
+            raise ValueError("invalid split history")
+        if any(not isinstance(key, str) or not isinstance(value, str) or value not in {"train", "valid", "test", "quarantine"}
+               for key, value in registry["assignments"].items()):
+            raise ValueError("invalid split assignment")
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in registry.get("groups", {}).items()):
+            raise ValueError("invalid historical split groups")
+    selected, seen, sources = [], set(), set()
+    family_owners, group_splits, input_targets = {}, {}, {}
+    total = 0
+    # Hash and validate the bytes that are actually parsed, for every split.
+    # Keep only the selected case list after validating each other file.
+    for filename in filenames:
+        content = (directory / filename).read_bytes().decode("utf-8")
+        if digest(content) != files[filename]["sha256"]:
+            raise ValueError(f"{filename}: hash mismatch; export may be incomplete or edited")
+        current_split = filename[:-6]
+        count = 0
+        for row in _jsonl_rows(content, filename):
+            count += 1
+            identifier = row.get("id")
+            if not isinstance(identifier, str) or not identifier or identifier in seen:
+                raise ValueError("missing or duplicate case id across dataset splits")
+            seen.add(identifier)
+            if row.get("trainingEligible") is not True or row.get("label") != "human-reviewed" or row.get("split") != current_split:
+                raise ValueError("evaluation requires independently reviewed examples in the requested split")
+            if "schemaVersion" in row and (type(row["schemaVersion"]) is not int or row["schemaVersion"] != EXPORT_SCHEMA):
+                raise ValueError("unsupported supervised case schema")
+            if (not isinstance(row.get("kind"), str) or row["kind"] not in SCOPES
+                    or not isinstance(row.get("input"), str) or not row["input"].strip()
+                    or not has_reviewed_target(row) or len(row["target"]) > 20_000):
+                raise ValueError("evaluation requires a supported kind, nonempty input and bounded independently reviewed target")
+            if row.get("app") is not None and not isinstance(row["app"], str):
+                raise ValueError("case app metadata must be a string or unavailable")
+            for key in ("mustContain", "mustNotContain"):
+                literals = row.get(key, [])
+                if not isinstance(literals, list) or any(not isinstance(value, str) or not value or len(value) > 500 for value in literals):
+                    raise ValueError("literal constraints must be lists of bounded nonempty strings")
+                if any((value in row["target"]) != (key == "mustContain") for value in literals):
+                    raise ValueError("literal constraints contradict the reviewed target")
+            if row.get("caseHash") != case_hash(row):
+                raise ValueError("caseHash does not match the reviewed case")
+            source_fingerprint = fingerprint(row["input"])
+            if "inputFingerprint" in row and row["inputFingerprint"] != source_fingerprint:
+                raise ValueError("inputFingerprint does not match the frozen input")
+            if "inputHash" in row and row["inputHash"] != digest(row["input"]):
+                raise ValueError("inputHash does not match the frozen input")
+            if "targetProvenance" in row:
+                provenance = row["targetProvenance"]
+                if (not isinstance(provenance, dict) or provenance.get("source") != "human-reviewed"
+                        or provenance.get("scope") != SCOPES[row["kind"]] or provenance.get("inputHash") != digest(row["input"])):
+                    raise ValueError("reviewed target provenance is not bound to this input and editing scope")
+            target_hash = digest(row["target"])
+            if source_fingerprint in input_targets and input_targets[source_fingerprint] != target_hash:
+                raise ValueError("conflicting reviewed targets for the same normalized input")
+            input_targets[source_fingerprint] = target_hash
+            group = row.get("groupID")
+            if not isinstance(group, str) or not group:
+                raise ValueError("each reviewed case needs a stable independent groupID")
+            if group in group_splits and group_splits[group] != current_split:
+                raise ValueError("one independent family appears across dataset splits")
+            group_splits[group] = current_split
+            recording_keys = row.get("recordingKeys", [])
+            source_ids = row.get("sourceRunIDs", [identifier])
+            if not isinstance(recording_keys, list) or any(not isinstance(key, str) or not key for key in recording_keys):
+                raise ValueError("recordingKeys must be a list of identity strings")
+            if (not isinstance(source_ids, list) or not source_ids or any(not isinstance(key, str) or not key for key in source_ids)
+                    or len(set(source_ids)) != len(source_ids) or identifier not in source_ids or sources.intersection(source_ids)):
+                raise ValueError("source run ids are missing or duplicated in the supervised corpus")
+            sources.update(source_ids)
+            for key in {source_fingerprint, fingerprint(row["target"]), *recording_keys}:
+                owner = (current_split, group)
+                if key in family_owners and family_owners[key] != owner:
+                    raise ValueError("overlapping input, target or recording families cannot be split or counted independently")
+                family_owners[key] = owner
+                if registry is not None:
+                    if registry["assignments"].get(key) != current_split:
+                        raise ValueError("case split disagrees with locked family history")
+                    if key in registry.get("groups", {}) and registry["groups"][key] != group:
+                        raise ValueError("case groupID disagrees with locked family history")
+            if current_split == split:
+                selected.append(row)
+        if count != files[filename]["rows"]:
+            raise ValueError("dataset row count mismatch")
+        total += count
+    if "supervisedExamples" in manifest and (type(manifest["supervisedExamples"]) is not int or manifest["supervisedExamples"] != total):
+        raise ValueError("manifest supervised example count disagrees with the complete dataset")
+    return manifest, selected
 
 
 def positive_number(value):
-    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def validate_protocol(protocol, protocol_id):
@@ -104,7 +199,7 @@ def validate_protocol(protocol, protocol_id):
         raise ValueError("unsupported benchmark warmup protocol")
     if type(repetitions) is not int or not 1 <= repetitions <= 50:
         raise ValueError("benchmark repetitions must be between 1 and 50")
-    if protocol.get("concurrency") != 1 or protocol.get("order") != "dataset-rounds":
+    if type(protocol.get("concurrency")) is not int or protocol["concurrency"] != 1 or protocol.get("order") != "dataset-rounds":
         raise ValueError("benchmark must use sequential complete-workload rounds")
     if not positive_number(protocol.get("timeoutSeconds")) or type(protocol.get("maxTokens")) is not int or protocol["maxTokens"] < 1:
         raise ValueError("benchmark request limits must be finite and positive")
@@ -123,8 +218,12 @@ def empty_output(case, output):
 
 def predictions_by_id(rows, cases, dataset_id=None):
     expected = {case["id"]: case for case in cases}
+    if len(expected) != len(cases):
+        raise ValueError("frozen cases must have unique ids")
     predictions, models, protocols = {}, set(), set()
     for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("every prediction must be an object")
         identifier = row.get("id")
         if not isinstance(identifier, str) or identifier not in expected:
             raise ValueError("prediction has unknown or missing id")
@@ -136,6 +235,9 @@ def predictions_by_id(rows, cases, dataset_id=None):
             raise ValueError("stale prediction: datasetID differs from the complete snapshot and context")
         if not isinstance(row.get("output"), str):
             raise ValueError("prediction output must be a string, including failures")
+        for key in ("error", "finish_reason"):
+            if row.get(key) is not None and not isinstance(row[key], str):
+                raise ValueError("prediction status must be a string or unavailable")
         latency = row.get("latencyMs")
         if not positive_number(latency):
             raise ValueError("prediction latencyMs must be finite and positive")
@@ -162,6 +264,9 @@ def predictions_by_id(rows, cases, dataset_id=None):
                     raise ValueError("missing, duplicate or reordered attempt index")
                 if not isinstance(sample.get("output"), str) or not positive_number(sample.get("latencyMs")):
                     raise ValueError("every attempted request requires text output and measured positive latency")
+                for key in ("error", "finish_reason"):
+                    if sample.get(key) is not None and not isinstance(sample[key], str):
+                        raise ValueError("attempt status must be a string or unavailable")
                 for key in ("promptTokens", "completionTokens"):
                     if sample.get(key) is not None and (type(sample[key]) is not int or sample[key] < 0):
                         raise ValueError("usage token counts must be nonnegative integers or unavailable")
@@ -190,40 +295,52 @@ def score(case, prediction):
     required_layout = layout_signature(expected) if case.get("requireExactLayout") is True else None
     layout_exact = True if required_layout is not None else None
     samples = prediction_attempts(prediction)
-    faults = []
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("scoring requires at least one retained attempt")
+    faults = set()
     if prediction.get("error"):
-        faults.append("runtime_failure")
-    if any(sample["output"] != samples[0]["output"] for sample in samples):
-        faults.append("unstable_output")
-    edits = 0
+        faults.add("runtime_failure")
+    outputs = Counter(sample["output"] for sample in samples)
+    if len(outputs) > 1:
+        faults.add("unstable_output")
+    target_numbers = NUMBERS.findall(expected)
+    target_negations = len(NEGATIONS.findall(expected))
+    target_literals = LITERALS.findall(expected)
+    protocol = prediction.get("benchmarkProtocol")
+    deadline_ms = protocol["timeoutSeconds"] * 1000 if isinstance(protocol, dict) and positive_number(protocol.get("timeoutSeconds")) else None
     for sample in samples:
-        output = sample["output"]
-        edits += edit_distance(target_tokens, TOKENS.findall(output))
+        if (sample.get("error") or sample.get("finish_reason") != "stop"
+                or (deadline_ms is not None and sample["latencyMs"] > deadline_ms)):
+            faults.add("runtime_failure")
+    edits = 0
+    # Deterministic repeats usually contain identical text. Score that text
+    # once, weighting its distance by its actual frequency, while every
+    # retained attempt above still contributes status and latency evidence.
+    for output, occurrences in outputs.items():
+        edits += occurrences * edit_distance(target_tokens, TOKENS.findall(output))
         if required_layout is not None and layout_signature(output) != required_layout:
-            faults.append("changed_layout")
+            faults.add("changed_layout")
             layout_exact = False
-        if sample.get("error") or sample.get("finish_reason") != "stop":
-            faults.append("runtime_failure")
         if empty_output(case, output):
-            faults.append("empty_output")
+            faults.add("empty_output")
         # Compare with independent corrected text; a human correction can change raw ASR facts.
-        if NUMBERS.findall(expected) != NUMBERS.findall(output):
-            faults.append("changed_number")
-        if len(NEGATIONS.findall(expected)) != len(NEGATIONS.findall(output)):
-            faults.append("changed_negation")
-        if LITERALS.findall(expected) != LITERALS.findall(output):
-            faults.append("changed_literal")
+        if target_numbers != NUMBERS.findall(output):
+            faults.add("changed_number")
+        if target_negations != len(NEGATIONS.findall(output)):
+            faults.add("changed_negation")
+        if target_literals != LITERALS.findall(output):
+            faults.add("changed_literal")
         for literal in case.get("mustContain", []):
             if literal not in output:
-                faults.append("missing_required_text")
+                faults.add("missing_required_text")
         for literal in case.get("mustNotContain", []):
             if literal in output:
-                faults.append("forbidden_text")
+                faults.add("forbidden_text")
     return {"id": case["id"], "edits": edits / len(samples),
             "tokens": max(1, len(target_tokens)), "latencyMs": prediction["latencyMs"],
             "latenciesMs": [sample["latencyMs"] for sample in samples],
             "layoutExact": layout_exact,
-            "critical": sorted(set(faults)), "exact": not faults and all(sample["output"] == expected for sample in samples)}
+            "critical": sorted(faults), "exact": not faults and len(outputs) == 1 and expected in outputs}
 
 
 def percentile95(values):
@@ -256,9 +373,9 @@ def sign_test(wins, losses):
 def compare(cases, baseline_rows, candidate_rows, min_cases=50, min_improvement=0.02, max_latency_ratio=1.10, dataset_id=None):
     if not cases:
         raise ValueError("no reviewed held-out cases: collect labels before judging candidates")
-    if min_cases < 1 or not math.isfinite(min_improvement) or not 0 < min_improvement < 1:
+    if type(min_cases) is not int or min_cases < 1 or not positive_number(min_improvement) or min_improvement >= 1:
         raise ValueError("positive case count and an improvement fraction between 0 and 1 required")
-    if not math.isfinite(max_latency_ratio) or max_latency_ratio < 1:
+    if not positive_number(max_latency_ratio) or max_latency_ratio < 1:
         raise ValueError("latency ratio must be finite and at least 1")
     baseline, baseline_id, baseline_protocol = predictions_by_id(baseline_rows, cases, dataset_id)
     candidate, candidate_id, candidate_protocol = predictions_by_id(candidate_rows, cases, dataset_id)

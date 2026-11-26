@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import glob
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -35,6 +36,37 @@ LINE_ENDINGS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def strict_json_loads(contents):
+    """Decode an unambiguous UTF-8 JSON value, including nested objects.
+
+    The default decoder silently accepts duplicate keys and non-finite numbers.
+    A duplicate followup key can otherwise erase an Undo from the evidence.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    def reject_constant(_):
+        raise ValueError("non-finite JSON number")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non-finite JSON number")
+        return number
+
+    if isinstance(contents, bytes):
+        contents = contents.decode("utf-8")
+    try:
+        return json.loads(contents, object_pairs_hook=unique_object, parse_constant=reject_constant, parse_float=finite_float)
+    except (RecursionError, OverflowError) as error:
+        raise ValueError("JSON value exceeds the decoder limit") from error
 
 
 def digest(value):
@@ -84,7 +116,7 @@ def read_records(source, diagnostics=None):
         for path in files:
             try:
                 stat = os.stat(path)
-                result[path] = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                result[path] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
             except OSError:
                 diagnostics["sourceReadError"] += 1
         return result
@@ -97,8 +129,8 @@ def read_records(source, diagnostics=None):
                     if not line.strip():
                         continue
                     try:
-                        record = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeError):
+                        record = strict_json_loads(line)
+                    except (ValueError, UnicodeError):
                         diagnostics["invalidJSON"] += 1
                         continue
                     if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not record["id"]:
@@ -117,15 +149,17 @@ def read_records(source, diagnostics=None):
 def valid_record(record):
     if record.get("kind") == "followup" and (not isinstance(record.get("followup"), str) or not record["followup"]):
         return False
-    for key in ("kind", "input", "output", "recordedAt", "followup", "editedText", "targetScope", "feedbackSource", "outcome"):
+    for key in ("kind", "input", "output", "recordedAt", "followup", "editedText", "targetScope", "feedbackSource", "outcome",
+                "app", "audioPath", "audioSHA256", "sourceRecordingID", "recordingID"):
         if record.get(key) is not None and not isinstance(record[key], str):
             return False
     for key in ("settings", "models", "timingsMs"):
         if key in record and not isinstance(record[key], dict):
             return False
-    diff_id = record.get("settings", {}).get("diffID")
-    if diff_id is not None and not isinstance(diff_id, str):
-        return False
+    for key in ("diffID", "audioPath", "audioSHA256", "sourceRecordingID", "recordingID"):
+        value = record.get("settings", {}).get(key)
+        if value is not None and not isinstance(value, str):
+            return False
     for key in ("stages", "decisions"):
         if key in record and (not isinstance(record[key], list) or any(not isinstance(item, dict) for item in record[key])):
             return False
@@ -135,6 +169,11 @@ def valid_record(record):
 def join(records, diagnostics=None):
     diagnostics = diagnostics if diagnostics is not None else Counter()
     runs, followups = {}, []
+    def identity(record):
+        settings = record.get("settings") or {}
+        return (record.get("input"), record.get("kind"), settings.get("diffID"),
+                *(record.get(key) or settings.get(key) for key in ("audioPath", "audioSHA256", "sourceRecordingID", "recordingID")))
+
     for record in records:
         if record.get("kind") == "followup":
             followups.append(record)
@@ -142,8 +181,11 @@ def join(records, diagnostics=None):
             old = runs.get(record["id"])
             if old:
                 diagnostics["duplicateRunID"] += 1
-            conflict = old and (old.get("input"), old.get("kind")) != (record.get("input"), record.get("kind"))
+            conflict = old and identity(old) != identity(record)
             run = dict(record, followups=[])
+            # Raw/imported observations cannot self-certify a reviewed target.
+            # Only apply_labels may attach an independently supplied review.
+            run.pop("reviewedLabel", None)
             if conflict or (old and old.get("conflictingRunID")):
                 run["conflictingRunID"] = True
             runs[record["id"]] = run
@@ -161,15 +203,15 @@ def join(records, diagnostics=None):
         if signature in seen:
             continue
         seen.add(signature)
-        matches = diff_runs.get(followup["id"], [])
-        run = runs.get(followup["id"])
-        if run is None and len(matches) == 1:
-            run = matches[0]
-        if run is None:
+        matches = {run["id"]: run for run in diff_runs.get(followup["id"], [])}
+        if followup["id"] in runs:
+            matches[followup["id"]] = runs[followup["id"]]
+        if len(matches) != 1:
             diagnostics["unmatchedFollowup"] += 1
-            for match in matches:
+            for match in matches.values():
                 match["ambiguousFeedback"] = True
             continue
+        run = next(iter(matches.values()))
         fields = ("followup", "editedText", "recordedAt", "feedbackSource", "targetScope", "schemaVersion")
         run["followups"].append({key: followup[key] for key in fields if key in followup})
     for run in runs.values():
@@ -183,11 +225,15 @@ def apply_labels(runs, path, diagnostics):
         return
     by_id = {run["id"]: run for run in runs}
     seen = set()
+    def identity(stat):
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
     with open(path, encoding="utf-8") as handle:
+        initial = identity(os.fstat(handle.fileno()))
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
                 continue
-            entry = json.loads(line)
+            entry = strict_json_loads(line)
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
                 raise ValueError(f"label line {line_number}: missing id")
             if entry["id"] in seen:
@@ -215,6 +261,8 @@ def apply_labels(runs, path, diagnostics):
                 if any((text in value) != (key == "mustContain") for text in literals):
                     raise ValueError(f"label line {line_number}: {key} contradicts the reviewed target")
             run["reviewedLabel"] = entry
+        if identity(os.fstat(handle.fileno())) != initial or identity(os.stat(path)) != initial:
+            raise ValueError("reviewed-label file changed during export; freeze a complete stable label snapshot and rerun")
 
 
 def stage_text(run, name):
@@ -299,11 +347,19 @@ def split_examples(pairs, registry):
     Connecting an old training group to a held-out group quarantines the component:
     neither a formerly trained text nor its reference can become a clean test case.
     """
-    if registry.get("policy") != SPLIT_POLICY or not isinstance(registry.get("assignments"), dict):
+    if not isinstance(registry, dict) or registry.get("policy") != SPLIT_POLICY or not isinstance(registry.get("assignments"), dict):
         raise ValueError("unsupported split-lock.json; keep the old snapshot and review its split policy")
     assignments = dict(registry["assignments"])
-    if any(value not in {"train", "valid", "test", "quarantine"} for value in assignments.values()):
+    if any(not isinstance(key, str) or not isinstance(value, str) or value not in {"train", "valid", "test", "quarantine"}
+           for key, value in assignments.items()):
         raise ValueError("invalid split assignment")
+    # Recording identity is evidence even when its transcript has no approved
+    # target (or is later retracted). A replay observation can bridge a path and
+    # a recording hash that otherwise look like independent train/test cases.
+    # Capture reviewed target links before conflicts remove their supervision:
+    # ambiguity must not erase evidence of possible held-out contamination.
+    family_links = [(row["inputFingerprint"], fingerprint(row["target"]) if row["trainingEligible"] else None,
+                     row.get("recordingKeys", [])) for row in pairs]
     candidates = [row for row in pairs if row["trainingEligible"]]
     by_input = defaultdict(list)
     for row in candidates:
@@ -331,12 +387,11 @@ def split_examples(pairs, registry):
         raise ValueError("invalid historical split groups")
     for key, group in history.items():
         parent[find(key)] = find(group)
-    for row in candidates:
-        a, b = row["inputFingerprint"], fingerprint(row["target"])
-        root_a, root_b = find(a), find(b)
-        parent[root_a] = root_b
-        for recording_key in row.get("recordingKeys", []):
-            parent[find(recording_key)] = find(a)
+    for source, target, recording_keys in family_links:
+        if target is not None:
+            parent[find(source)] = find(target)
+        for recording_key in recording_keys:
+            parent[find(recording_key)] = find(source)
     components = defaultdict(set)
     for key in parent:
         components[find(key)].add(key)
@@ -379,22 +434,41 @@ def split_examples(pairs, registry):
                       "groups": historical_groups}
 
 
-def write_private(path, contents):
-    """Atomic 0600 replacement, including when an older export had loose permissions."""
+@contextmanager
+def _private_writer(path):
+    """Atomic 0600 replacement; failed serialization leaves the old file intact."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
     fd, temporary = tempfile.mkstemp(prefix=".flow-export-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        with os.fdopen(fd, "wb") as handle:
             os.fchmod(handle.fileno(), 0o600)
-            handle.write(contents)
+            yield handle
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def write_private(path, contents):
+    with _private_writer(path) as handle:
+        handle.write(contents.encode("utf-8"))
+
+
+def write_private_jsonl(path, rows):
+    """Hash and write one row at a time instead of duplicating the whole corpus."""
+    fingerprint = hashlib.sha256()
+    count = 0
+    with _private_writer(path) as handle:
+        for row in rows:
+            encoded = (canonical(row) + "\n").encode("utf-8")
+            handle.write(encoded)
+            fingerprint.update(encoded)
+            count += 1
+    return {"sha256": fingerprint.hexdigest(), "rows": count}
 
 
 @contextmanager
@@ -449,10 +523,10 @@ def _export_locked(source, out, since=None, labels=None):
         locked_content = lock_path.read_bytes().decode("utf-8")
         manifest_path = out / "manifest.json"
         if manifest_path.exists():
-            prior = json.loads(manifest_path.read_bytes().decode("utf-8"))
+            prior = strict_json_loads(manifest_path.read_bytes())
             if digest(locked_content) != prior.get("splitLockSHA256"):
                 raise ValueError("split-lock hash mismatch; restore the complete previous snapshot before exporting")
-        registry = json.loads(locked_content)
+        registry = strict_json_loads(locked_content)
     else:
         # Losing the lock after training is unsafe; never silently reshuffle an existing export.
         if (out / "manifest.json").exists():
@@ -480,9 +554,7 @@ def _export_locked(source, out, since=None, labels=None):
                   for split in ("train", "valid", "test")})
     hashes = {}
     for name, rows in files.items():
-        content = "".join(canonical(row) + "\n" for row in rows)
-        write_private(out / name, content)
-        hashes[name] = {"sha256": digest(content), "rows": len(rows)}
+        hashes[name] = write_private_jsonl(out / name, rows)
     write_private(lock_path, canonical(registry) + "\n")
     manifest = {"schemaVersion": EXPORT_SCHEMA, "createdAt": datetime.now(timezone.utc).isoformat(),
                 "splitPolicy": SPLIT_POLICY, "files": hashes, "diagnostics": dict(diagnostics),
