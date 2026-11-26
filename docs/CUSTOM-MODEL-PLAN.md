@@ -2,6 +2,8 @@
 
 Research checked **26 November 2026**. This is an implementation and experiment plan, not a trained model or a claim of measured improvement. Training estimates below assume a local **RTX 5080 with 16 GB VRAM**; deployment measurements must be taken on the **M1 Max with 32 GB memory**.
 
+For the staged implementation, exact observation/label contract, experiment configurations, commands, hardware pilots and release gates, follow [CUSTOM-MODEL-EXPERIMENTS.md](CUSTOM-MODEL-EXPERIMENTS.md). This research explains the model choice; that runbook is the working plan to execute it.
+
 ## Recommendation
 
 Build a small **candidate ranker that understands speech-recognition errors**, with an explicit option to leave the word alone. Keep sentence cleanup as a separate task. First calibrate the existing scorers on reviewed Flow examples; then compare a custom 2–5M parameter ranker against them. Fine-tune the existing S1-mini or DOSE1 cleanup route separately if sentence-level errors dominate.
@@ -97,6 +99,8 @@ Keep a versioned experiment manifest with code revision, dataset/split hashes, m
 ## What still needs implementation and hardware validation
 
 The repository has run logging, dataset builders, replay tooling and several model routes. It does not currently include a trained custom ranker, a portable CUDA trainer for it, its tokenizer/export contract, or a verified native benchmark for these proposed models. The private training recordings and installed DOSE1 artifacts are not available in this checkout. This research has not trained or swapped any model.
+
+Candidate collection now has a concrete first step: `WordDecisionEvidence.swift` and `FlowRunLog.swift` retain bounded, validated candidate observations from TinyFix, sound-alike and low-confidence checks, including decisions to keep the original. The records include exact source spans, context, alternatives, scores, rule features and thresholds. They remain observations; the model's selected index is never a gold label. Independent candidate review, feature preparation and the trainer are still required. The runbook describes these remaining interfaces.
 
 TinyNext v2 publishes float32 safetensors, tokenizer and training/export scripts. [9] TinyFix publishes its current quantized model and training script, but the root file listing does not include a matching full-precision training checkpoint. Separate `letters-v2`/`letters-v3` experiments include PyTorch files; they are not established drop-in replacements. [10] The upstream TinyFix training script also has a hard-coded remote corpus cache and upload calls. Localize its data/checkpoint handling before using private Flow examples. [11]
 

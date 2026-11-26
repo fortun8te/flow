@@ -11,12 +11,18 @@ import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import json
+import importlib.util
 import math
 from pathlib import Path
 import re
 import statistics
 
 from export_flow_runs import EXPORT_SCHEMA, SPLIT_POLICY, canonical, case_hash, digest, write_private
+
+_distance_spec = importlib.util.spec_from_file_location("flow_text_metrics", Path(__file__).resolve().parents[1] / "bench/text_metrics.py")
+_distance_module = importlib.util.module_from_spec(_distance_spec)
+_distance_spec.loader.exec_module(_distance_module)
+edit_distance = _distance_module.edit_distance
 
 TOKENS = re.compile(r"\w+|[^\w\s]|\n", re.UNICODE)
 NEGATIONS = re.compile(r"\b(?:no|not|never|none|nothing|nobody|neither|nor|without|cannot|\w+n['’]t)\b", re.I)
@@ -82,9 +88,33 @@ def load_dataset(directory, split):
     return manifest, rows
 
 
+def positive_number(value):
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
+def validate_protocol(protocol, protocol_id):
+    if not isinstance(protocol, dict) or protocol_id != digest(canonical(protocol)):
+        raise ValueError("benchmark protocol hash mismatch")
+    count, repetitions = protocol.get("warmupRequests"), protocol.get("repetitions")
+    if protocol.get("schemaVersion") != 2 or type(count) is not int or not 0 <= count <= 5:
+        raise ValueError("unsupported benchmark warmup protocol")
+    if type(repetitions) is not int or not 1 <= repetitions <= 50:
+        raise ValueError("benchmark repetitions must be between 1 and 50")
+    if protocol.get("concurrency") != 1 or protocol.get("order") != "dataset-rounds":
+        raise ValueError("benchmark must use sequential complete-workload rounds")
+    if not positive_number(protocol.get("timeoutSeconds")) or type(protocol.get("maxTokens")) is not int or protocol["maxTokens"] < 1:
+        raise ValueError("benchmark request limits must be finite and positive")
+
+
+def prediction_attempts(row):
+    # A manually supplied one-shot prediction remains useful for quality inspection.
+    # Repeated timing and engine tuning require the actual retained samples.
+    return row.get("attempts") if row.get("attempts") is not None else [row]
+
+
 def predictions_by_id(rows, cases, dataset_id=None):
     expected = {case["id"]: case for case in cases}
-    predictions, models = {}, set()
+    predictions, models, protocols = {}, set(), set()
     for row in rows:
         identifier = row.get("id")
         if not isinstance(identifier, str) or identifier not in expected:
@@ -98,54 +128,85 @@ def predictions_by_id(rows, cases, dataset_id=None):
         if not isinstance(row.get("output"), str):
             raise ValueError("prediction output must be a string, including failures")
         latency = row.get("latencyMs")
-        if isinstance(latency, bool) or not isinstance(latency, (int, float)) or not math.isfinite(latency) or latency <= 0:
+        if not positive_number(latency):
             raise ValueError("prediction latencyMs must be finite and positive")
         model = row.get("modelID")
         if not isinstance(model, str) or not model.strip():
             raise ValueError("prediction modelID must identify weights, prompt and configuration")
         models.add(model)
+        protocol = row.get("benchmarkProtocol")
+        protocol_id = row.get("benchmarkProtocolID")
+        if protocol is not None:
+            validate_protocol(protocol, protocol_id)
+            if row.get("warmupSucceeded") is not (protocol["warmupRequests"] > 0):
+                raise ValueError("benchmark warmup calibration disagrees with its protocol")
+        elif protocol_id is not None:
+            raise ValueError("benchmark protocol content is missing")
+        samples = row.get("attempts")
+        if samples is not None:
+            if protocol is None or not isinstance(samples, list) or len(samples) != protocol["repetitions"]:
+                raise ValueError("prediction attempts must match the declared repetition count")
+            for index, sample in enumerate(samples):
+                if not isinstance(sample, dict) or sample.get("id") != identifier or sample.get("caseHash") != row["caseHash"]:
+                    raise ValueError("attempt does not belong to the frozen prediction case")
+                if type(sample.get("sampleIndex")) is not int or sample["sampleIndex"] != index:
+                    raise ValueError("missing, duplicate or reordered attempt index")
+                if not isinstance(sample.get("output"), str) or not positive_number(sample.get("latencyMs")):
+                    raise ValueError("every attempted request requires text output and measured positive latency")
+                for key in ("promptTokens", "completionTokens"):
+                    if sample.get(key) is not None and (type(sample[key]) is not int or sample[key] < 0):
+                        raise ValueError("usage token counts must be nonnegative integers or unavailable")
+            if row["output"] != samples[0]["output"] or row.get("finish_reason") != samples[0].get("finish_reason"):
+                raise ValueError("prediction header must retain the first attempt's output and finish status")
+            if not math.isclose(latency, statistics.median(sample["latencyMs"] for sample in samples), rel_tol=1e-12):
+                raise ValueError("prediction header latency must be the median of all retained attempts")
+        elif protocol is not None and protocol["repetitions"] != 1:
+            raise ValueError("repeated predictions require every attempt")
+        protocols.add(protocol_id)
         predictions[identifier] = row
     if predictions.keys() != expected.keys():
         raise ValueError("missing predictions: compare exactly the same complete case set")
     if len(models) != 1:
         raise ValueError("each prediction file must identify exactly one candidate configuration")
-    return predictions, next(iter(models))
-
-
-def edit_distance(left, right):
-    previous = list(range(len(right) + 1))
-    for i, token in enumerate(left, 1):
-        current = [i]
-        for j, other in enumerate(right, 1):
-            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (token != other)))
-        previous = current
-    return previous[-1]
+    if len(protocols) != 1:
+        raise ValueError("prediction file mixes different timing protocols")
+    return predictions, next(iter(models)), next(iter(protocols))
 
 
 def score(case, prediction):
-    output, expected = prediction["output"], case["target"]
-    source_tokens, target_tokens = TOKENS.findall(output), TOKENS.findall(expected)
+    expected = case["target"]
+    target_tokens = TOKENS.findall(expected)
+    samples = prediction_attempts(prediction)
     faults = []
-    if prediction.get("error") or prediction.get("finish_reason") in {"length", "timeout", "cancelled", "error"}:
+    if prediction.get("error"):
         faults.append("runtime_failure")
-    if not output.strip():
-        faults.append("empty_output")
-    # Compare with independent corrected text; a legitimate human correction can change the raw ASR facts.
-    if NUMBERS.findall(expected) != NUMBERS.findall(output):
-        faults.append("changed_number")
-    if len(NEGATIONS.findall(expected)) != len(NEGATIONS.findall(output)):
-        faults.append("changed_negation")
-    if LITERALS.findall(expected) != LITERALS.findall(output):
-        faults.append("changed_literal")
-    for literal in case.get("mustContain", []):
-        if literal not in output:
-            faults.append("missing_required_text")
-    for literal in case.get("mustNotContain", []):
-        if literal in output:
-            faults.append("forbidden_text")
-    return {"id": case["id"], "edits": edit_distance(target_tokens, source_tokens),
+    if any(sample["output"] != samples[0]["output"] for sample in samples):
+        faults.append("unstable_output")
+    edits = 0
+    for sample in samples:
+        output = sample["output"]
+        edits += edit_distance(target_tokens, TOKENS.findall(output))
+        if sample.get("error") or sample.get("finish_reason") != "stop":
+            faults.append("runtime_failure")
+        if not output.strip():
+            faults.append("empty_output")
+        # Compare with independent corrected text; a human correction can change raw ASR facts.
+        if NUMBERS.findall(expected) != NUMBERS.findall(output):
+            faults.append("changed_number")
+        if len(NEGATIONS.findall(expected)) != len(NEGATIONS.findall(output)):
+            faults.append("changed_negation")
+        if LITERALS.findall(expected) != LITERALS.findall(output):
+            faults.append("changed_literal")
+        for literal in case.get("mustContain", []):
+            if literal not in output:
+                faults.append("missing_required_text")
+        for literal in case.get("mustNotContain", []):
+            if literal in output:
+                faults.append("forbidden_text")
+    return {"id": case["id"], "edits": edits / len(samples),
             "tokens": max(1, len(target_tokens)), "latencyMs": prediction["latencyMs"],
-            "critical": sorted(set(faults)), "exact": output == expected}
+            "latenciesMs": [sample["latencyMs"] for sample in samples],
+            "critical": sorted(set(faults)), "exact": not faults and all(sample["output"] == expected for sample in samples)}
 
 
 def percentile95(values):
@@ -153,10 +214,10 @@ def percentile95(values):
 
 
 def aggregate(rows):
+    latencies = [latency for row in rows for latency in row["latenciesMs"]]
     return {"cases": len(rows), "tokenErrorRate": sum(row["edits"] for row in rows) / sum(row["tokens"] for row in rows),
             "exactRate": sum(row["exact"] for row in rows) / len(rows),
-            "p50Ms": statistics.median(row["latencyMs"] for row in rows),
-            "p95Ms": percentile95([row["latencyMs"] for row in rows]),
+            "latencySamples": len(latencies), "p50Ms": statistics.median(latencies), "p95Ms": percentile95(latencies),
             "criticalCases": sum(bool(row["critical"]) for row in rows),
             "criticalCounts": dict(Counter(fault for row in rows for fault in row["critical"]))}
 
@@ -179,8 +240,8 @@ def compare(cases, baseline_rows, candidate_rows, min_cases=50, min_improvement=
         raise ValueError("positive case count and an improvement fraction between 0 and 1 required")
     if not math.isfinite(max_latency_ratio) or max_latency_ratio < 1:
         raise ValueError("latency ratio must be finite and at least 1")
-    baseline, baseline_id = predictions_by_id(baseline_rows, cases, dataset_id)
-    candidate, candidate_id = predictions_by_id(candidate_rows, cases, dataset_id)
+    baseline, baseline_id, baseline_protocol = predictions_by_id(baseline_rows, cases, dataset_id)
+    candidate, candidate_id, candidate_protocol = predictions_by_id(candidate_rows, cases, dataset_id)
     if baseline_id == candidate_id:
         raise ValueError("candidate and baseline must have distinct immutable configuration identities")
     before, after = [], []
@@ -208,6 +269,9 @@ def compare(cases, baseline_rows, candidate_rows, min_cases=50, min_improvement=
     improvement = (a["tokenErrorRate"] - b["tokenErrorRate"]) / a["tokenErrorRate"] if a["tokenErrorRate"] else 0.0
     probability = sign_test(grouped_wins, grouped_losses)
     gates = {"enoughIndependentCases": len(groups) >= min_cases,
+             "matchedTimingProtocol": baseline_protocol is not None and baseline_protocol == candidate_protocol
+                                      and all(row.get("warmupSucceeded") is True for row in baseline.values())
+                                      and all(row.get("warmupSucceeded") is True for row in candidate.values()),
              "qualityImproved": improvement >= min_improvement,
              "pairedEvidence": probability <= 0.05,
              "noCriticalFailures": b["criticalCases"] == 0,
@@ -228,6 +292,7 @@ def compare(cases, baseline_rows, candidate_rows, min_cases=50, min_improvement=
                                     for item in slices.values())
     return {"schemaVersion": 1, "eligibleForReview": all(gates.values()), "promoted": False,
             "baselineID": baseline_id, "candidateID": candidate_id, "rollbackCandidateID": baseline_id,
+            "baselineProtocolID": baseline_protocol, "candidateProtocolID": candidate_protocol,
             "policy": {"minIndependentCases": min_cases, "minRelativeImprovement": min_improvement,
                        "maxP95LatencyRatio": max_latency_ratio, "maxOneSidedSignP": 0.05},
             "gates": gates, "baseline": a, "candidate": b, "relativeImprovement": improvement,

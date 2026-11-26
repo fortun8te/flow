@@ -43,8 +43,10 @@ def case(identifier, text="The violet kettle is on shelf 2.", kind="dictation"):
 
 
 def prediction(row, model="baseline-sha+prompt-v1", output=None, latency=100):
+    protocol = replay.benchmark_protocol()
     return {"id": row["id"], "caseHash": row["caseHash"], "modelID": model,
-            "output": row["target"] if output is None else output, "latencyMs": latency}
+            "output": row["target"] if output is None else output, "latencyMs": latency, "finish_reason": "stop",
+            "benchmarkProtocol": protocol, "benchmarkProtocolID": export.digest(export.canonical(protocol)), "warmupSucceeded": True}
 
 
 class LearningExportTests(unittest.TestCase):
@@ -523,6 +525,84 @@ class HillclimbGateTests(unittest.TestCase):
 
 
 class LocalReplayTests(unittest.TestCase):
+    def test_repeated_replay_uses_workload_rounds_and_retains_slow_failed_attempt(self):
+        cases = [case("one"), case("two")]
+        order = []
+
+        def invoke(row):
+            order.append(row["id"])
+            failed = len(order) == 3
+            return {"id": row["id"], "caseHash": row["caseHash"], "output": row["target"],
+                    "error": "timeout" if failed else None, "finish_reason": "timeout" if failed else "stop",
+                    "latencyMs": 1000 if failed else 10}
+
+        rows = replay.replay_cases(cases, invoke, replay.benchmark_protocol(repetitions=3), "candidate", "dataset")
+        self.assertEqual(order, ["one", "two", "one", "two", "one", "two"])
+        self.assertEqual(rows[0]["error"], "attempt-failed")
+        self.assertEqual(len(rows[0]["attempts"]), 3)
+        hill.predictions_by_id(rows, cases, "dataset")
+        result = hill.aggregate([hill.score(case, row) for case, row in zip(cases, rows)])
+        self.assertEqual(result["p95Ms"], 1000)
+        self.assertEqual(result["latencySamples"], 6)
+        self.assertEqual(result["criticalCases"], 1)
+        self.assertEqual(result["exactRate"], 0.5)
+
+    def test_prefix_template_options_cache_and_actual_usage_are_preserved(self):
+        requests = []
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(json.loads(request.data))
+                return io.BytesIO(json.dumps({"choices": [{"message": {"content": "Violet kettle."}, "finish_reason": "stop"}],
+                                              "usage": {"prompt_tokens": 12, "completion_tokens": 4}}).encode())
+
+        c = case("one")
+        result = replay.request_case(c, "http://localhost/v1/chat/completions", "local", "Edit.", 1, 100,
+                                     Opener(), "[Styling: semi-formal]\n", {"enable_thinking": False}, "off")
+        self.assertEqual(requests[0]["messages"][1]["content"], "[Styling: semi-formal]\n" + c["input"])
+        self.assertEqual(requests[0]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertIs(requests[0]["cache_prompt"], False)
+        self.assertEqual((result["promptTokens"], result["completionTokens"]), (12, 4))
+
+    def test_missing_or_invalid_usage_is_unavailable_and_bad_json_shape_is_failure(self):
+        class Opener:
+            def __init__(self, value):
+                self.value = value
+
+            def open(self, request, timeout):
+                return io.BytesIO(json.dumps(self.value).encode())
+
+        for usage in (None, {"completion_tokens": True}, {"completion_tokens": -1}, {"completion_tokens": "4"}):
+            result = replay.request_case(case("one"), "http://localhost/v1/chat/completions", "local", "Edit.", 1, 100,
+                Opener({"choices": [{"message": {"content": "Violet kettle."}, "finish_reason": "stop"}], "usage": usage}))
+            self.assertIsNone(result["completionTokens"])
+        result = replay.request_case(case("one"), "http://localhost/v1/chat/completions", "local", "Edit.", 1, 100, Opener([]))
+        self.assertEqual(result["error"], "ValueError")
+
+    def test_unknown_finish_empty_reply_and_overdue_reply_are_failures(self):
+        class Opener:
+            def __init__(self, output, reason):
+                self.output, self.reason = output, reason
+
+            def open(self, request, timeout):
+                return io.BytesIO(json.dumps({"choices": [{"message": {"content": self.output}, "finish_reason": self.reason}]}).encode())
+
+        for output, reason in (("Violet kettle.", None), (" ", "stop")):
+            row = replay.request_case(case("one"), "http://localhost/v1/chat/completions", "local", "Edit.", 1, 100, Opener(output, reason))
+            self.assertTrue(row["error"])
+        with patch.object(replay.time, "perf_counter", side_effect=[0, 2]):
+            row = replay.request_case(case("one"), "http://localhost/v1/chat/completions", "local", "Edit.", 1, 100, Opener("Violet kettle.", "stop"))
+        self.assertEqual(row["finish_reason"], "timeout")
+        self.assertEqual(row["latencyMs"], 2000)
+
+    def test_zero_warmup_cannot_claim_calibrated_timing(self):
+        c = case("one")
+        p = prediction(c)
+        p["benchmarkProtocol"] = replay.benchmark_protocol(warmup_requests=0)
+        p["benchmarkProtocolID"] = export.digest(export.canonical(p["benchmarkProtocol"]))
+        with self.assertRaisesRegex(ValueError, "warmup calibration"):
+            hill.predictions_by_id([p], [c])
+
     def test_only_explicit_loopback_endpoints_are_allowed(self):
         for url in ("https://example.com/v1/chat/completions", "file:///tmp/example",
                     "http://127.0.0.1.example.com/v1/chat/completions", "http://user:password@localhost/v1/chat/completions",

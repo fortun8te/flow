@@ -77,7 +77,7 @@ This catches exact/normalized overlap, not all semantic paraphrases or overlap w
 
 ### Replay a candidate locally
 
-`scripts/run_flow_candidate.py` replays the frozen reviewed cases against an already-running local OpenAI-compatible cleanup server. It sends only the raw input and the supplied system prompt, never the reviewed target. It does not launch a server, install weights, change Flow settings, or retry a failed request. Only loopback endpoints are allowed; HTTP redirects and proxy routing are disabled.
+`scripts/run_flow_candidate.py` replays the frozen reviewed cases against an already-running local OpenAI-compatible cleanup server. It sends the raw input, the supplied system prompt, and any explicit user prefix, never the reviewed target. It does not launch a server, install weights, change Flow settings, or retry a failed request. Only loopback endpoints are allowed; HTTP redirects and proxy routing are disabled.
 
 ```sh
 python3 scripts/run_flow_candidate.py \
@@ -86,13 +86,18 @@ python3 scripts/run_flow_candidate.py \
   --model local-cleanup \
   --artifact "$HOME/models/baseline.gguf" \
   --prompt "$HOME/flow-train/cleanup-system.txt" \
-  --runtime-id "server-build-EXACT; quant-Q8; Mac-model-EXACT; flags-EXACT" \
+  --runtime-id "server-build-EXACT; quant-Q8; flags-EXACT" \
+  --environment-id "Mac-model-EXACT; chip-EXACT; RAM-EXACT; OS-EXACT; power-EXACT" \
   --out "$HOME/flow-train/baseline.jsonl"
 ```
 
-Load the candidate using your normal local engine, then repeat with its actual artifact, prompt and runtime identity and a different output path. For sharded models, supply a manifest containing hashes of every shard as `--artifact`. The artifact must match what the server loaded; an HTTP endpoint alone cannot verify that. Use comparable hardware, engine flags, background load and warm/cold state for both runs. Repeat latency measurements before deployment if the budget is close.
+Load the candidate using your normal local engine, then repeat with its actual artifact, prompt and runtime identity and a different output path. For sharded models, supply a manifest containing hashes of every shard and tokenizer/configuration file as `--artifact`. The artifact must match what the server loaded; an HTTP endpoint alone cannot verify that. Use comparable hardware, engine flags, and background load for both runs.
 
-Every prediction records the immutable configuration digest, case hash, output, measured latency and any failure. The configuration digest covers the supplied artifact, prompt, runtime identity, temperature, token limit and timeout. The companion manifest records the complete dataset and prediction-file hashes. Timeout, truncated or malformed replies stay in the output as failures; they are not dropped from the denominator. These timings cover the HTTP cleanup call, not the complete ASR-to-paste path.
+Request templates are explicit. `--user-prefix-file FILE` prepends the file's exact UTF-8 contents, including its newline; `--chat-template-kwargs FILE` sends a JSON object to servers that support that field. Verify server support first. The S1 default user input starts with `[Styling: semi-formal] [Structure: prose] [Context: general]` and a newline, and its native chat template disables thinking. Passing only the raw transcript changes that task. Supplying the prefix alone still does not reproduce native S1: this runner uses a fixed token budget and does not execute Flow's guards, fallback stages or paste pipeline. Validate an actual candidate through the native application before release.
+
+One authored warmup request runs by default and is recorded separately. `--warmup-requests 0` permits cold inspection, but it cannot pass the calibrated timing gate. A warmup failure clears any previous prediction file at the chosen output and writes a failure manifest. `--repetitions 6` repeats the entire dataset six times in fixed order; it does not pick the fastest or best answer. All attempts are retained, including slow, empty, truncated and failed replies. Repeated output changes count as instability. The comparison's p50/p95 use every measured attempt, including failures, rather than the medians of each case.
+
+Every prediction records the immutable configuration digest, case and dataset hashes, output, measured request latency and any failure. The configuration digest covers the supplied artifact, prompt, exact prefix, template options, runtime/environment identities, runner source, temperature, token limit, timeout and prompt-cache request option. `--environment-id` declares hardware, OS and power regime separately from engine flags. Engine tuning requires that identity to be nonempty and identical in every run; it cannot attest the declaration itself. The companion manifest records the complete dataset/prediction hashes, actual start/end timestamps, warmup evidence and replay protocol. `--cache-prompt on|off|server-default` makes a cache experiment explicit; support and semantics depend on the server. These timings cover nonstreaming HTTP cleanup calls, not the complete ASR-to-paste path. Optional token counts come only from the server's `usage` fields; missing counts remain unavailable.
 
 ### Compare and decide whether to keep a change
 
@@ -107,6 +112,7 @@ python3 scripts/flow_hillclimb.py \
 The comparison fails on stale, duplicate, missing or extra predictions, non-finite latency, mismatched case hashes, mismatched complete dataset identities (including app/settings context), or mixed configuration identities. It measures token-edit distance to the independent target, exact-match rate, paired wins/losses, and p50/p95 latency. Default review eligibility requires all of these:
 
 - At least 50 independent text families, not 50 repeats of one example.
+- Matching replay protocols with successful warmup for both configurations.
 - At least a 2% relative reduction in aggregate token-edit error.
 - A one-sided paired sign-test result at or below 0.05 across independent families.
 - No empty/runtime failures or detected changes to ordered numbers, negation count, URLs, emails, inline code, or the reviewed literal constraints.
@@ -137,6 +143,14 @@ Most of these scripts keep their own configuration at the top of the file. Read 
 ### Benchmark harness (`bench/`)
 
 `bench/flow_bench.py` and the modules beside it benchmark recognition and cleanup engines. `bench/engines.json` lists the engines. The harness finds `llama-server` by name. Tests for the harness are in `bench/test_*.py`.
+
+Scorer version 2 treats an error, empty output, missing/unknown finish reason, token-limit truncation, or invalid timing as a failed call, even if the returned text happens to match the reference. Failed attempts stay in the quality denominator and all-call timing distribution. Tables show failed-call and timing counts, plus separate successful-call timings in saved summary data. A call never attempted after a worker failure has unavailable latency, not an invented zero. A run with any failed calls exits unsuccessfully while preserving its results.
+
+Suite IDs must align exactly: duplicate, extra or missing outputs fail. A run records the exact suite fingerprint, configuration/harness hashes, GGUF/template hashes or every MLX weight shard and tokenizer/configuration file. Rescoring requires the same frozen suite; legacy rows without that fingerprint require a rerun. Summary tables reject older scorer versions so a changed success definition cannot silently look like a model improvement. Optional artifact hash caching uses file identity and nanosecond modification/change times, checks for changes during hashing, and lives outside the repository.
+
+The MLX worker emits a result after every case. Separate load and per-case watchdogs terminate and reap a hung worker, preserve earlier results, and mark the pending/unattempted cases as failures. It reads actual generation finish metadata instead of inferring completion from output length. The harness's exact token edit-distance implementation trims common ends and uses integer bitmasks to reduce Python scoring work; its tests compare against reference dynamic programming, including Unicode and long inputs. This changes evaluation cost without approximating the score.
+
+These single-pass benchmark timings mix first-generation and later work and are labelled uncalibrated. For a proposed engine speed change, use the repeated replay runner with `scripts/flow_engine_tune.py` and the control/candidate/control procedure in [INFERENCE-OPTIMIZATION.md](INFERENCE-OPTIMIZATION.md). That tool verifies the run manifests, workload/model/prompt identity, every attempt, chronology, control stability and exact observed output equivalence. It cannot change the installed engine. Its six-sample minimum is pilot screening; nearest-rank p95 with six samples is the maximum, so noisy or near-budget results need longer runs. Whole-request completion throughput uses reported completion tokens divided by request time; it is not decode TPS or a TTFT measurement.
 
 ## What is not in the repository
 

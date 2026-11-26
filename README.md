@@ -103,6 +103,8 @@ Run records are local and can contain transcript text. [Data and privacy](docs/D
 - [Data and privacy](docs/DATA.md) covers local storage, settings, and what leaves the Mac with optional cloud cleanup.
 - [Training and evaluation](docs/TRAINING.md) covers the benchmark and dataset scripts.
 - [Custom model plan](docs/CUSTOM-MODEL-PLAN.md) compares a specialist correction ranker with cleanup fine-tuning, including data needs, training estimates and evaluation gates.
+- [Custom-model experiments](docs/CUSTOM-MODEL-EXPERIMENTS.md) specifies candidate observations, independent labels, first experiments, deployment checks and the pieces still to implement.
+- [Inference optimization](docs/INFERENCE-OPTIMIZATION.md) documents the current cleanup engines and the repeated control/candidate/control speed comparison.
 - [Contributing](CONTRIBUTING.md) covers builds, tests, and the use of invented fixtures.
 
 ## Licence
