@@ -366,6 +366,16 @@ struct PolishTransactionTests {
         #expect(PolishTransaction.expectedFullText(before: "abc", range: NSRange(location: 2, length: 5), replacement: "x") == nil)
     }
 
+    @Test("Opt+1 preserves typed list structure and exact numeric literals")
+    func strictSelectedLayout() {
+        let source = "- Keep 12 files.\n  - Send version 2.4."
+        #expect(OptOneReferee.finalize("- Keep 123 files.\n  - Send version 2.4.", source: source) == nil)
+        #expect(OptOneReferee.finalize("- Keep 12 files.\n- Send version 2.4.", source: source) == nil)
+        #expect(OptOneReferee.finalize(source, source: source) == source)
+        #expect(!OptOneLayout.sameWords("Keep 12 files and folders.", "Keep 123 files folders."))
+        #expect(OptOneLayout.apply(source: source, edited: source) == source)
+    }
+
     @Test("Selections over 6,000 characters are refused; 6,000 exactly is allowed")
     func lengthCap() {
         #expect(!PolishTransaction.isTooLong(String(repeating: "a", count: 6_000)))

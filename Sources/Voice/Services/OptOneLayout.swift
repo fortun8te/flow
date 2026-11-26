@@ -11,11 +11,10 @@ import Foundation
 /// Deterministic and cheap (no model call): a few regex passes over the edited text.
 enum OptOneLayout {
     static func apply(source: String, edited: String) -> String {
-        guard !source.contains(where: \.isNewline), !edited.contains(where: \.isNewline) else { return edited }
-        guard !looksLikeCode(edited) else { return edited }
-        let laidOut = DictationParagraphs.formatDictation(edited)
-        // Only line breaks and list markers may change: the words must be the same.
-        return sameWords(edited, laidOut) ? laidOut : edited
+        guard !looksLikeCode(source), !looksLikeCode(edited) else { return edited }
+        // The deterministic formatter leaves existing list lines, indentation
+        // and fenced blocks alone. It can still lay out each long prose line.
+        return DictationParagraphs.formatDictation(edited)
     }
 
     static func looksLikeCode(_ text: String) -> Bool {
@@ -24,14 +23,17 @@ enum OptOneLayout {
         return semicolons >= 2
     }
 
-    /// Same words in the same order, ignoring list markers ("1.", "-") and spoken ordinals the list replaced.
+    /// Only the exact deterministic layout, or a pure case/whitespace change,
+    /// may disregard enumeration markers. Do not erase all numbers or ordinary
+    /// words such as "one" and "and" when comparing arbitrary drafts.
     static func sameWords(_ a: String, _ b: String) -> Bool {
-        let markers: Set<String> = ["first", "firstly", "second", "secondly", "third", "thirdly", "fourth", "fifth",
-                                    "sixth", "seventh", "eighth", "ninth", "lastly", "finally", "number", "one", "two",
-                                    "three", "four", "five", "six", "seven", "eight", "nine", "and", "of", "all"]
-        func words(_ s: String) -> [String] {
-            s.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "’" })
-                .map(String.init).filter { Int($0) == nil }
+        if a == b { return true }
+        func words(_ text: String) -> [String] {
+            text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "’" }).map(String.init)
+        }
+        return words(a) == words(b) || (!looksLikeCode(a) && DictationParagraphs.formatDictation(a) == b)
+    }
+}
         }
         let x = words(a).filter { !markers.contains($0) }, y = words(b).filter { !markers.contains($0) }
         return x == y

@@ -454,9 +454,11 @@ final class TypoRepair: @unchecked Sendable {
         // Words the writer typed in lowercase: a model capitalising one ("Odenst") does not make it a name.
         let typedLowercase = Set((typedText ?? "").split(whereSeparator: { !$0.isLetter && $0 != "'" })
             .map(String.init).filter { $0 == $0.lowercased() })
-        guard let lex = lexicon(wait: wait) else { return (text, []) }
-        // User typo pairs first: exact and cheap, before the model and as the fallback after it.
+        // Exact dictionary rules do not depend on an optional frequency
+        // lexicon being installed. Apply them even on a cold/model-free path.
+        guard !Task.isCancelled else { return (text, []) }
         let text = Self.snapPhrases(Self.applyPersonalDictionary(text), userTerms: protectedTerms)
+        guard let lex = lexicon(wait: wait) else { return (text, []) }
         let scorer = useLM ? TinyNextScorer.shared.ready(wait: wait) : nil
         let userKeys = userKeyMap(protectedTerms)
         let w = Self.weights
@@ -559,7 +561,7 @@ final class TypoRepair: @unchecked Sendable {
             return t.count >= 2
         }
         for i in tokens.indices {
-            if let deadline, ContinuousClock.now >= deadline { break }
+            if Task.isCancelled || (deadline.map { ContinuousClock.now >= $0 } ?? false) { break }
             guard !done.contains(i), suspicious(i) else { continue }
             let t = tokens[i]
             let l = t.lowercased().replacingOccurrences(of: "’", with: "'")
@@ -768,7 +770,10 @@ final class TypoRepair: @unchecked Sendable {
                 let word = String(chars[i..<j])
                 if !word.contains("://"), !word.contains("_"), !word.hasPrefix("www."), c.isLowercase,
                    !(word.count > 1 && word.dropFirst().contains(where: \.isUppercase)) {
-                    chars[i] = Character(c.uppercased())
+                    // Some Unicode uppercase mappings expand (ß -> SS).
+                    // Character(String) traps on those; preserve the original.
+                    let upper = c.uppercased()
+                    if upper.count == 1, let letter = upper.first { chars[i] = letter }
                 }
                 atStart = false
             } else if c == "." || c == "!" || c == "?" {

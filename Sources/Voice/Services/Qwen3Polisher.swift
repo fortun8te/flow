@@ -1522,7 +1522,7 @@ final class Qwen3Polisher {
                         onLoading: ((Bool) -> Void)? = nil,
                         onDraft: (() -> Void)? = nil) async -> (text: String?, preview: Bool) {
         if TypoFixModel.isAvailable {
-            return await typoFixShortcut(original, deadline: deadline, onLoading: onLoading)
+            return await typoFixShortcut(original, deadline: deadline, onLoading: onLoading, onDraft: onDraft)
         }
         let core = await polishShortcutCore(original, deadline: deadline, onLoading: onLoading, onDraft: onDraft)
         guard !Task.isCancelled else { return core }
@@ -1542,7 +1542,7 @@ final class Qwen3Polisher {
     /// finishes what is left, and product names snap to their spelling. A cold model never means an
     /// unchanged selection: the deterministic fixes go out instead and the model keeps loading.
     private func typoFixShortcut(_ original: String, deadline: ContinuousClock.Instant?,
-                                 onLoading: ((Bool) -> Void)?) async -> (text: String?, preview: Bool) {
+                                 onLoading: ((Bool) -> Void)?, onDraft: (() -> Void)?) async -> (text: String?, preview: Bool) {
         Self.lastSelectedRejection = nil
         let deadline = deadline ?? ContinuousClock.now + .seconds(PolishTransaction.shortcutBudgetSeconds(for: original))
         let terms = DictationReferee.protectedTerms()
@@ -1566,8 +1566,11 @@ final class Qwen3Polisher {
         if ready, let edited = await model.edit(original, deadline: deadline - .milliseconds(700),
                                                 progress: { PillPolishSignal.post(fraction: $0) }), !Task.isCancelled {
             PillPolishSignal.post(fraction: TypoFixProgress.ceiling)
-            let judged = OptOneReferee.finish(source: original, model: edited, protectedTerms: terms,
-                                              deadline: min(deadline, ContinuousClock.now + .milliseconds(900)))
+            onDraft?()
+            let reviewDeadline = min(deadline, ContinuousClock.now + .milliseconds(900))
+            let judged = await DictationReferee.background {
+                OptOneReferee.finish(source: original, model: edited, protectedTerms: terms, deadline: reviewDeadline)
+            }
             result = judged.text
             if !judged.reverted.isEmpty { print("[VOICE-SELECT] referee kept \(judged.reverted.count) typed group(s)") }
         }
@@ -1576,12 +1579,19 @@ final class Qwen3Polisher {
         if result == nil {
             if ready { Telemetry.log("polish.opt1_model_timeout", properties: ["words": original.split(whereSeparator: \.isWhitespace).count]) }
             if !ready { await model.prepareInBackground() }
-            result = OptOneReferee.deterministic(original, protectedTerms: terms,
-                                                 deadline: min(deadline, ContinuousClock.now + .milliseconds(600)))
+            onDraft?()
+            let repairDeadline = min(deadline, ContinuousClock.now + .milliseconds(600))
+            result = await DictationReferee.background {
+                OptOneReferee.deterministic(original, protectedTerms: terms, deadline: repairDeadline)
+            }
         }
-        let snapped = TypoRepair.shared.snapVocabulary(result ?? original, protectedTerms: terms)
-        // Line breaks and lists for one long block (OptOneLayout): rules only, no model call.
-        return (OptOneLayout.apply(source: original, edited: snapped), false)
+        guard !Task.isCancelled else { return (nil, false) }
+        let base = result ?? original
+        let laidOut = await DictationReferee.background {
+            let snapped = TypoRepair.shared.snapVocabulary(base, protectedTerms: terms)
+            return OptOneLayout.apply(source: original, edited: snapped)
+        }
+        return Task.isCancelled ? (nil, false) : (laidOut, false)
     }
 
     private func polishShortcutCore(_ original: String, deadline: ContinuousClock.Instant? = nil,

@@ -3805,8 +3805,11 @@ extension AppDelegate {
                     polishedRaw = proposed
                 }
             }
-            // Same final word pass as dictation: hesitations never reach the field. Nothing left means no change.
-            let polished: String? = polishedRaw.map { DictationFinalPass.apply($0) }.flatMap { $0.isEmpty ? nil : $0 }
+            // Opt+1 edits selected text, not raw microphone audio. A second
+            // dictation-only stutter/filler pass would undo the referee's
+            // preservation of deliberately repeated words or quoted speech.
+            let polished: String? = polishedRaw.map { quick ? $0 : DictationFinalPass.apply($0) }
+                .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
 
             // ESC-cancel checkpoint: an Escape during the call means no replacement, ever.
             guard !Task.isCancelled, self.polishGate.isCurrent(operationID) else { return }

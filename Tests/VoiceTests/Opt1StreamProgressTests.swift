@@ -15,6 +15,20 @@ struct Opt1TypoFixProgressTests {
         }
     }
 
+    @Test("Long single-paragraph selections use all available slots and preserve every byte")
+    func longProseUsesSlots() {
+        let sentence = "Check the backup tomorrow, then send the report to the team. "
+        let text = String(repeating: sentence, count: 36) + "Keep version 2.4."
+        let chunks = TypoFixModel.chunks(text)
+        #expect(chunks.count == 3)
+        #expect(chunks.allSatisfy { !$0.body.isEmpty })
+        #expect(chunks.map { $0.lead + $0.body + $0.trail }.joined() == text)
+        #expect(chunks.map { $0.body.count }.max()! < text.count * 2 / 3)
+        let code = " `" + text + "` "
+        #expect(TypoFixModel.chunks(code).count == 1)
+        #expect(TypoFixModel.chunks("Short request.").count == 1)
+    }
+
     @Test("A streamed reply collects text, stops at [DONE] and keeps the finish reason")
     func streamedReplyCollectsText() throws {
         var stream = StreamedReply()

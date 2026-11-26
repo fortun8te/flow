@@ -80,3 +80,7 @@ S1-mini is used for English recognition normalisation only. It is not a general 
 ### Auxiliary local model recovery
 
 TinyFix, TinyNext and the frequency lexicon may be installed under `~/Library/Application Support/Voice/Models/TinyFix`; bundled vocabulary/tokenizer files are used when absent from the external directory. TinyFix, TinyNext and CTC retry transient load failures after a bounded backoff without relaunching Flow. The run log distinguishes missing/cold auxiliary resources, no candidates, and model-scored candidates. TinyNext bounds activation storage by token rows; Opt+1 uses the selected installed typing model, keeps its server alive during inference, avoids per-chunk tokenization delays, and preserves original text in failed chunks.
+
+### Opt+1 long selections
+
+Long prose is split into at most three contiguous balanced groups at paragraph, sentence, clause or word boundaries, with separators kept outside inference. Short text stays a single request. The progress denominator includes every group before streaming starts, incomplete streams are rejected, and partial runs do not train timing estimates. The copy-edit referee resolves its dictionary once, uses a linear path for unchanged word sequences, bounds unrelated alignment work, and preserves exact numeric literals and existing list prefixes. The CPU referee and layout run off the UI actor. Opt+1 does not run a second speech-only filler/stutter pass on selected text.
