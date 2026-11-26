@@ -19,7 +19,7 @@ Rendered offscreen by FLOW with a sample desktop and generated audio levels.
 This is a source release. Use **macOS 26 or later** and Xcode with the **Swift 6.2** toolchain. Apple silicon is recommended for the on-device Core ML and MLX models.
 
 ```sh
-git clone https://github.com/fortun8te/t5-t5p.git flow-voice
+git clone https://github.com/fortun8te/flow.git flow-voice
 cd flow-voice
 swift build
 ```
