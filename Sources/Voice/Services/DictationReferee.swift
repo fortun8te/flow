@@ -137,6 +137,17 @@ enum DictationReferee {
 
     // MARK: Pipeline entry points
 
+    /// CPU model scoring is independent of the UI actor. Preserve stage order
+    /// but let new recording events and audio UI proceed while the model scores.
+    static func background<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        let task = Task.detached(priority: .userInitiated) { work() }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
     /// Dictation, after the cleanup and the final word pass: fixes spelling homophones (their/there,
     /// its/it's, then/than ...) in English sentences. Never waits for the model; code fields are skipped.
     static func dictationPass(_ text: String, isCode: Bool) -> String {

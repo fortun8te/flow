@@ -489,7 +489,10 @@ class RecordingCoordinator {
                     object: nil,
                     userInfo: ["message": "Couldn't start recording — check microphone access"]
                 )
-                Task { @MainActor in _ = await self.stopRecording() }
+                Task { @MainActor in
+                    guard self.currentSessionId == sessionId else { return }
+                    _ = await self.stopRecording()
+                }
                 return
             }
         }
@@ -498,6 +501,7 @@ class RecordingCoordinator {
         // System audio capture is async so it lives here too.
         vlog("[VOICE-RC] spawning startupTask (async transcription.start)")
         startupTask = Task { @MainActor in
+            guard self.currentSessionId == sessionId, !Task.isCancelled else { return }
             do {
                 try await transcription.start()
                 vlog("[VOICE-RC] transcription.start() OK in task")
@@ -511,14 +515,15 @@ class RecordingCoordinator {
                     object: nil,
                     userInfo: ["message": "Transcription engine not ready — try again in a moment"]
                 )
+                // A stale startup must not stop the next recording or clear its task.
+                guard self.currentSessionId == sessionId else { return }
                 // stopRecording awaits startupTask; this IS that task, so detach first.
                 self.startupTask = nil
                 _ = await self.stopRecording()
                 return
             }
-            guard self.state.isRecording else {
-                vlog("[VOICE-RC] startupTask: state.isRecording flipped false during await — aborting")
-                _ = await transcription.stop()
+            guard self.state.isRecording, self.currentSessionId == sessionId, !Task.isCancelled else {
+                vlog("[VOICE-RC] startupTask: recording ended or was superseded — aborting")
                 return
             }
             if audioSource == "system" {
@@ -534,6 +539,7 @@ class RecordingCoordinator {
                         object: nil,
                         userInfo: ["message": "Couldn't capture system audio — check Screen Recording permission"]
                     )
+                    guard self.currentSessionId == sessionId else { return }
                     self.startupTask = nil
                     _ = await self.stopRecording()
                 }
@@ -551,6 +557,7 @@ class RecordingCoordinator {
     struct ClaimedRecording {
         let audioURL: URL?
         let sessionId: UUID
+        let recordingCounter: UInt64
         let recordingStartTime: Date?
         let startupTask: Task<Void, Never>?
         /// Audio-derived speech-presence signal captured BEFORE the engine was
@@ -640,6 +647,7 @@ class RecordingCoordinator {
         return ClaimedRecording(
             audioURL:           url,
             sessionId:          sid,
+            recordingCounter:   currentRecordingSessionId,
             recordingStartTime: startTime,
             startupTask:        task,
             voicedSeconds:      claimedVoiced,
@@ -672,7 +680,7 @@ class RecordingCoordinator {
         let tCaptureStart: Date
         var tCaptureEnd:    Date? = nil
         var tParakeetDone:  Date? = nil
-        let mySessionId = currentRecordingSessionId  // for log parity
+        let mySessionId = claiming?.recordingCounter ?? currentRecordingSessionId
 
         // Audio-derived speech-presence signal for the anti-hallucination gate.
         // Claimed path: use the snapshot taken before teardown. Normal path:
@@ -797,15 +805,12 @@ class RecordingCoordinator {
         }
         tCaptureEnd = Date()
 
-        // Reset transcription session state (stop() no longer transcribes).
-        _ = await transcription.stop()
+        // Only reset the shared transcription session if we still own it.
+        if currentRecordingSessionId == mySessionId { _ = await transcription.stop() }
 
-        // Capture the session-id-at-entry. If a NEW recording starts before
-        // our transcribe completes, this lets us avoid clobbering shared
-        // `state.*` fields that belong to the new session. We still RETURN
-        // our segments so VoiceApp's pasteChain can paste them in FIFO order
-        // — only the mid-flight UI/state mirroring is suppressed.
-        let entryCounter = currentRecordingSessionId
+        // The counter was captured at synchronous claim, before a new key-down
+        // could take over. Late finishing work still returns its own segments.
+        let entryCounter = mySessionId
         let tag = sessTag(sessionId)
         func isStillActive() -> Bool { currentRecordingSessionId == entryCounter }
         vlog("[VOICE-RC] \(tag) phase=drain-done counter=\(entryCounter)")

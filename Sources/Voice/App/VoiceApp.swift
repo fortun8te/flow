@@ -5893,10 +5893,9 @@ extension AppDelegate: NSWindowDelegate {
 
         recordingStartedAt = nil
         guard wasRecording else {
-            // No active recording — nothing to drain. Make sure we still
-            // tell the engine to stop in case a streaming session is open.
-            print("[VOICE-HK] finishRecording: wasRecording=false, bailing (this is the silent-discard bug if it fires after a real hold)")
-            Task { @MainActor in _ = await coordinator.stopRecording() }
+            // Nothing to claim. An async stop here could stop the next recording.
+            print("[VOICE-HK] finishRecording: wasRecording=false, bailing")
+            coordinator.stopLivePartials()
             return
         }
 
@@ -5956,9 +5955,11 @@ extension AppDelegate: NSWindowDelegate {
                 // Ensure live partials are always cleaned up regardless of
                 // which code path triggered finishRecording (silence timeout,
                 // hotkey, or confirm button — all paths end here).
-                coordinator.stopLivePartials()
-                // Restore the user's saved personality if auto-override applied.
-                if let saved = personalityToRestore {
+                if self.recordingState.recordingSessionID == mySession {
+                    coordinator.stopLivePartials()
+                }
+                // Restore only the personality override owned by this session.
+                if self.recordingState.recordingSessionID == mySession, let saved = personalityToRestore {
                     UserDefaults.standard.set(saved, forKey: "personalityStyle")
                     print("[VOICE-PERSONALITY] restored: \(saved)")
                 }
@@ -6002,8 +6003,9 @@ extension AppDelegate: NSWindowDelegate {
             // paste pipeline runs unconditionally for A's own claimed audio,
             // and A's paste still flows through the pasteChain / pasteOrderAnchor
             // ordering mechanism so A lands before B (chronological order).
-            let iOwnLiveState = (self.recordingState.recordingSessionID == mySession)
-            if !iOwnLiveState {
+            // Re-evaluate after every suspension: another capture can start at any await.
+            func iOwnLiveState() -> Bool { self.recordingState.recordingSessionID == mySession }
+            if !iOwnLiveState() {
                 vlog("[VOICE-RACE] proceeding as background session (not live owner) session=\(mySession) current=\(self.recordingState.recordingSessionID)")
             }
 
@@ -6072,7 +6074,7 @@ extension AppDelegate: NSWindowDelegate {
             // has taken over, currentTranscript / livePartialText now mirror
             // B's in-flight recording — clearing them here would blank B's live
             // preview. A still pastes its own text via pasteChain below.
-            if iOwnLiveState {
+            if iOwnLiveState() {
                 recordingState.currentTranscript = []
                 // Final transcript has landed — clear live preview so partial text
                 // doesn't linger after the real result is pasted.
@@ -6089,7 +6091,7 @@ extension AppDelegate: NSWindowDelegate {
                 // below, so clear it here (only if we still own live state) —
                 // otherwise the NEXT dictation inherits this session's stale
                 // short-clip flag and wrongly skips its own LLM polish.
-                if iOwnLiveState {
+                if iOwnLiveState() {
                     recordingState.skipPolishForCurrent = false
                     recordingState.graniteTranscript = nil
                     recordingState.moonshineTranscript = nil
@@ -6136,7 +6138,7 @@ extension AppDelegate: NSWindowDelegate {
                 // STALE-FLAG GUARD (same rationale as the empty-transcript path):
                 // consume this session's per-clip polish flags before returning so
                 // a stale skipPolishForCurrent can't leak into the next dictation.
-                if iOwnLiveState {
+                if iOwnLiveState() {
                     recordingState.skipPolishForCurrent = false
                     recordingState.graniteTranscript = nil
                     recordingState.moonshineTranscript = nil
@@ -6277,7 +6279,7 @@ extension AppDelegate: NSWindowDelegate {
             let skipPolish: Bool
             let graniteTranscript: String?
             let moonshineTranscript: String?
-            if iOwnLiveState {
+            if iOwnLiveState() {
                 skipPolish = recordingState.skipPolishForCurrent
                 recordingState.skipPolishForCurrent = false  // consume the flag
                 graniteTranscript = recordingState.graniteTranscript
@@ -6422,7 +6424,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Surface average confidence to the pill so it can tint its
                 // stroke (white >= 0.55, amber 0.40..<0.55, red < 0.40).
                 // Already on MainActor (enclosing Task), so set directly.
-                if let conf = parakeetAvgConf {
+                if iOwnLiveState(), let conf = parakeetAvgConf {
                     self.recordingState.transcriptionConfidence = Double(conf)
                 }
                 let capture = TripleASRCapture(
@@ -6588,7 +6590,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Only hesitations were said ("um"): nothing to paste. Same outcome as no speech.
                 run.update { $0.outcome = "no-speech" }
                 showToast(DictationRecoveryRules.emptyTranscriptMessage(mic: coordinator.audioCapture.activeMicrophoneName))
-                if iOwnLiveState {
+                if iOwnLiveState() {
                     recordingState.skipPolishForCurrent = false
                     recordingState.graniteTranscript = nil
                     recordingState.moonshineTranscript = nil
@@ -6598,14 +6600,23 @@ extension AppDelegate: NSWindowDelegate {
             // Real-word pass (tinyfix): their/there, its/it's, then/than in English sentences. Off with cleanup.
             if polishEnabledByUser && cleanupForTask != "none" {
                 let started = CFAbsoluteTimeGetCurrent()
-                finalText = DictationReferee.dictationPass(finalText, isCode: polishContext == .code)
+                let input = finalText
+                let isCode = polishContext == .code
+                finalText = await DictationReferee.background {
+                    DictationReferee.dictationPass(input, isCode: isCode)
+                }
+                guard !Task.isCancelled, !recordingState.isCancelled(for: mySession) else { return }
                 run.stage("tinyfix", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000))
             }
             // tinynext recheck of Parakeet's low-confidence words: a word changes only when a near word reads
             // clearly better in context (LowConfidenceRecheck). Off with cleanup and in code. Falls back to text.
             if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code {
                 let started = CFAbsoluteTimeGetCurrent()
-                let recheck = LowConfidenceRecheck.recheck(finalText, suspects: suspectWords, protectedTerms: userVocab)
+                let input = finalText
+                let recheck = await DictationReferee.background {
+                    LowConfidenceRecheck.recheck(input, suspects: suspectWords, protectedTerms: userVocab)
+                }
+                guard !Task.isCancelled, !recordingState.isCancelled(for: mySession) else { return }
                 finalText = recheck.text
                 for change in recheck.changes {
                     run.decision("tinynext", "\(change.original) -> \(change.replacement)",
@@ -6671,7 +6682,7 @@ extension AppDelegate: NSWindowDelegate {
             // represent the MOST RECENT dictation. If B owns the session, B is
             // the most recent — an older background session A must not overwrite
             // these with its stale numbers. Gate on ownership.
-            if iOwnLiveState {
+            if iOwnLiveState() {
                 recordingState.lastDictationWordCount = wordCount
                 recordingState.lastDictationDurationSeconds = durationSeconds
                 recordingState.lastDictationWPM = wpm

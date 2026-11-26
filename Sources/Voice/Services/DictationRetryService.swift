@@ -50,10 +50,21 @@ enum DictationRetryService {
         case .failure(let failure): return .failure(failure)
         }
 
+        // Prepare the independent models while the recognizer loads/decodes audio.
+        let cleanupLevel = CleanupLevel.current
+        let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
+        let useAssistants = cleanupLevel != .none && polishEnabled
+        if useAssistants {
+            RealWordFixer.shared.prewarm()
+            TypoRepair.shared.prewarm()
+            Task(priority: .utility) { await DraftDecisionGate.prewarmIfEnabled() }
+        }
+
         // Same patience as "Transcribe now" on a meeting: up to about 10 s.
         var waited = 0
         while !transcription.isReady && waited < 20 {
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            do { try await Task.sleep(nanoseconds: 500_000_000) }
+            catch { return .failure(.transcription("Cancelled")) }
             waited += 1
         }
         guard transcription.isReady else { return .failure(.modelNotReady) }
@@ -72,20 +83,33 @@ enum DictationRetryService {
         case nil: break
         }
         let formatted = prepared.command.text
-        let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
         var finalText = formatted
-        if CleanupLevel.current != .none && polishEnabled {
+        if useAssistants {
             let suspects = Array(Set(segments.compactMap(\.suspectWords).flatMap { $0 }
                                      + TextFormatter.suspectsForPolish(formatted)))
-            let vocabulary = Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms()))
+            let preferred = ProperNounVocabulary.preferredSpellingTerms()
+            let vocabulary = Array(Set(preferred + ProperNounVocabulary.current() + CombinedDictionary.terms()))
             finalText = await Qwen3Polisher.shared.polish(
                 formatted,
                 suspectWords: suspects.isEmpty ? nil : suspects,
                 userVocabulary: vocabulary.isEmpty ? nil : vocabulary,
-                cleanupLevel: CleanupLevel.current.rawValue,
+                cleanupLevel: cleanupLevel.rawValue,
                 personalityStyle: PersonalityStyle.current.rawValue)
+            if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText) {
+                finalText = formatted
+            }
+            finalText = DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+            let preparedText = finalText
+            let repaired = await DictationReferee.background {
+                let fixed = DictationReferee.dictationPass(preparedText, isCode: false)
+                return LowConfidenceRecheck.recheck(fixed, suspects: suspects, protectedTerms: vocabulary).text
+            }
+            finalText = ProperNounVocabulary.applyPreferredSpelling(repaired, terms: preferred)
+        } else {
+            finalText = DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
         }
-        finalText = DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+        guard !Task.isCancelled else { return .failure(.transcription("Cancelled")) }
+        guard !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .failure(.noSpeech) }
 
         do {
             // Saving also tells Companion that dictations changed (StorageService.onChange).

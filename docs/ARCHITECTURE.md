@@ -52,7 +52,7 @@ The Swift module is called `Voice` for compatibility with older builds; the prod
 
 A dictation is never lost because a model failed. If every cleanup step fails, the formatted transcript is pasted.
 
-On every dictation start, Flow begins optional TinyFix, TinyNext/lexicon and D1 warmups while audio is being captured. A long recording refreshes the idle D1 worker without extending any pending request's watchdog. The CTC encoder is shared between batch and live recognition; a cold live preview starts without vocabulary rescoring rather than waiting for a download. On sectioned dictation, deterministic validation precedes D1 review, and review of one section overlaps cleanup of the next. The original section remains the fallback on a veto. TinyNext low-confidence contexts are scored in bounded batches rather than one model call per suspect.
+On every dictation start, Flow begins optional TinyFix, TinyNext/lexicon and D1 warmups while audio is being captured. A long recording refreshes the idle D1 worker without extending any pending request's watchdog. The CTC encoder is shared between batch and live recognition; a cold live preview starts without vocabulary rescoring rather than waiting for a download. On sectioned dictation, deterministic validation precedes D1 review, and review of one section overlaps cleanup of the next. The original section remains the fallback on a veto. TinyNext low-confidence contexts are scored in bounded batches rather than one model call per suspect. CPU-only word repairs run away from the main UI actor; a newer recording can proceed without an older repair clearing its preview or resetting its transcription session. Saved-dictation retries use the auxiliary reviewers as well.
 
 ## Opt+1 polish
 

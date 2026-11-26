@@ -126,12 +126,13 @@ final class TypoRepair: @unchecked Sendable {
     private let lock = NSLock()
     private var lexiconStorage: Lexicon?
     private var loading = false
+    private var retryLexiconAfter = Date.distantPast
     private var userTerms: [String: String] = [:]   // key -> surface
     private var userTermsLoadedAt = Date.distantPast
 
     func prewarm() {
         lock.lock()
-        let start = lexiconStorage == nil && !loading
+        let start = lexiconStorage == nil && !loading && Date() >= retryLexiconAfter
         if start { loading = true }
         lock.unlock()
         TinyNextScorer.shared.prewarm()
@@ -145,6 +146,9 @@ final class TypoRepair: @unchecked Sendable {
         let lex = url.flatMap { Lexicon(words: $0) }
         lock.lock()
         lexiconStorage = lex
+        // Public builds may not ship words.txt. Back off without disabling
+        // TinyNext or permanently preventing a later installation.
+        retryLexiconAfter = lex == nil ? Date().addingTimeInterval(60) : .distantPast
         loading = false
         lock.unlock()
         return lex
