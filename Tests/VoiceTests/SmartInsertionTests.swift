@@ -174,4 +174,11 @@ final class SmartInsertionTests: XCTestCase {
         XCTAssertEqual(insert("- item\n  continuation", into: "Tail", at: 0), "- item\n  continuation\nTail")
         XCTAssertEqual(insert("- item\n\tcontinuation", into: "Tail", at: 0), "- item\n\tcontinuation\nTail")
     }
+
+    func testPlainMultilineAndBlockPayloadsKeepTheirSentenceFormatting() {
+        XCTAssertEqual(insert("The notes are ready.\nPlease keep them.", into: "Draft:", at: 6, preFormatted: false),
+                       "Draft: The notes are ready.\nPlease keep them.")
+        XCTAssertEqual(insert("- Keep the backup.", into: "Tasks:", at: 6, preFormatted: false),
+                       "Tasks:\n- Keep the backup.")
+    }
 }
