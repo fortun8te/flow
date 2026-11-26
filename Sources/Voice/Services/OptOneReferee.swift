@@ -278,7 +278,7 @@ enum OptOneReferee {
                     length: tw[j1 - 1].range.location + tw[j1 - 1].range.length - tw[j0].range.location)) : ""
                 if j1 > j0 { kept += 1 }
                 if j1 == j0 { sep = "" }   // a stray letter dropped
-            } else if i1 - i0 == j1 - j0, i1 - i0 > 1 {
+            } else if i1 - i0 == j1 - j0, (2...40).contains(i1 - i0) {
                 // Same number of words: judge each pair on its own.
                 var pieces: [String] = []
                 for k in 0..<(i1 - i0) {

@@ -113,6 +113,14 @@ enum PillCardType {
 
 /// Measures wrapped text in lines, memoised like the rest of the pill's measuring.
 enum PillCardText {
+    static func chipWidth(_ title: String, skin: PillSkin) -> CGFloat {
+        let font = PillCardType.nsFont(skin, 11.5, .semibold)
+        let key = "chip|\(font.fontName)|\(font.pointSize)|\(title)"
+        return PillTextMeasure.cached(key) {
+            ceil((title as NSString).size(withAttributes: [.font: font]).width) + 22
+        }
+    }
+
     static func lines(_ text: String, _ font: NSFont, width: CGFloat, maximum: Int = .max) -> Int {
         guard !text.isEmpty, width > 0 else { return 0 }
         let key = "lines|\(font.fontName)|\(font.pointSize)|\(Int(width))|\(text)"
@@ -120,7 +128,7 @@ enum PillCardText {
             let rect = (text as NSString).boundingRect(with: CGSize(width: width, height: 10_000),
                 options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: font])
             let natural = font.ascender - font.descender + font.leading
-            return CGFloat(max(1, Int((rect.height / natural).rounded())))
+            return CGFloat(max(1, Int(ceil(rect.height / max(1, natural)))))
         }
         return min(maximum, Int(count))
     }
@@ -160,18 +168,41 @@ struct PillCardModel: Equatable {
         return min(maxWidth, PillCardStyle.noticeWidth + PillCardStyle.padding * 2)
     }
 
+    func actionRows(skin: PillSkin, contentWidth: CGFloat) -> [[Int]] {
+        var rows: [[Int]] = []
+        var used: CGFloat = 0
+        for (i, action) in actions.enumerated() {
+            let w = PillCardText.chipWidth(action.title, skin: skin)
+            if !rows.isEmpty, used + PillCardStyle.chipGap + w <= contentWidth {
+                rows[rows.count - 1].append(i)
+                used += PillCardStyle.chipGap + w
+            } else {
+                rows.append([i])
+                used = w
+            }
+        }
+        return rows
+    }
+
     func size(skin: PillSkin, dock: PillDockEdge) -> CGSize {
         let width = width(skin: skin, dock: dock)
         let textWidth = width - PillCardStyle.padding * 2 - PillCardStyle.icon - PillCardStyle.gap
         let titleLines = PillCardText.lines(title, PillCardType.nsFont(skin, 13, .semibold),
                                             width: textWidth - PillCardStyle.ringRoom, maximum: 2)
         var text = CGFloat(titleLines) * PillCardStyle.titleLine
-        if notice.badge != nil { text += PillCardStyle.textGap + PillCardStyle.bodyLine }
+        if let badge = notice.badge {
+            let lines = PillCardText.lines(badge, PillCardType.nsFont(skin, 12, .regular), width: textWidth, maximum: 2)
+            text += PillCardStyle.textGap + CGFloat(lines) * PillCardStyle.bodyLine
+        }
         if !body.isEmpty {
             let bodyLines = PillCardText.lines(body.trimmingCharacters(in: .whitespacesAndNewlines), PillCardType.nsFont(skin, 12, .regular), width: textWidth, maximum: 4)
             text += PillCardStyle.textGap + CGFloat(bodyLines) * PillCardStyle.bodyLine
         }
-        if !actions.isEmpty { text += PillCardStyle.chipTop + PillCardStyle.chipHeight }
+        let rows = actionRows(skin: skin, contentWidth: textWidth).count
+        if rows > 0 {
+            text += PillCardStyle.textGap + PillCardStyle.chipTop + CGFloat(rows) * PillCardStyle.chipHeight
+                + CGFloat(rows - 1) * PillCardStyle.chipGap
+        }
         // A little slack: the estimate must never come out shorter than the laid-out text, or the words
         // spill outside the glass (21 Nov 2026: "reconnected it" drawn above the card).
         let height = PillCardStyle.padding * 2 + max(PillCardStyle.icon, text) + 6
@@ -300,6 +331,7 @@ struct PillCardContent: View {
                     .padding(.trailing, PillCardStyle.ringRoom)
                 if let badge = model.notice.badge {
                     Text(badge).font(PillCardType.meta(skin)).foregroundStyle(skin.palette.ink.opacity(0.5))
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
                 if !model.body.isEmpty {
                     Text(model.body.trimmingCharacters(in: .whitespacesAndNewlines)).font(PillCardType.body(skin)).foregroundStyle(skin.onBrightGlass ? Color.black.opacity(0.6) : Color.white.opacity(0.62))
@@ -307,9 +339,16 @@ struct PillCardContent: View {
                         .lineLimit(4).fixedSize(horizontal: false, vertical: true)
                 }
                 if !model.actions.isEmpty {
-                    HStack(spacing: PillCardStyle.chipGap) {
-                        ForEach(Array(model.actions.enumerated()), id: \.offset) { _, action in
-                            PillChip(title: action.title, primary: action.primary, finished: dismiss) { run(action) }
+                    let contentWidth = size.width - PillCardStyle.padding * 2 - PillCardStyle.icon - PillCardStyle.gap
+                    let rows = model.actionRows(skin: skin, contentWidth: contentWidth)
+                    VStack(alignment: .leading, spacing: PillCardStyle.chipGap) {
+                        ForEach(rows.indices, id: \.self) { row in
+                            HStack(spacing: PillCardStyle.chipGap) {
+                                ForEach(rows[row], id: \.self) { i in
+                                    let action = model.actions[i]
+                                    PillChip(title: action.title, primary: action.primary, finished: dismiss) { run(action) }
+                                }
+                            }
                         }
                     }
                     .padding(.top, PillCardStyle.chipTop)

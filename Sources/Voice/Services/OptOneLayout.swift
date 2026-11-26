@@ -2,7 +2,7 @@ import Foundation
 
 /// Layout for an Opt+1 result (22 Nov 2026: "it still really doesn't do proper line breaks").
 ///
-/// - Text he laid out himself (any line break in the selection) keeps exactly that layout.
+/// - Existing structured lines keep their layout; independent plain prose lines can still be laid out.
 /// - One block of 40+ words becomes short paragraphs, and a spoken or typed enumeration ("First, ...
 ///   Second, ...") becomes a lead-in line and one item per line, with the same rules as dictation
 ///   (DictationParagraphs). Under 25 words it always stays one line.
@@ -32,10 +32,5 @@ enum OptOneLayout {
             text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "’" }).map(String.init)
         }
         return words(a) == words(b) || (!looksLikeCode(a) && DictationParagraphs.formatDictation(a) == b)
-    }
-}
-        }
-        let x = words(a).filter { !markers.contains($0) }, y = words(b).filter { !markers.contains($0) }
-        return x == y
     }
 }

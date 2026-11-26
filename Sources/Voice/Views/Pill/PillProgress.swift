@@ -16,30 +16,42 @@ struct PillPolishSignal: Equatable {
     static let notification = Notification.Name("voice.polishProgress")
     static let fractionKey = "fraction"
     static let loadingKey = "loadingModel"
+    static let operationKey = "operationID"
 
     var fraction: Double?
     var loadingModel: Bool
+    var operationID: String?
 
-    init(fraction: Double?, loadingModel: Bool = false) {
+    init(fraction: Double?, loadingModel: Bool = false, operationID: String? = nil) {
         self.fraction = fraction.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
         self.loadingModel = loadingModel
+        self.operationID = operationID
+    }
+
+    func belongs(to activeID: String?) -> Bool {
+        guard let activeID else { return false }
+        return operationID == activeID
     }
 
     init(notification note: Notification) {
         self.init(fraction: note.userInfo?[Self.fractionKey] as? Double,
-                  loadingModel: note.userInfo?[Self.loadingKey] as? Bool ?? false)
+                  loadingModel: note.userInfo?[Self.loadingKey] as? Bool ?? false,
+                  operationID: note.userInfo?[Self.operationKey] as? String)
     }
 
     /// The userInfo the engine posts (no fraction key when progress is unknown).
     var userInfo: [String: Any] {
         var info: [String: Any] = [Self.loadingKey: loadingModel]
         if let fraction { info[Self.fractionKey] = fraction }
+        if let operationID { info[Self.operationKey] = operationID }
         return info
     }
 
     /// Posts on the main queue, where the pill listens. Safe to call from any thread or actor.
     static func post(fraction: Double?, loadingModel: Bool = false) {
-        let info = PillPolishSignal(fraction: fraction, loadingModel: loadingModel).userInfo
+        guard !Task.isCancelled else { return }
+        let info = PillPolishSignal(fraction: fraction, loadingModel: loadingModel,
+                                    operationID: FlowRunCollector.current?.snapshot.id).userInfo
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: notification, object: nil, userInfo: info)
         }
@@ -53,8 +65,12 @@ struct PillPolishState: Equatable {
     var loadingModel = false
 
     mutating func apply(_ signal: PillPolishSignal) {
-        fraction = signal.fraction
-        if let fraction { floor = max(floor, fraction) }
+        if let incoming = signal.fraction {
+            floor = max(floor, incoming)
+            fraction = floor
+        } else if floor == 0 {
+            fraction = nil
+        }
         loadingModel = signal.loadingModel
     }
 }

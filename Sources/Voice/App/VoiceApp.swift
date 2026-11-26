@@ -3716,6 +3716,7 @@ extension AppDelegate {
         let timing = quick ? QuickPolishTiming(words: text.split(whereSeparator: \.isWhitespace).count, at: quickStartedAt) : nil
         recordingState.polishWorkEstimate = timing?.estimate(using: quickPolishTimingHistory)
         let operationID = polishGate.begin()
+        recordingState.polishOperationID = operationID.uuidString
         let evidenceAt = Date()
         let saveEvidence: Bool = if quick, Opt1EvidenceLog.isEnabled, !fnSecureInputOn(), !BackgroundActivityGate.privacyMode,
                                    let element = selection.target.focusedElement {
@@ -7739,11 +7740,13 @@ class RecordingState {
         didSet {
             guard oldValue != isPolishingSelection else { return }
             polishWorkStartedAt = isPolishingSelection ? Date() : nil
+            if !isPolishingSelection { polishOperationID = nil }
             polishWorkStage = .editing
             polishWorkEstimate = nil
         }
     }
     private(set) var polishWorkStartedAt: Date?
+    var polishOperationID: String?
     var polishWorkStage: FlowWorkPresentation.PolishStage = .editing
     var polishWorkEstimate: FlowWorkPresentation.PolishEstimate?
     /// True while a meeting capture session is active (Google Meet / Zoom / Teams).

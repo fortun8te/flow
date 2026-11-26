@@ -199,8 +199,12 @@ enum PillLayoutEngine {
         slots[PillSlot.trail.rawValue] = budFrame(active: budSizes.trail != nil, out: trailRect, body: body, m: m, corner: corner)
 
         // The tip: above (or below, on a top dock), centred or aligned with the body's outer side.
-        let tipSize = look.tip.map { CGSize(width: skin.type.width($0.label + ($0.key.isEmpty ? "" : " " + $0.key), .tooltip)
-                                                + m.tooltipPadding * 2, height: m.tooltipHeight) }
+        let tipSize = look.tip.map {
+            let textWidth = skin.type.width($0.label, .tooltip)
+                + ($0.key.isEmpty ? 0 : 4 + skin.type.width($0.key, .tooltipKey))
+            return CGSize(width: min(max(0, bounds.width - 2 * inset), textWidth + m.tooltipPadding * 2),
+                          height: m.tooltipHeight)
+        }
             ?? CGSize(width: m.tooltipHeight * 2, height: m.tooltipHeight)
         let tipX: CGFloat
         switch dock.inward {

@@ -84,6 +84,20 @@ struct Opt1TypoFixProgressTests {
         #expect(PillPolishSignal(notification: loading) == PillPolishSignal(fraction: nil, loadingModel: true))
     }
 
+    @Test("Late progress belongs only to the operation that produced it")
+    func progressIsScoped() {
+        let signal = PillPolishSignal(fraction: 0.7, operationID: "first")
+        let note = Notification(name: PillPolishSignal.notification, object: nil, userInfo: signal.userInfo)
+        let decoded = PillPolishSignal(notification: note)
+        #expect(decoded.belongs(to: "first"))
+        #expect(!decoded.belongs(to: "second"))
+        #expect(!decoded.belongs(to: nil))
+        var state = PillPolishState()
+        state.apply(decoded)
+        state.apply(PillPolishSignal(fraction: 0.2, operationID: "first"))
+        #expect(state.fraction == 0.7)
+    }
+
     @Test("Estimated tokens without the server stay positive and grow with length")
     func estimatedTokens() {
         #expect(TypoFixModel.estimatedTokens("") == 1)

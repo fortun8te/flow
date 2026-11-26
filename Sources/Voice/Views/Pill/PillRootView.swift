@@ -219,6 +219,7 @@ struct OverlayPillView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: PillPolishSignal.notification)) { note in
             let signal = PillPolishSignal(notification: note)
+            guard state.isPolishingSelection, signal.belongs(to: state.polishOperationID) else { return }
             polishState.apply(signal)
             if var track = glow, track.kind == .polish, !track.isComplete {
                 let now = Date.timeIntervalSinceReferenceDate
