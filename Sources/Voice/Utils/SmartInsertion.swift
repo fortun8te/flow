@@ -23,8 +23,6 @@ enum SmartInsertion {
         let selected = field[edit]
         let left = before.last
         let right = after.first
-        let opening = "([{“‘«‹"
-        let closing = ".,!?;:%)]}”’»›"
         let connector = "-_@/\\"
         let sentenceEnd = ".!?…"
 
@@ -53,9 +51,8 @@ enum SmartInsertion {
             && right.map { !$0.isWhitespace } == true
             && (token.contains("://") || token.contains("@"))
 
-        let closingQuotes = "”’'\")]}»›"
         let lastMeaningful = before.reversed()
-            .drop(while: { isHorizontalSpace($0) || closingQuotes.contains($0) }).first
+            .drop(while: { isHorizontalSpace($0) || isClosingDelimiter($0) || $0 == "\"" || $0 == "'" }).first
         let continuesSentence = lastMeaningful.map { !$0.isNewline && !sentenceEnd.contains($0) } ?? false
         if !preFormatted && !insideLiteral && !insideContraction {
             if messaging || code || (continuesSentence && !body.contains(where: \.isNewline) && !isBlockLine(body)) { body = withoutFinalPeriod(body) }
@@ -77,7 +74,7 @@ enum SmartInsertion {
         let rightContent = after.drop(while: isHorizontalSpace).first
         // Existing sentence/quote punctuation belongs to the replacement's
         // last line; moving it onto an empty line would orphan it.
-        let adjacentClosing = rightContent.map { closing.contains($0) || $0 == "\"" || $0 == "'" } ?? false
+        let adjacentClosing = rightContent.map { isClosingPunctuation($0) || isQuotationMark($0) } ?? false
         let endsBlock = !code && !insideLiteral && !insideContraction && !adjacentClosing
             && (isBlockLine(lastLine) || blockContinuation)
 
@@ -94,20 +91,19 @@ enum SmartInsertion {
         }
         guard let first = body.first, let last = body.last else { return body }
 
-        func straightQuote(_ character: Character?) -> Bool { character == "\"" || character == "'" }
         let beforeQuote = before.dropLast().last
         let afterQuote = after.dropFirst().first
-        let leftOpensQuote = straightQuote(left)
-            && (beforeQuote == nil || beforeQuote!.isWhitespace || opening.contains(beforeQuote!))
-        let rightClosesQuote = straightQuote(right)
-            && (afterQuote == nil || afterQuote!.isWhitespace || closing.contains(afterQuote!))
+        let leftOpensQuote = left.map(isQuotationMark) == true
+            && (left.map(isOpeningDelimiter) == true || beforeQuote == nil || beforeQuote!.isWhitespace || isOpeningDelimiter(beforeQuote!))
+        let rightClosesQuote = right.map(isQuotationMark) == true
+            && (right.map(isClosingDelimiter) == true || afterQuote == nil || afterQuote!.isWhitespace || isClosingPunctuation(afterQuote!))
         let prefix = left.map {
-            !$0.isWhitespace && !first.isWhitespace && !opening.contains($0) && !closing.contains(first)
+            !$0.isWhitespace && !first.isWhitespace && !isOpeningDelimiter($0) && !isClosingPunctuation(first)
                 && !connector.contains($0) && !connector.contains(first) && !joinsLeft && !insideLiteral && !insideContraction
                 && !leftOpensQuote && !(code && $0 == ".")
         } ?? false
         let suffix = right.map {
-            !$0.isWhitespace && !last.isWhitespace && !opening.contains(last) && !closing.contains($0)
+            !$0.isWhitespace && !last.isWhitespace && !isOpeningDelimiter(last) && !isClosingPunctuation($0)
                 && !connector.contains(last) && !connector.contains($0) && !joinsRight && !insideLiteral && !insideContraction
                 && !rightClosesQuote
         } ?? false
@@ -127,8 +123,9 @@ enum SmartInsertion {
 
     static func boundarySpaced(_ text: String, after previousEnd: Character?, allowBlocks: Bool = true) -> String {
         guard let previousEnd, let first = text.first else { return text }
-        let endsWordOrSentence = previousEnd.isLetter || previousEnd.isNumber || ".!?:;…)]}”’»›\"".contains(previousEnd)
-        if allowBlocks, endsWordOrSentence, !"\"'“‘”’".contains(previousEnd),
+        let endsWordOrSentence = previousEnd.isLetter || previousEnd.isNumber || ".!?:;…\"".contains(previousEnd)
+            || isClosingDelimiter(previousEnd)
+        if allowBlocks, endsWordOrSentence, !isQuotationMark(previousEnd),
            isBlockLine(text.prefix(while: { !$0.isNewline })) { return "\n" + text }
         guard endsWordOrSentence, !previousEnd.isWhitespace, !first.isWhitespace,
               !first.isPunctuation, !first.isSymbol else { return text }
@@ -149,6 +146,27 @@ enum SmartInsertion {
 
     private static func isHorizontalSpace(_ character: Character) -> Bool {
         character.isWhitespace && !character.isNewline && character != "\t"
+    }
+
+    // Unicode categories include fullwidth/corner brackets and quotation
+    // marks. Fixed ASCII-oriented lists added padding inside those delimiters
+    // and mistook a quoted '- literal' for a new paragraph or list.
+    private static func isOpeningDelimiter(_ character: Character) -> Bool {
+        let category = character.unicodeScalars.first?.properties.generalCategory
+        return category == .openPunctuation || category == .initialPunctuation
+    }
+
+    private static func isClosingDelimiter(_ character: Character) -> Bool {
+        let category = character.unicodeScalars.first?.properties.generalCategory
+        return category == .closePunctuation || category == .finalPunctuation
+    }
+
+    private static func isQuotationMark(_ character: Character) -> Bool {
+        character.unicodeScalars.first?.properties.isQuotationMark == true
+    }
+
+    private static func isClosingPunctuation(_ character: Character) -> Bool {
+        ".,!?;:%".contains(character) || isClosingDelimiter(character)
     }
 
     private static let blockStart = try! NSRegularExpression(

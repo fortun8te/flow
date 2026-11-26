@@ -27,6 +27,37 @@ final class SmartInsertionTests: XCTestCase {
         XCTAssertEqual(insert("next", into: "\"done\"", at: 6), "\"done\" next")
     }
 
+    func testUnicodeBracketsDoNotGainInteriorSpaces() {
+        for (opening, closing) in [("（", "）"), ("［", "］"), ("｛", "｝"),
+                                   ("「", "」"), ("『", "』"), ("【", "】"), ("《", "》"), ("⟪", "⟫")] {
+            let prefix = "Use " + opening
+            XCTAssertEqual(insert("blue kettle", into: prefix + closing + " now", at: prefix.utf16.count),
+                           prefix + "blue kettle" + closing + " now")
+            XCTAssertEqual(insert("blue", into: prefix + "old" + closing, at: prefix.utf16.count, replacing: 3),
+                           prefix + "blue" + closing)
+        }
+    }
+
+    func testUnicodeQuotedBlockMarkersStayInsideTheExistingQuotes() {
+        for (opening, closing) in [("“", "”"), ("‘", "’"), ("«", "»"), ("「", "」"), ("『", "』")] {
+            for prefix in ["Use " + opening, "Use" + opening] {
+                for text in ["- literal", "> literal", "## literal", "```swift\nlet value = 1\n```"] {
+                    XCTAssertEqual(insert(text, into: prefix + closing + " now", at: prefix.utf16.count),
+                                   prefix + text + closing + " now")
+                }
+            }
+        }
+    }
+
+    func testRememberedUnicodeClosingDelimiterKeepsTheNextWordSeparate() {
+        for ending: Character in ["）", "］", "】", "」", "』", "》"] {
+            XCTAssertEqual(SmartInsertion.boundarySpaced("Next", after: ending), " Next")
+        }
+        for ending: Character in ["」", "』", "»"] {
+            XCTAssertEqual(SmartInsertion.boundarySpaced("- literal", after: ending), "- literal")
+        }
+    }
+
     func testExistingPunctuationIsNotDoubled() {
         XCTAssertEqual(insert("blue.", into: "The , green kettle", at: 4), "The blue, green kettle")
         XCTAssertEqual(insert("blue,", into: "The , green kettle", at: 4), "The blue, green kettle")
