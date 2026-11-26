@@ -64,6 +64,8 @@ enum LowConfidenceRecheck {
     static func decisions(_ text: String, suspects: [String], protectedTerms: [String] = [],
                           protectedRanges: [NSRange] = [], lexicon: TypoRepair.Lexicon, scorer: TinyNextScorer.Model,
                           config: Config = Config()) -> [Decision] {
+        guard config.before >= 0, config.after >= 0, config.maxFlagged > 0, config.maxCandidates > 0,
+              config.maxDistance >= 0, config.margin.isFinite, !Task.isCancelled else { return [] }
         let ns = text as NSString
         let whole = NSRange(location: 0, length: ns.length)
         let flagged = Set(suspects.map { $0.lowercased() })
@@ -76,6 +78,7 @@ enum LowConfidenceRecheck {
         let codeRanges = skipPattern.matches(in: text, range: whole).map(\.range) + protectedRanges
         let sentences = sentencePattern.matches(in: text, range: whole).map(\.range)
         let words = wordPattern.matches(in: text, range: whole).map(\.range)
+        var englishBySentence: [Int: Bool] = [:]
 
         func atSentenceStart(_ r: NSRange) -> Bool {
             var j = r.location - 1
@@ -89,6 +92,7 @@ enum LowConfidenceRecheck {
             let word: String
             let candidates: [String]
             let contexts: [String]
+            let contextRange: NSRange
         }
         var out: [Decision] = []
         var jobs: [Job] = []
@@ -105,9 +109,20 @@ enum LowConfidenceRecheck {
                     let span = scores[offset..<(offset + job.candidates.count)]
                     if span.allSatisfy(\.isFinite),
                        let best = (1..<job.candidates.count).max(by: { span[offset + $0] < span[offset + $1] }) {
+                        let delta = span[offset + best] - span[offset]
+                        if let collector = FlowRunCollector.current, collector.canCollectWordDecision {
+                            let candidates = job.candidates.enumerated().map { i, word in
+                                WordDecisionEvidence.Candidate(text: word, rawScore: Double(span[offset + i]),
+                                    adjustedScore: Double(span[offset + i] - span[offset]), features: ["asrFlagged": 1])
+                            }
+                            if let evidence = WordDecisionEvidence.make(stage: "low-confidence", mode: "dictation", source: text,
+                                range: job.range, contextRange: job.contextRange, candidates: candidates,
+                                chosenIndex: delta >= config.margin ? best : 0, margin: Double(delta),
+                                threshold: Double(config.margin), modelID: "tinynext-v2") { collector.wordDecision(evidence) }
+                        }
                         out.append(Decision(start: job.range.location, end: job.range.upperBound,
                                             original: job.word, replacement: job.candidates[best],
-                                            delta: span[offset + best] - span[offset]))
+                                            delta: delta))
                     }
                     offset += job.candidates.count
                 }
@@ -126,8 +141,12 @@ enum LowConfidenceRecheck {
             let starts = atSentenceStart(r)
             if word.first!.isUppercase && !starts { continue }          // a name in the middle of a sentence
             if word.count > 1 && word == word.uppercased() { continue } // an acronym
-            if let s = sentences.first(where: { NSLocationInRange(r.location, $0) }),
-               !RealWordFixer.LanguageGate.sentenceIsEnglish(ns.substring(with: s)) { continue }
+            if let s = sentences.first(where: { NSLocationInRange(r.location, $0) }) {
+                let english = englishBySentence[s.location]
+                    ?? RealWordFixer.LanguageGate.sentenceIsEnglish(ns.substring(with: s))
+                englishBySentence[s.location] = english
+                if !english { continue }
+            }
 
             // Alternatives: lexicon words within the edit budget, cheapest keyboard cost first.
             let budget = key.count <= 5 ? 1 : config.maxDistance
@@ -137,8 +156,8 @@ enum LowConfidenceRecheck {
                 .prefix(config.maxCandidates)
             guard !pool.isEmpty else { continue }
 
-            let lo = words[max(0, i - config.before)].location
-            let hi = words[min(words.count - 1, i + config.after)].upperBound
+            let lo = words[i - min(i, config.before)].location
+            let hi = words[i + min(words.count - 1 - i, config.after)].upperBound
             let left = ns.substring(with: NSRange(location: lo, length: r.location - lo))
             let right = ns.substring(with: NSRange(location: r.upperBound, length: hi - r.upperBound))
             let candidates = [word] + pool.map { alt -> String in
@@ -147,7 +166,7 @@ enum LowConfidenceRecheck {
             // Bound temporary tensors; TinyNext runs these contexts together.
             if batchCount + candidates.count > 32 { flush() }
             jobs.append(Job(range: r, word: word, candidates: candidates,
-                            contexts: candidates.map { left + $0 + right }))
+                            contexts: candidates.map { left + $0 + right }, contextRange: NSRange(location: lo, length: hi - lo)))
             batchCount += candidates.count
             considered += 1
         }

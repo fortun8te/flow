@@ -69,6 +69,8 @@ struct LocalCleanupEvaluationTests {
     @Test func rawFallbackIsNeverCountedAsAnAcceptedEdit() {
         #expect(LocalCleanupEvaluationHarness.normalized(.accepted("same input"), input: "same input") == .unchanged)
         #expect(LocalCleanupEvaluationHarness.normalized(.refused, input: "same input") == .refused)
+        #expect(LocalCleanupEvaluationHarness.normalized(.accepted(" \n\t"), input: "violet kettle") == .refused)
+        #expect(LocalCleanupEvaluationHarness.normalized(.accepted(""), input: "") == .refused)
     }
 
     @Test func aggregateExcludesPrivateTextAndCountsFailures() async throws {

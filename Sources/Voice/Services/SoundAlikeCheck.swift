@@ -66,20 +66,29 @@ enum SoundAlikeCheck {
     }
 
     static func hasCandidates(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        return groups.joined().contains { word in word != "two" && word != "to" && lower.contains(word) }
-            || lower.contains("to ") || lower.contains("to.") || lower.contains("to,")
+        let keys = Set(groups.joined().filter { $0 != "two" })
+        let ns = text as NSString
+        var found = false
+        wordPattern.enumerateMatches(in: text, range: NSRange(location: 0, length: ns.length)) { match, _, stop in
+            guard let match else { return }
+            let key = ns.substring(with: match.range).lowercased().replacingOccurrences(of: "’", with: "'")
+            if keys.contains(key) { found = true; stop.pointee = true }
+        }
+        return found
     }
 
     /// Every judged word with its best other spelling and the gain, whatever the margin.
     static func decisions(_ text: String, protectedTerms: [String] = [], protectedRanges: [NSRange] = [], learned: Set<String> = [],
                           config: Config = Config(), scorer: ([String]) -> [Float]) -> [Decision] {
+        guard config.before >= 0, config.after >= 0, config.maxChecks > 0,
+              config.margin.isFinite, config.learnedMargin.isFinite, !Task.isCancelled else { return [] }
         let ns = text as NSString
         let whole = NSRange(location: 0, length: ns.length)
         let protectedKeys = Set(protectedTerms.map { $0.lowercased() })
         let skips = skipPattern.matches(in: text, range: whole).map(\.range) + protectedRanges
         let sentences = sentencePattern.matches(in: text, range: whole).map(\.range)
         let words = wordPattern.matches(in: text, range: whole).map(\.range)
+        var englishBySentence: [Int: Bool] = [:]
 
         func atSentenceStart(_ r: NSRange) -> Bool {
             var j = r.location - 1
@@ -110,8 +119,12 @@ enum SoundAlikeCheck {
                 let next = i + 1 < words.count ? ns.substring(with: words[i + 1]).lowercased() : ""
                 guard clauseEndsAfter(r) || tooHeads.contains(next) else { continue }
             }
-            if let s = sentences.first(where: { NSLocationInRange(r.location, $0) }),
-               !RealWordFixer.LanguageGate.sentenceIsEnglish(ns.substring(with: s)) { continue }
+            if let s = sentences.first(where: { NSLocationInRange(r.location, $0) }) {
+                let english = englishBySentence[s.location]
+                    ?? RealWordFixer.LanguageGate.sentenceIsEnglish(ns.substring(with: s))
+                englishBySentence[s.location] = english
+                if !english { continue }
+            }
             let options = group.filter { $0 != key && $0 != "two" }.map { option -> String in
                 starts && word.first!.isUppercase ? option.prefix(1).uppercased() + option.dropFirst() : option
             }
@@ -122,26 +135,43 @@ enum SoundAlikeCheck {
 
         var texts: [String] = []
         var spans: [Range<Int>] = []
+        var contextRanges: [NSRange] = []
         for job in jobs {
-            let lo = words[max(0, job.index - config.before)].location
-            let hi = words[min(words.count - 1, job.index + config.after)].upperBound
+            let lo = words[job.index - min(job.index, config.before)].location
+            let hi = words[job.index + min(words.count - 1 - job.index, config.after)].upperBound
             let left = ns.substring(with: NSRange(location: lo, length: job.range.location - lo))
             let right = ns.substring(with: NSRange(location: job.range.upperBound, length: hi - job.range.upperBound))
             let start = texts.count
             for candidate in [job.word] + job.options { texts.append(left + candidate + right) }
             spans.append(start..<texts.count)
+            contextRanges.append(NSRange(location: lo, length: hi - lo))
         }
         let scores = scorer(texts)
-        guard scores.count == texts.count else { return [] }
+        guard !Task.isCancelled, scores.count == texts.count else { return [] }
         var out: [Decision] = []
-        for (job, span) in zip(jobs, spans) {
+        for (index, pair) in zip(jobs, spans).enumerated() {
+            let (job, span) = pair
             guard scores[span].allSatisfy(\.isFinite) else { continue }
             let base = scores[span.lowerBound]
             guard let best = (1..<span.count).max(by: { scores[span.lowerBound + $0] < scores[span.lowerBound + $1] }) else { continue }
             let replacement = job.options[best - 1]
-            let learned = learned.contains(AutoDictionary.key(job.word, replacement))
+            let wasLearned = learned.contains(AutoDictionary.key(job.word, replacement))
+            let delta = scores[span.lowerBound + best] - base
+            let required = wasLearned ? config.learnedMargin : config.margin
+            if let collector = FlowRunCollector.current, collector.canCollectWordDecision {
+                let choices = [job.word] + job.options
+                let candidates = choices.enumerated().map { i, word in
+                    WordDecisionEvidence.Candidate(text: word, rawScore: Double(scores[span.lowerBound + i]),
+                        adjustedScore: Double(scores[span.lowerBound + i] - base),
+                        features: ["learnedPair": i > 0 && learned.contains(AutoDictionary.key(job.word, word)) ? 1 : 0])
+                }
+                if let evidence = WordDecisionEvidence.make(stage: "soundalike", mode: "dictation", source: text,
+                    range: job.range, contextRange: contextRanges[index], candidates: candidates,
+                    chosenIndex: delta >= required ? best : 0, margin: Double(delta), threshold: Double(required),
+                    modelID: "tinynext-v2") { collector.wordDecision(evidence) }
+            }
             out.append(Decision(start: job.range.location, end: job.range.upperBound, original: job.word,
-                                replacement: replacement, delta: scores[span.lowerBound + best] - base, learned: learned))
+                                replacement: replacement, delta: delta, learned: wasLearned))
         }
         return out
     }

@@ -105,7 +105,9 @@ actor S1MiniPolisher {
 
     #if canImport(MLXLLM) && canImport(MLXLMCommon)
     private var container: ModelContainer?
-    private var loading: (id: UUID, task: Task<ModelContainer, Error>)?
+    private var loading: SharedModelTask<ModelContainer>?
+    private var loadGeneration: UUID?
+    private enum CacheFailure: Error { case missing }
     #endif
 
     init(directory: URL = S1MiniPolisher.defaultDirectory) {
@@ -128,9 +130,11 @@ actor S1MiniPolisher {
     func prepare() async -> Bool {
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
         guard !Task.isCancelled else { return false }
-        let loaded = await localContainer() != nil
-        if loaded { scheduleIdleUnload() }
-        return loaded && !Task.isCancelled
+        do {
+            _ = try await localContainer()
+            scheduleIdleUnload()
+            return !Task.isCancelled
+        } catch { return false }
         #else
         return false
         #endif
@@ -177,8 +181,10 @@ actor S1MiniPolisher {
         }
 
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
-        guard Self.isCompleteCache(at: directory) else { return .unavailable(.missingOrInvalidCache) }
-        guard let loaded = await localContainer() else {
+        let loaded: ModelContainer
+        do { loaded = try await localContainer() }
+        catch CacheFailure.missing { return .unavailable(.missingOrInvalidCache) }
+        catch {
             return Task.isCancelled ? .rejected(.cancelled) : .unavailable(.loadFailed)
         }
         guard !Task.isCancelled else { return .rejected(.cancelled) }
@@ -234,27 +240,44 @@ actor S1MiniPolisher {
                   additionalContext: ["enable_thinking": false])
     }
 
-    private func localContainer() async -> ModelContainer? {
+    private func localContainer() async throws -> ModelContainer {
+        try Task.checkCancellation()
         if let container { return container }
-        guard Self.isCompleteCache(at: directory) else { return nil }
-        let pending: (id: UUID, task: Task<ModelContainer, Error>)
-        if let loading { pending = loading }
-        else {
-            let directory = self.directory
-            pending = (UUID(), Task.detached(priority: .userInitiated) {
-                try await loadModelContainer(directory: directory)
-            })
-            loading = pending
+        if let loading { return try await loading.value }
+        // Validate once per actual load, rather than rereading metadata on
+        // every warm inference and once again inside this method.
+        guard Self.isCompleteCache(at: directory) else { throw CacheFailure.missing }
+        let directory = self.directory
+        let generation = UUID()
+        loadGeneration = generation
+        let task = SharedModelTask<ModelContainer> { [weak self] in
+            do {
+                let loaded = try await loadModelContainer(directory: directory)
+                guard await self?.finishLoad(loaded, generation: generation) == true else { throw CancellationError() }
+                return loaded
+            } catch {
+                await self?.failLoad(generation: generation)
+                throw error
+            }
         }
-        do {
-            let loaded = try await pending.task.value
-            container = loaded
-            if loading?.id == pending.id { loading = nil }
-            return loaded
-        } catch {
-            if loading?.id == pending.id { loading = nil }
-            return nil
-        }
+        loading = task
+        return try await task.value
+    }
+
+    private func finishLoad(_ loaded: ModelContainer, generation: UUID) -> Bool {
+        guard loadGeneration == generation, !Task.isCancelled else { return false }
+        container = loaded
+        loading = nil
+        loadGeneration = nil
+        // Also reclaim a load whose only waiting request was cancelled.
+        scheduleIdleUnload()
+        return true
+    }
+
+    private func failLoad(generation: UUID) {
+        guard loadGeneration == generation else { return }
+        loading = nil
+        loadGeneration = nil
     }
     #endif
 

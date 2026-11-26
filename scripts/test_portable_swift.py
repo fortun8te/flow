@@ -22,6 +22,12 @@ SUITES = {
     "SmartInsertionTests": "Sources/Voice/Utils/SmartInsertion.swift",
     "PasteReadbackTests": "Sources/Voice/Utils/PasteReadback.swift",
     "CorrectionEvidenceTests": "Sources/Voice/Services/CorrectionEvidence.swift",
+    "SharedModelTaskTests": "Sources/Voice/Services/SharedModelTask.swift",
+    "CleanupRuntimeLimitsTests": "Sources/Voice/Services/CleanupRuntimeLimits.swift",
+    "ContextScoreBatchTests": "Sources/Voice/Services/ContextScoreBatch.swift",
+    "PipelineTimerTests": "Sources/Voice/Services/PipelineTimer.swift",
+    "WordDecisionEvidenceTests": "Sources/Voice/Services/WordDecisionEvidence.swift",
+    "VocabularyReplacementRulesTests": "Sources/Voice/Services/VocabularyReplacementRules.swift",
 }
 
 
@@ -53,14 +59,18 @@ def main() -> int:
             if text.count("@testable import Voice") != 1:
                 parser.error(f"{suite} must have exactly one Voice module import.")
             text = text.replace("@testable import Voice", "")
-            names = re.findall(r"^    func (test\w+)\(\)(?: throws)?\s*\{", text, re.MULTILINE)
+            methods = re.findall(r"^    func (test\w+)\(\)( async)?(?: throws)?\s*\{", text, re.MULTILINE)
+            names = [name for name, _ in methods]
             declarations = re.findall(r"\bfunc (test\w+)\s*\(", text)
             if not names or names != declarations:
                 parser.error(f"{suite} has unsupported test signatures; update the portable runner explicitly.")
             copied = directory / test.name
             copied.write_text(text, encoding="utf-8")
             inputs.extend((str(source), str(copied)))
-            entries.append("testCase([" + ",\n".join(f'("{name}", {suite}.{name})' for name in names) + "])")
+            entries.append("testCase([" + ",\n".join(
+                f'("{name}", asyncTest({suite}.{name}))' if is_async else f'("{name}", {suite}.{name})'
+                for name, is_async in methods
+            ) + "])")
             test_count += len(names)
 
         runner = directory / "main.swift"

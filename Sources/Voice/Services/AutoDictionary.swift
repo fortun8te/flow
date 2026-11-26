@@ -169,6 +169,7 @@ final class AutoDictionary: @unchecked Sendable {
     private var checkedAt = Date.distantPast
     /// Bumped on every change; consumers cache on it.
     private(set) var revision = 0
+    private var cachedLiveSnapshot: LiveSnapshot?
     /// A delayed keep or replay must not revive an operation that was already undone.
     private var undoneOperations: Set<String> = []
     private var suspendSaves = false
@@ -204,10 +205,17 @@ final class AutoDictionary: @unchecked Sendable {
         return entries[Self.key(heard, written)]
     }
 
-    private func live(_ kinds: Set<AutoDictionaryEntry.Kind>) -> [AutoDictionaryEntry] {
-        lock.lock(); defer { lock.unlock() }
-        reloadIfChangedLocked()
-        return entries.values.filter { $0.status == .live && kinds.contains($0.kind) }
+    struct LiveSnapshot: Sendable {
+        struct Replacement: Sendable {
+            let heard: String
+            let written: String
+        }
+        let revision: Int
+        let names: [String]
+        let replacements: [Replacement]
+        let spellings: [String: String]
+        let soundAlikes: Set<String>
+        let conflictingAliases: Set<String>
     }
 
     /// An alias with more than one learned target needs context. Keep the terms
@@ -220,34 +228,58 @@ final class AutoDictionary: @unchecked Sendable {
         return active.filter { targets[normalized($0.heard)]?.count == 1 }
     }
 
-    private func liveMappings(_ kinds: Set<AutoDictionaryEntry.Kind>) -> [AutoDictionaryEntry] {
+    /// One atomic, cached view for consumers. Repeated reads do not regroup/sort the whole store.
+    func liveSnapshot() -> LiveSnapshot {
         lock.lock(); defer { lock.unlock() }
         reloadIfChangedLocked()
-        return Self.unambiguousLiveEntries(Array(entries.values)).filter { kinds.contains($0.kind) }
+        if let snapshot = cachedLiveSnapshot, snapshot.revision == revision { return snapshot }
+        let active = entries.values.filter { $0.status == .live }.sorted {
+            let aOwn = $0.sources.contains { Source(rawValue: $0.key)?.isOwnEdit == true && $0.value > 0 }
+            let bOwn = $1.sources.contains { Source(rawValue: $0.key)?.isOwnEdit == true && $0.value > 0 }
+            if aOwn != bOwn { return aOwn }
+            let a = $0.lastOwnEditAt ?? $0.lastSeen, b = $1.lastOwnEditAt ?? $1.lastSeen
+            return a == b ? $0.key < $1.key : a > b
+        }
+        let mappings = Self.unambiguousLiveEntries(active)
+        let allowed = Set(mappings.map(\.key))
+        let conflicts = Set(active.filter { !allowed.contains($0.key) }.map { Self.normalized($0.heard) })
+        var names: [String: String] = [:]
+        for entry in active where entry.kind == .name || entry.kind == .phrase {
+            let key = Self.normalized(entry.written)
+            if names[key] == nil { names[key] = entry.written }
+        }
+        let replacements = mappings.filter {
+            ($0.kind == .name || $0.kind == .phrase) && $0.replaces && Self.normalized($0.heard) != Self.normalized($0.written)
+        }.sorted { $0.heard < $1.heard }.map {
+            LiveSnapshot.Replacement(heard: $0.heard.lowercased(), written: names[Self.normalized($0.written)] ?? $0.written)
+        }
+        var spellings: [String: String] = [:]
+        for entry in mappings where entry.kind == .spelling { spellings[entry.heard.lowercased()] = entry.written }
+        let snapshot = LiveSnapshot(revision: revision, names: names.values.sorted(), replacements: replacements,
+            spellings: spellings, soundAlikes: Set(active.filter { $0.kind == .soundAlike }.map(\.key)),
+            conflictingAliases: conflicts)
+        cachedLiveSnapshot = snapshot
+        return snapshot
     }
 
     /// Learned names and terms: the speech model boosts them and the polish keeps their spelling.
     func liveNames() -> [String] {
-        var seen = Set<String>()
-        return live([.name, .phrase]).map(\.written).sorted().filter { seen.insert($0.lowercased()).inserted }
+        liveSnapshot().names
     }
 
     /// Learned heard -> written replacements (names and phrases).
     func liveReplacements() -> [(heard: String, written: String)] {
-        liveMappings([.name, .phrase]).filter { $0.replaces && $0.heard.lowercased() != $0.written.lowercased() }
-            .sorted { $0.heard < $1.heard }.map { ($0.heard.lowercased(), $0.written) }
+        liveSnapshot().replacements.map { ($0.heard, $0.written) }
     }
 
     /// Learned misspellings, lowercase keys: the user overlay of the typo dictionary.
     func liveSpellings() -> [String: String] {
-        var out: [String: String] = [:]
-        for e in liveMappings([.spelling]) { out[e.heard.lowercased()] = e.written }
-        return out
+        liveSnapshot().spellings
     }
 
     /// Learned sound-alike directions, "whether" -> "weather".
     func liveSoundAlikes() -> Set<String> {
-        Set(live([.soundAlike]).map(\.key))
+        liveSnapshot().soundAlikes
     }
 
     var currentRevision: Int {
@@ -393,9 +425,9 @@ final class AutoDictionary: @unchecked Sendable {
     func remove(written: String, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
         reloadIfChangedLocked()
-        let target = written.lowercased()
+        let target = Self.normalized(written)
         var changed = false
-        for (key, var e) in entries where e.written.lowercased() == target && e.status != .removed {
+        for (key, var e) in entries where Self.normalized(e.written) == target && e.status != .removed {
             e.status = .removed
             e.removedAt = now
             e.undos = max(e.undos, Rules.permanentUndos)
@@ -572,7 +604,8 @@ final class AutoDictionary: @unchecked Sendable {
     }
 
     private static func normalized(_ s: String) -> String {
-        s.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
+        s.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            .lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
     }
 
     private static let negations: Set<String> = [

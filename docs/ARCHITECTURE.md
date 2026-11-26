@@ -25,7 +25,7 @@ The Swift module is called `Voice` for compatibility with older builds; the prod
 
 ## Dictation pipeline
 
-1. **Start.** A hotkey press starts `RecordingCoordinator`. Audio goes to a file through `AudioCaptureService`. A short press that is released before the hold threshold is discarded silently (`HotkeyService.swift`).
+1. **Start.** A hotkey press starts `RecordingCoordinator`. Microphone audio goes to a file through `AudioCaptureService` before Accessibility target inspection and optional assistant warmups. System-audio capture has its own asynchronous startup. A short press that is released before the hold threshold is discarded silently (`HotkeyService.swift`).
 2. **Recognition.** `TranscriptionService` runs the selected recogniser on the finished file. The default is Parakeet TDT 0.6B v3 through FluidAudio. It returns timed segments with per-word confidence (`TranscriptionService.swift`, `TranscriptionEngine.swift`).
 3. **Preparation.** `DictationTextPreparation.prepare` joins the segments, repairs sentences broken by the recogniser (`DictationFinalPass.joinBrokenSentences`), and formats the text with `TextFormatter.formatSegments`. It rejects empty input and text that is mostly non-Latin script. It also reads a trailing "press Enter" command (`TrailingPressEnter.swift`). A trailing stop word is removed only when the spoken stop word ended the recording.
 4. **Restart and entity protection.** `RestartCorrectionPreprocessor` resolves spoken self-corrections ("two, no wait, one") before the model sees the text. `EntityFreezer` swaps emails, URLs, code, contractions and domains for sentinel tokens before the model sees the text, and restores them verbatim afterwards.
@@ -83,9 +83,13 @@ A companion app can drive Flow over distributed notifications and read Flow's st
 
 General cleanup admits one request per llama-server and publishes model readiness before its shared startup task completes. A settings change cannot tear down an active request. Batch CTC builds are keyed by the exact dictionary and settings; cold loads do not block final recognition, and a warm dictionary rebuild can be joined for up to 120 ms. Each CTC decode retains its own guard vocabulary. Multi-window dictation overlaps the next TDT decode with the preceding CTC rescore while preserving the original window order and keeping at most one outstanding CTC task.
 
+`SharedModelTask` lets each caller cancel its wait without cancelling model preparation needed by the next dictation. Explicit owner shutdown invalidates the load; generation checks prevent a late completion from publishing readiness or replacing a newer server. WhisperNow, TypoFix, General, S1 and Qwen share this primitive. Qwen meeting/dictation callers also join the same 4B load. A ready selected General model skips unnecessary DOSE1 fallback preparation; cold General retains that fallback. Catalog number validation prevents integer conversion traps, and load headroom includes actual weight-file size when metadata omits it.
+
 ### Opt+1 and cleanup latency
 
 At capture start Flow refreshes the selected cleanup engine. Launch/wake Opt+1 warmup does not start another large fallback editor if the selected typing model is installed. Section routing uses the existing 60-word threshold or section character limit; per-section request budgets include any selected general model allowance but cannot extend the outer deadline. The deadline primitive also checks the absolute monotonic cutoff before accepting a reply. Paragraph layout precomputes its sentence-boundary costs once. Existing explicit list lines are preserved; ordinary semicolon-delimited prose is not treated as code merely for using semicolons.
+
+`PipelineTimer` measures elapsed work monotonically. Run/trace timings separate cleanup, final rules and word repair, delivery-queue wait, dispatch and readback; the completed readback cancels its timeout backstop. TinyNext scores exact-byte duplicate contexts once per call, checks cancellation between expensive steps, and refuses overflow instead of silently shortening context. See [INFERENCE-OPTIMIZATION.md](INFERENCE-OPTIMIZATION.md) for the field definitions, existing engine settings and controlled experiments. These changes are not a hardware speed claim.
 
 ### Context-aware insertion and correction evidence
 

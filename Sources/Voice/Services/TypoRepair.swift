@@ -371,17 +371,17 @@ final class TypoRepair: @unchecked Sendable {
     private static let wordToken = try! NSRegularExpression(pattern: #"[A-Za-z]+(?:['’][A-Za-z]+)?"#)
 
     private static let overlayLock = NSLock()
-    nonisolated(unsafe) private static var overlayCache: (revision: Int, map: [String: String])?
+    nonisolated(unsafe) private static var overlayCache: (owner: AutoDictionary, revision: Int, map: [String: String])?
 
     /// The bundled pairs plus the misspellings Flow learned from the user's fixes (AutoDictionary, user
     /// overlay file VOICE/typo_dictionary.user.json). Read live: a new entry applies on the next text.
     static func currentPersonalDictionary(learned: AutoDictionary = .shared) -> [String: String] {
-        let revision = learned.currentRevision
+        let snapshot = learned.liveSnapshot()
         overlayLock.lock(); defer { overlayLock.unlock() }
-        if let cache = overlayCache, cache.revision == revision { return cache.map }
+        if let cache = overlayCache, cache.owner === learned, cache.revision == snapshot.revision { return cache.map }
         var map = personalDictionary
-        for (k, v) in learned.liveSpellings() where map[k] == nil { map[k] = v }
-        overlayCache = (revision, map)
+        for (k, v) in snapshot.spellings where map[k] == nil { map[k] = v }
+        overlayCache = (learned, snapshot.revision, map)
         return map
     }
 

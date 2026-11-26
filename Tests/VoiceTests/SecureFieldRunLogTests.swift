@@ -19,6 +19,12 @@ extension FlowRunLogTests {
 
         let secret = "zxqPassphrase9 correcthorse"
         let run = FlowRunCollector(kind: "dictation", id: "secure-run-1", app: "com.example.login", input: secret)
+        let evidence = try #require(WordDecisionEvidence.make(stage: "tinyfix", mode: "dictation", source: secret,
+            range: (secret as NSString).range(of: "zxqPassphrase9"), contextRange: NSRange(location: 0, length: secret.utf16.count),
+            candidates: [.init(text: "zxqPassphrase9", rawScore: -2), .init(text: "privateAlternative", rawScore: -3)],
+            chosenIndex: 0, margin: -1, threshold: 5, modelID: "fixture"))
+        run.wordDecision(evidence)
+        #expect(run.snapshot.wordDecisions?.count == 1)
         run.stage("cleanup", text: secret + " typed twice")
         run.update { record in
             record.asrWords = [ASRWordConfidence(word: "zxqPassphrase9", confidence: 0.4, start: nil, end: nil)]
@@ -45,6 +51,7 @@ extension FlowRunLogTests {
         #expect(saved.output == nil)
         #expect(saved.asrWords == nil)
         #expect(saved.suspectWords == nil)
+        #expect(saved.wordDecisions == nil)
         #expect(saved.settings.isEmpty)
         #expect(saved.audioPath == nil && saved.fallbackReason == nil)
         #expect(saved.stages.allSatisfy { $0.text == nil && $0.changes == nil && $0.detail == nil })
@@ -142,6 +149,7 @@ extension FlowRunLogTests {
         let decoded = try JSONDecoder().decode(FlowRunRecord.self, from: data)
         #expect(decoded.schemaVersion == 1)
         #expect(decoded.feedbackSource == nil && decoded.targetScope == nil)
+        #expect(decoded.wordDecisions == nil)
         #expect(decoded.sourceSHA256 == nil && decoded.pipelineVersion == nil)
     }
 }

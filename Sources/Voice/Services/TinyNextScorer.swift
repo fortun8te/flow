@@ -187,7 +187,14 @@ final class TinyNextScorer: @unchecked Sendable {
         /// Total log-probability of each token sequence (the end-of-text token is prepended as the start).
         /// Sequences are run together through the linear layers; attention stays within each sequence.
         func logProbabilities(_ sequences: [[Int32]]) -> [Float] {
-            let seqs = sequences.map { Array(([0] + $0).prefix(Self.maxPositions)) }
+            // An incomplete context can omit the word being judged. Refuse it rather than
+            // silently scoring a truncated prefix, including callers bypassing score().
+            guard !Task.isCancelled,
+                  sequences.allSatisfy({ $0.count < Self.maxPositions
+                      && $0.allSatisfy({ $0 >= 0 && Int($0) < vocabSize }) }) else {
+                return Array(repeating: .nan, count: sequences.count)
+            }
+            let seqs = sequences.map { [0] + $0 }
             let lengths = seqs.map { $0.count - 1 }
             let total = lengths.reduce(0, +)
             guard total > 0 else { return sequences.map { _ in 0 } }
@@ -225,6 +232,8 @@ final class TinyNextScorer: @unchecked Sendable {
                 let xp = xb.baseAddress!, np = nb.baseAddress!, qp = qb.baseAddress!, ap = ab.baseAddress!
                 let gp = gb.baseAddress!, hp = hb.baseAddress!, sp = sb.baseAddress!
                 for layer in layers {
+                    // Cancellation must not wait for every transformer layer and the large output head.
+                    if Task.isCancelled { return }
                     rmsNorm(xp, rows: total, weight: layer.norm1, into: np)
                     linear(np, rows: total, inDim: dim, layer.qkv, outDim: 3 * dim, into: qp)
                     // Rotary position on q and k, per sequence position.
@@ -291,6 +300,7 @@ final class TinyNextScorer: @unchecked Sendable {
                 }
                 rmsNorm(xp, rows: total, weight: finalNorm, into: np)
             }}}}}}}
+            guard !Task.isCancelled else { return Array(repeating: .nan, count: sequences.count) }
             var logits = [Float](repeating: 0, count: total * vocabSize)
             normed.withUnsafeBufferPointer { nb in
                 logits.withUnsafeMutableBufferPointer { lb in
@@ -300,6 +310,7 @@ final class TinyNextScorer: @unchecked Sendable {
             var result: [Float] = []
             logits.withUnsafeMutableBufferPointer { lb in
                 for (s, n) in lengths.enumerated() {
+                    if Task.isCancelled { return }
                     var sum: Float = 0
                     for t in 0..<n {
                         let row = lb.baseAddress! + (starts[s] + t) * vocabSize
@@ -317,12 +328,22 @@ final class TinyNextScorer: @unchecked Sendable {
                     result.append(sum)
                 }
             }
+            guard !Task.isCancelled else { return Array(repeating: .nan, count: sequences.count) }
             return result
         }
 
         /// Bound temporary logits/activation storage by the token rows, not just the number of candidates.
         /// Sequences have independent attention, so splitting a batch preserves their scores.
         func score(_ texts: [String]) -> [Float] {
+            guard !Task.isCancelled else { return Array(repeating: .nan, count: texts.count) }
+            let scores = ContextScoreBatch.score(texts) { unique in
+                FlowRunCollector.note("tinynext-batch", ["contexts": "\(texts.count)", "uniqueContexts": "\(unique.count)"])
+                return scoreDistinct(unique)
+            }
+            return Task.isCancelled ? Array(repeating: .nan, count: texts.count) : scores
+        }
+
+        private func scoreDistinct(_ texts: [String]) -> [Float] {
             var results: [Float] = []
             var batch: [[Int32]] = []
             var rows = 0
@@ -338,11 +359,12 @@ final class TinyNextScorer: @unchecked Sendable {
             let rowLimit = max(Self.maxPositions, min(1024, 4_000_000 / vocabSize))
             for text in texts {
                 if Task.isCancelled { return Array(repeating: .nan, count: texts.count) }
-                let tokens = Array(tokenizer.encode(text).prefix(Self.maxPositions - 1))
+                // Read only enough tokens to detect overflow, without tokenizing the entire tail.
+                let tokens = tokenizer.encode(text, limit: Self.maxPositions)
                 let size = tokens.count
                 if !batch.isEmpty && rows + size > rowLimit { flush() }
                 // A mismatched tokenizer must never index past the weight matrix.
-                if tokens.contains(where: { $0 < 0 || Int($0) >= vocabSize }) {
+                if tokens.count >= Self.maxPositions || tokens.contains(where: { $0 < 0 || Int($0) >= vocabSize }) {
                     flush()
                     results.append(.nan)
                 } else {
@@ -388,12 +410,25 @@ final class TinyNextScorer: @unchecked Sendable {
             byteMap = map
         }
 
-        func encode(_ text: String) -> [Int32] {
+        func encode(_ text: String, limit: Int? = nil) -> [Int32] {
+            if let limit, limit <= 0 { return [] }
             let ns = text as NSString
             var out: [Int32] = []
-            for match in Self.pattern.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            Self.pattern.enumerateMatches(in: text, range: NSRange(location: 0, length: ns.length)) { match, _, stop in
+                guard let match, !Task.isCancelled else { stop.pointee = true; return }
                 let piece = ns.substring(with: match.range)
-                out += bpe(String(piece.utf8.map { byteMap[Int($0)] }))
+                // A pathological single word otherwise makes the quadratic merge loop unbounded.
+                // Negative IDs mark an unscorable context and can never become a replacement.
+                if limit != nil, piece.utf8.count > 2_048 {
+                    out.append(-1)
+                    stop.pointee = true
+                    return
+                }
+                out += self.bpe(String(piece.utf8.map { self.byteMap[Int($0)] }))
+                if let limit, out.count >= limit {
+                    out = Array(out.prefix(limit))
+                    stop.pointee = true
+                }
             }
             return out
         }

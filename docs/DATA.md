@@ -33,6 +33,10 @@ Apple's paths are case-insensitive, so `VOICE` and `Voice` refer to the same fol
 - the app the text was going to;
 - the final text.
 
+Pipeline version 3 also collects optional bounded `wordDecisions` from TinyFix, sound-alike and low-confidence scoring. Each observation contains the exact local source context and UTF-16 spans, original-first candidates with finite raw/adjusted scores and numeric features, the actual threshold, and the selected candidate (zero means KEEP). Collection stops at 64 decisions per run; context is limited to 2,048 UTF-16 units. Invalid, ambiguous or oversized evidence is omitted. These are model observations, including rejected edits, **not reviewed targets**. The schema remains backward compatible with earlier records; see [CUSTOM-MODEL-EXPERIMENTS.md](CUSTOM-MODEL-EXPERIMENTS.md) for the exact contract and coverage limits.
+
+The actual cleanup engine is attached within the task's backend result path instead of inferred from shared UI status. Pipeline timing uses a monotonic clock and separates cleanup, post-cleanup rules, delivery queue, dispatch and readback. [INFERENCE-OPTIMIZATION.md](INFERENCE-OPTIMIZATION.md) explains the timing fields and comparison procedure.
+
 Later lines link back by `id` for Undo, the "Original" toggle, and edits made straight after paste. Schema 2 corrections contain only the corrected insertion, with `targetScope: pasted-span` and `feedbackSource: observed-edit`. Flow anchors this to the exact verified UTF-16 insertion range, requires a stable change in the same focused field after keyboard activity, and cancels the observation when Flow makes another edit. Repeated text elsewhere in the field cannot be selected by substring matching. Older whole-field correction records remain readable but are not training targets.
 
 The keyboard tracker stores only counters. It does not store key characters, key codes, or modifier values. External keyboard activity supports an observed correction; another app could synthesize input, so this is not a claim of independent human approval. The exporter puts these observations in a review queue. Paste verification and leaving model output untouched are delivery/retention observations, not positive training labels.
@@ -44,7 +48,7 @@ The keyboard tracker stores only counters. It does not store key characters, key
   defaults write <your bundle identifier> flow.saveRunRecords -bool NO
   ```
 - Privacy mode also stops run records. Both this switch and `flow.saveRunRecords` apply to the legacy training log as well, including queued writes.
-- Secure text fields are recorded without their text (`FlowRunLog.withoutText`), including word-bearing decision values, auxiliary transcripts in settings, free-form fallback reasons and audio paths. Stage labels, timings and model identifiers remain. The legacy training copy also omits its text, audio path and fallback reason.
+- Secure text fields are recorded without their text (`FlowRunLog.withoutText`), including the entire candidate observation array, word-bearing decision values, auxiliary transcripts in settings, free-form fallback reasons and audio paths. Stage labels, timings and model identifiers remain. The legacy training copy also omits its text, audio path and fallback reason.
 - The folder is created with mode 0700 and the file with 0600.
 - The folder is excluded from iCloud and Time Machine backups.
 - The file rotates at 24 MB and keeps the newest 12 rotated files (about 300 MB at most).
@@ -78,6 +82,8 @@ Meeting audio is saved as `meeting-*.wav` files in `Voice/audio/`, and dictation
 When you correct a word, Flow can learn the correction (`AutoDictionary.swift`). The short list shown in settings is kept under `voice.autoDictionary`. Learned entries are local and can be removed from the app. Repeated polling or history import of the same recording counts once. Retained Opt+1 output alone cannot promote a replacement or override a user-learned spelling. Older live entries supported only by passive model output return to pending review. Undo invalidates the corresponding evidence, including after restart.
 
 The dictionary's version 2 store retains bounded per-entry observation identities and their sources, plus undone-operation identities. It preserves compatibility with older stores. This dictionary adaptation is separate from training a neural model; model training still requires reviewed labels and evaluation.
+
+Consumers read one cached, atomic live snapshot instead of rebuilding names, spelling maps and alias groups on every pass. Ambiguous learned aliases also block matching built-in automatic replacements. Phrase matching tolerates repeated horizontal spaces, tabs and nonbreaking spaces without joining paragraphs. Manual casing wins over seed vocabulary, and the latest own edit determines learned casing ahead of passive observations. Compiled spelling/name rules invalidate when their dictionary, revision or relevant settings change. Protected code, paths and URLs remain frozen through the replacement passes.
 
 ## Keys and tokens
 

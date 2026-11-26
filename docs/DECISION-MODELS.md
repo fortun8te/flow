@@ -113,3 +113,9 @@ D1 installations are rechecked after a short backoff. Flow accepts the legacy ca
 ### Correction ownership across judges
 
 Accepted TinyFix and sound-alike edits lock their exact UTF-16 occurrences, not every occurrence of the replacement word. Locks move when a later edit changes an earlier word's length. The low-confidence recheck respects those locks and the same dictionary terms; invalid, stale, overlapping and non-finite candidate edits never reach the final text. Completed run records ignore late asynchronous callbacks.
+
+### Candidate evidence and inference bounds
+
+TinyFix and TinyNext-based judges can record bounded original-first candidate lists, raw scores, rule features, margins and actual thresholds in `WordDecisionEvidence`. KEEP decisions are retained as observations alongside applied edits. These are not probabilities or independent labels; the legacy TinyFix `probability` field is an upstream heuristic, not calibrated confidence for Flow speech. Training requires separate review, as specified in [CUSTOM-MODEL-EXPERIMENTS.md](CUSTOM-MODEL-EXPERIMENTS.md).
+
+TinyNext deduplicates contexts using exact UTF-8 bytes, preserving candidate order and byte-distinct Unicode. Missing/nonfinite scores, cancellation, token overflow and pathological token pieces make a context unscorable, so its original stays unchanged. Sound-alike and low-confidence passes reuse language classification within a sentence and validate window settings before slicing. Their acceptance thresholds are unchanged.

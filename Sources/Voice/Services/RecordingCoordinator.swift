@@ -354,14 +354,8 @@ class RecordingCoordinator {
         }
 
         vlog("[VOICE-RC] isRecording: false → true at \(Date()) (SYNC, before any Task)")
-        // Kick off independent auxiliary loads while the microphone captures audio.
-        // None of these warmups is required for recording or final delivery.
-        warmDictationAssistants()
-        if ASRVocabularyBoost.isEnabled {
-            Task(priority: .utility) { await ASRVocabularyBooster.shared.prewarm() }
-        }
         stopLivePartials()
-        currentPasteTarget = CursorPaster().captureTargetSnapshot()
+        currentPasteTarget = nil
         state.isRecording = true
         state.isPaused = false
         state.elapsedSeconds = 0
@@ -501,6 +495,10 @@ class RecordingCoordinator {
             }
         }
 
+        // The microphone is already writing before any Accessibility/file/model discovery.
+        // AX can block on a busy editor; it must not delay capture of the first syllable.
+        currentPasteTarget = CursorPaster().captureTargetSnapshot()
+
         // transcription.start() is instant (marks session start) but must precede stop().
         // System audio capture is async so it lives here too.
         vlog("[VOICE-RC] spawning startupTask (async transcription.start)")
@@ -548,6 +546,12 @@ class RecordingCoordinator {
                     _ = await self.stopRecording()
                 }
             }
+        }
+        // Prepare useful local resources during capture, after the audio writer and mic started.
+        // These jobs are independent of transcript generation and never gate capture startup.
+        warmDictationAssistants()
+        if ASRVocabularyBoost.isEnabled {
+            Task(priority: .utility) { await ASRVocabularyBooster.shared.prewarm() }
         }
         vlog("[VOICE-RC] startRecording() EXIT at \(Date()) — isRecording=\(state.isRecording) (elapsed \(Int(Date().timeIntervalSince(enterTime) * 1000))ms)")
     }

@@ -5855,7 +5855,7 @@ extension AppDelegate: NSWindowDelegate {
     private func finishRecording() {
         hotkeyService.endSessionFromUI()
         // Key release. Every stage time in the dictation trace is counted from here.
-        let keyUpAt = CFAbsoluteTimeGetCurrent()
+        let keyUpTimer = PipelineTimer()
         print("[VOICE-TIMING] finishRecording entered at \(Date())")
         let wasRecording = recordingState.isRecording
         let started = recordingStartedAt
@@ -6029,7 +6029,7 @@ extension AppDelegate: NSWindowDelegate {
             // Also forwarded to Telemetry so the JSONL log can be diffed by
             // build / model / app target.
             // ============================================================
-            let tPipelineStart = CFAbsoluteTimeGetCurrent()
+            let pipelineTimer = PipelineTimer()
             // This is a cooperative warning threshold, not a hard deadline:
             // the task group still waits for a cancellation-unresponsive decoder.
             // A WARNING at 15 s, never a cut-off. A transcription that finishes late is still pasted
@@ -6044,8 +6044,8 @@ extension AppDelegate: NSWindowDelegate {
                 await coordinator.stopRecording(claiming: claimed)
             }
             slowWarning.cancel()
-            let parakeetMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-            let transcriptAtMs = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
+            let parakeetMs = pipelineTimer.seconds() * 1000
+            let transcriptAtMs = Int(keyUpTimer.seconds() * 1000)
             fputs("[LATENCY] Parakeet (drain+ASR): \(Int(parakeetMs))ms\n", stderr)
             vlog("[VOICE-TIMING] Parakeet returned at \(Date())")
             // [VOICE-RACE] Prove each finish task received ITS OWN session's
@@ -6169,7 +6169,7 @@ extension AppDelegate: NSWindowDelegate {
             // ============================================================
 
             // Run formatter — paragraph-aware, synchronous (no Ollama round-trip).
-            let tFormatStart = CFAbsoluteTimeGetCurrent()
+            let formatterTimer = PipelineTimer()
             // Strip a trailing stop-word command token ("finito") so the word
             // the user spoke to END the recording never lands in the pasted /
             // saved text. Trailing-only and gated on the feature flag, so a
@@ -6192,7 +6192,7 @@ extension AppDelegate: NSWindowDelegate {
                 endedByVoiceStop: coordinator.lastVoiceStopSession == mySession)
             let pressEnterCommand = preparation.command
             let formatted = pressEnterCommand.text
-            let formatterMs = (CFAbsoluteTimeGetCurrent() - tFormatStart) * 1000
+            let formatterMs = formatterTimer.seconds() * 1000
             fputs("[LATENCY] TextFormatter: \(Int(formatterMs))ms\n", stderr)
             run.stage("rules", text: formatted, ms: Int(formatterMs),
                       detail: t2RawText != nil ? ["preparation": "model-transcript"] : nil)
@@ -6234,26 +6234,7 @@ extension AppDelegate: NSWindowDelegate {
             // polisher itself reads) — that one stays for backward compat,
             // this one is the new user-visible setting wired into the UI.
             // ============================================================
-            // ============================================================
-            // OPTIMISTIC PASTE — "type now, refine after".
-            // Storage key `optimisticPaste` (defaults to false). When true
-            // AND polish is enabled AND polish hasn't been short-circuited
-            // for any reason, paste the TextFormatter output IMMEDIATELY,
-            // then run Qwen3 in background and try to swap. Swap only
-            // happens when the pasteboard fingerprint hasn't changed since
-            // our optimistic write (a rough "user hasn't typed over us" gate)
-            // — otherwise the polished text is dropped and the unpolished
-            // text remains. Opt-in because the swap involves Cmd+Z which
-            // can feel disruptive if the user is fast-typing.
-            // ============================================================
-            let optimisticPasteEnabled: Bool = {
-                if UserDefaults.standard.object(forKey: "optimisticPaste") == nil { return false }
-                return UserDefaults.standard.bool(forKey: "optimisticPaste")
-            }()
-            // LLM polish runs only if enabled+available; otherwise returns
-            // `formatted` unchanged after a near-zero check. 800ms hard
-            // timeout inside the polisher guards paste latency (warm
-            // Qwen3-0.6B-4bit on M2 typically completes in ~80–150ms).
+            // Cleanup uses the bounded request/deadline path below and preserves the source on failure.
             // Insertion-context hint lets the model bias for chat / email and
             // skip entirely in code editors.
             vlog("[VOICE] Starting polish... (formatted=\(formatted.count) chars) polishEnabledByUser=\(polishEnabledByUser)")
@@ -6272,7 +6253,7 @@ extension AppDelegate: NSWindowDelegate {
             var seenWords = Set<String>()
             let userVocab = (preferredWords + ProperNounVocabulary.current() + CombinedDictionary.terms())
                 .filter { seenWords.insert($0.lowercased()).inserted }
-            let polishStart = Date()
+            let polishTimer = PipelineTimer()
             // Short-utterance bypass: when RecordingCoordinator flagged the
             // current clip as 16-36KB ("ok"/"yeah"/"no" territory), skip the
             // LLM polish pass and keep the rule-based formatted text. Polish
@@ -6301,73 +6282,6 @@ extension AppDelegate: NSWindowDelegate {
                 skipPolish = false
                 graniteTranscript = nil
                 moonshineTranscript = nil
-            }
-            // Decide up-front whether this dictation will actually hit the LLM.
-            // Used to gate optimistic paste: there's no point doing the
-            // "paste-now, replace-after" dance if polish was going to be a
-            // no-op anyway (short clip, polish disabled, non-English, etc.).
-            let polishWillRun = cleanupForTask != "none" && polishEnabledByUser && !skipPolish
-
-            // Optimistic paste: paste TextFormatter output immediately, BEFORE
-            // the LLM round trip. The post-polish replace is best-effort.
-            //
-            // We push the optimistic paste onto pasteChain so it serializes
-            // with any in-flight prior dictation's paste — we don't want two
-            // pastes racing the clipboard. The swap task is fired LATER after
-            // polish completes.
-            //
-            // `optimisticPasteSnapshot` is the SHA-like fingerprint we use to
-            // verify the field hasn't changed before we attempt Cmd+Z + repaste.
-            // (Plain string equality on the pasteboard contents is good enough
-            // — if anything else clobbered our paste, we abort the swap.)
-            let optimisticActive = false // Avoid undoing edits made while cleanup runs.
-            var optimisticPasteboardSig: String? = nil
-            // BUGFIX: hold our own optimistic-paste task locally. The Qwen3
-            // polish below has an `await` and during that await another
-            // finishRecording can overwrite `pasteChain`. If we read
-            // `pasteChain` after the await, we may pick up a NEWER session's
-            // chain link and lose serialization with our own optimistic write.
-            // Capturing it here keeps the swap correctly ordered behind our
-            // own pre-polish paste.
-            var ourOptimisticTask: Task<Void, Never>? = nil
-            if optimisticActive {
-                // BUGFIX (Category 4): chain off the anchor reserved at Parakeet-return,
-                // not pasteChain-now. Otherwise a faster recording B could overwrite
-                // pasteChain between Parakeet and here, and our optimistic paste would
-                // skip past it. The anchor preserves enqueue (chronological) order.
-                let priorChain = pasteOrderAnchor
-                let snapshotTarget = capturedTargetForTask
-                let optimisticText = formatted
-                let optimisticPolishOwnedFormatting = false  // pre-polish — paster runs its rule-based adjuster
-                let optimisticTask: Task<Void, Never> = Task { @MainActor in
-                    _ = await priorChain.value
-                    guard !work.isCancelled else { return }
-                    var didReactivate = false
-                    if let id = snapshotTarget,
-                       let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
-                       !app.isActive {
-                        app.activate()
-                        didReactivate = true
-                    }
-                    // LATENCY: only pay the 80ms activation settle when we
-                    // actually switched apps (see final-paste path for rationale).
-                    if didReactivate { try? await Task.sleep(nanoseconds: 80_000_000) }
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(optimisticText, forType: .string)
-                    self.cursorPaster.pasteAtCursor(
-                        optimisticText,
-                        restoreClipboard: false,
-                        preFormatted: optimisticPolishOwnedFormatting
-                    )
-                    try? await Task.sleep(nanoseconds: 60_000_000)
-                    vlog("[VOICE] OPTIMISTIC paste DONE")
-                }
-                pasteChain = optimisticTask
-                ourOptimisticTask = optimisticTask
-                // Snapshot the pasteboard once the optimistic write has landed,
-                // so the post-polish swap can detect "user typed over our paste".
-                optimisticPasteboardSig = optimisticText
             }
             // var (not let) — see the empty-polish guard below that may
             // fall back to `formatted` if Qwen3 returns whitespace/empty.
@@ -6410,7 +6324,7 @@ extension AppDelegate: NSWindowDelegate {
                 }
                 let graniteLabel = graniteTranscript.map { "'\($0.prefix(40))'" } ?? "nil"
                 let moonshineLabel = moonshineTranscript.map { "'\($0.prefix(40))'" } ?? "nil"
-                finalText = await Qwen3Polisher.shared.merge(
+                finalText = await FlowRunCollector.$current.withValue(run) { await Qwen3Polisher.shared.merge(
                     parakeet: formatted,
                     granite: graniteTranscript,
                     moonshine: moonshineTranscript,
@@ -6421,7 +6335,7 @@ extension AppDelegate: NSWindowDelegate {
                     appContextLabel: capturedRichAppContextForTask ?? Qwen3Polisher.appContextLabel(forBundleID: capturedTargetForTask),
                     cleanupLevel: cleanupForTask,
                     personalityStyle: personalityForTask
-                )
+                ) }
                 // Triple-ASR capture for the Polish Replay debug panel. Pure
                 // observer — runs AFTER the merge has produced `finalText`,
                 // never blocks the paste path, persists best-effort. We
@@ -6478,7 +6392,7 @@ extension AppDelegate: NSWindowDelegate {
                 // separate bounded window and preserve each unedited section.
                 // Longer drafts earn more time (1.5 s + 12 ms a word, at most 6 s): mid-length dictations
                 // used to miss the flat 1.5 s about two times in three and paste rules-only text (21 Nov 2026).
-                let shortBudget = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
+                let shortBudget = DictationDeadline.remainingSeconds(sinceKeyRelease: keyUpTimer.seconds(),
                                                                      words: draftWords)
                 // Long dictations try the PC first (RemoteCleanup); its time counts inside the same budgets below.
                 let remoteStarted = ContinuousClock.now
@@ -6489,6 +6403,7 @@ extension AppDelegate: NSWindowDelegate {
                         appContextLabel: capturedRichAppContextForTask ?? Qwen3Polisher.appContextLabel(forBundleID: capturedTargetForTask),
                         longProse: longProse, timeout: longProse ? 2.4 : shortBudget * 0.6) {
                     cleanupRoute = "remote-pc"
+                    run.model("cleanupEngine", "remote-pc")
                     finalText = pcText
                 } else if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
                    longProse || formatted.contains(where: \.isNewline) {
@@ -6541,26 +6456,22 @@ extension AppDelegate: NSWindowDelegate {
                     traceFallback = actual.fallback
                 }
             }
-            run.stage("cleanup", text: finalText, ms: Int(Date().timeIntervalSince(polishStart) * 1000),
+            run.stage("cleanup", text: finalText, ms: Int(polishTimer.seconds() * 1000),
                       detail: ["route": cleanupRoute, "engine": traceEngine, "fallback": traceFallback ?? "none"])
             run.model("cleanup", traceEngine)
-            run.model("cleanupEngine", PolishStatus.shared.lastEngine)
-            if PolishStatus.shared.lastSanitizerRejected {
-                run.decision("cleanup-guard", "rejected", reason: PolishStatus.shared.lastReason)
-            } else if let reason = PolishStatus.shared.lastReason, !reason.isEmpty {
-                run.decision("cleanup-guard", "note", reason: reason)
-            }
+            // Backends attach their own engine/guard result through the task-local collector.
+            // The shared UI's last result may belong to another concurrent dictation.
             if let fallback = traceFallback { run.decision("cleanup", "fallback", reason: fallback) }
             // Check the proposed cleanup only within the existing key-up budget.
             // A cold or busy reviewer leaves the ordinary cleanup result in place.
             if (traceModelWillRun || cleanupRoute == "remote-pc"), !editedBySection,
                !work.isCancelled {
-                let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
+                let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: keyUpTimer.seconds(),
                                                                    words: draftWords)
                 if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText,
                     deadline: ContinuousClock.now + .seconds(remaining), collector: run) {
                     let partial = finalText.utf8.count <= 600 &&
-                        DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
+                        DictationDeadline.remainingSeconds(sinceKeyRelease: keyUpTimer.seconds(),
                                                            words: draftWords) > 0.05
                         ? Qwen3Polisher.recoverAnchoredSpelling(original: formatted, proposed: finalText) : nil
                     finalText = partial ?? formatted
@@ -6570,13 +6481,12 @@ extension AppDelegate: NSWindowDelegate {
                     run.stage("decision-gate", text: finalText)
                 }
             }
-            let polishMs = Int(Date().timeIntervalSince(polishStart) * 1000)
+            let polishMs = Int(polishTimer.seconds() * 1000)
             fputs("[LATENCY] Qwen3 polish: \(polishMs)ms (enabled=\(polishEnabledByUser), skipShort=\(skipPolish))\n", stderr)
             // BUGFIX: guard against polish returning empty/whitespace. If
             // Qwen3 ever returns "" we'd paste nothing at the cursor while
             // the user thinks their dictation succeeded. Fall back to the
-            // pre-polish formatted text — same data the optimistic-paste
-            // path would have written.
+            // pre-polish formatted text.
             if WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
                 // WhisperNow tuned answered EMPTY for hesitation sounds only: treat it like no speech.
                 vlog("[VOICE] WhisperNow tuned: no speech — nothing to paste")
@@ -6595,6 +6505,7 @@ extension AppDelegate: NSWindowDelegate {
                 finalText = formatted
             }
             let modelOutputForTraining = finalText
+            let postCleanupTimer = PipelineTimer()
             finalText = T2CleanupOptions.finalizedTranscript(candidate: finalText, preparedASR: formatted,
                 level: cleanupForTask, recognizedT2: usesModelTranscript)
                 ?? DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
@@ -6616,7 +6527,7 @@ extension AppDelegate: NSWindowDelegate {
             // Real-word pass (tinyfix): their/there, its/it's, then/than in English sentences. Off with cleanup.
             var lockedWordRanges: [NSRange] = []
             if polishEnabledByUser && cleanupForTask != "none" {
-                let started = CFAbsoluteTimeGetCurrent()
+                let repairTimer = PipelineTimer()
                 let input = finalText
                 let isCode = polishContext == .code
                 let repaired = await DictationReferee.background(collector: run) {
@@ -6625,12 +6536,12 @@ extension AppDelegate: NSWindowDelegate {
                 guard !Task.isCancelled, !work.isCancelled else { return }
                 finalText = repaired.text
                 lockedWordRanges = repaired.lockedRanges
-                run.stage("tinyfix", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000))
+                run.stage("tinyfix", text: finalText, ms: repairTimer.milliseconds())
             }
             // tinynext recheck of Parakeet's low-confidence words: a word changes only when a near word reads
             // clearly better in context (LowConfidenceRecheck). Off with cleanup and in code. Falls back to text.
             if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code {
-                let started = CFAbsoluteTimeGetCurrent()
+                let repairTimer = PipelineTimer()
                 let input = finalText
                 let locks = lockedWordRanges
                 let recheck = await DictationReferee.background(collector: run) {
@@ -6643,7 +6554,7 @@ extension AppDelegate: NSWindowDelegate {
                     run.decision("tinynext", "\(change.original) -> \(change.replacement)",
                                  reason: String(format: "score margin %.3f", change.delta))
                 }
-                run.stage("tinynext", text: finalText, ms: Int((CFAbsoluteTimeGetCurrent() - started) * 1000),
+                run.stage("tinynext", text: finalText, ms: repairTimer.milliseconds(),
                           detail: ["suspects": "\(Set(parakeetSuspectsAgg).count)", "changed": "\(recheck.changes.count)"])
             }
             if polishContext != .code {
@@ -6666,6 +6577,8 @@ extension AppDelegate: NSWindowDelegate {
                 print("[VOICE-CANCEL-INFLIGHT] post-polish cancellation detected — skipping paste enqueue")
                 return
             }
+            let postCleanupMs = postCleanupTimer.milliseconds()
+            run.timing("postCleanupMs", postCleanupMs)
             // The single place a dictation's final text is decided. Remembered
             // before the paste is attempted, so Control+Command+V still works
             // when the automatic paste landed in the wrong place or failed.
@@ -6696,7 +6609,7 @@ extension AppDelegate: NSWindowDelegate {
             ])
 
             // Calculate statistics
-            let wordCount = finalText.split(separator: " ").count
+            let wordCount = finalText.split(whereSeparator: \.isWhitespace).count
             let durationSeconds = Int(duration)
             let wpm = durationSeconds > 0 ? (wordCount * 60) / durationSeconds : 0
             // "Last dictation" snapshot stats drive the live pill / stats UI and
@@ -6726,45 +6639,20 @@ extension AppDelegate: NSWindowDelegate {
                 skipPolish: skipPolish, formatted: formatted, final: finalText,
                 fieldContextProvided: capturedFieldContextForTask != nil, command: pressEnterCommand)
             let polishOwnedFormatting = deliveryIntent.preFormatted
-            // BUGFIX (Category 4): if we ran optimistic paste, chain off THAT task
-            // (most-recent pasteChain) so our final paste serializes after our own
-            // optimistic write. Otherwise chain off the parakeet-return anchor so
-            // paste order = finish-call order, not polish-completion order.
-            // BUGFIX: reading `pasteChain` here was racy — during the polish
-            // await another session can mutate it. Use the local snapshot of
-            // our own optimistic task instead so we always serialize behind
-            // our own pre-polish write.
-            let prior: Task<Void, Never>? = optimisticActive
-                ? (ourOptimisticTask ?? pasteOrderAnchor)
-                : pasteOrderAnchor
-            print("[VOICE-TIMING] polish returned at \(Date()) chars=\(finalText.count)")
-            // OPTIMISTIC SWAP PATH: optimistic paste already wrote `formatted`
-            // to the field above. If polish completed and produced something
-            // genuinely different, attempt a Cmd+Z then paste the polished
-            // version. Bail out and leave the unpolished text in place when:
-            //   - polish didn't change anything (no swap needed)
-            //   - polish was disabled / short / non-English (finalText==formatted)
-            //   - the system pasteboard contents differ from what we wrote
-            //     (something else clobbered it — could be the user typing
-            //     manually, another paste source, etc.)
-            //
-            // The Cmd+Z + repaste is best-effort: if Cmd+Z can't undo (the
-            // app doesn't support it) the user ends up with both versions
-            // visible, which is a less bad outcome than losing their text.
-            let optimisticSwapNeeded = optimisticActive && polishChanged
-            let optimisticSig = optimisticPasteboardSig
+            let prior = pasteOrderAnchor
             // The pill's glow learns how long processing took for this much speech.
             PillWorkTiming.recordDictation(words: wordCount, audioSeconds: duration,
-                                           seconds: CFAbsoluteTimeGetCurrent() - keyUpAt)
+                                           seconds: keyUpTimer.seconds())
             run.update {
                 $0.fallbackReason = traceFallback
                 $0.timingsMs["rulesMs"] = Int(formatterMs)
                 $0.timingsMs["cleanupMs"] = polishMs
-                $0.timingsMs["handoffAtMs"] = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
+                $0.timingsMs["handoffAtMs"] = Int(keyUpTimer.seconds() * 1000)
                 $0.settings["context"] = polishContext.rawValue
                 $0.settings["autoPaste"] = "\(autoPaste)"
             }
             deliveryStarted = true
+            let deliveryQueueTimer = PipelineTimer()
             work.task = Task { @MainActor in
                 defer {
                     deliverySlot.finish()
@@ -6774,94 +6662,14 @@ extension AppDelegate: NSWindowDelegate {
                     self.refreshMenuBarIcon()
                 }
                 _ = await prior?.value
-                // ESC-cancel checkpoint: unlike the optimistic first paste, the
-                // swap (Cmd+Z undo + repaste) had no early guard — so an ESC
-                // could still trigger an undo/repaste after cancellation. Bail.
+                let deliveryQueueMs = deliveryQueueTimer.milliseconds()
+                run.timing("deliveryQueueMs", deliveryQueueMs)
+                // Cancellation while waiting for the previous delivery must not paste later.
                 guard !Task.isCancelled, work.mayDeliver else {
                     run.finish(outcome: "cancelled", output: nil)
                     return
                 }
-                let tPasteStart = CFAbsoluteTimeGetCurrent()
-                if optimisticSwapNeeded, let sig = optimisticSig {
-                    // SWAP PATH — optimistic paste already ran, try to replace.
-                    let pb = NSPasteboard.general
-                    let currentClipboard = pb.string(forType: .string) ?? ""
-                    if currentClipboard != sig {
-                        print("[VOICE] OPTIMISTIC swap SKIPPED — clipboard changed since paste (current!=sig)")
-                        if autoCopy {
-                            DictationPasteboard.write(finalText, to: pb)
-                        }
-                    } else {
-                        if let id = capturedTargetForTask,
-                           let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
-                           !app.isActive {
-                            app.activate()
-                        }
-                        try? await Task.sleep(nanoseconds: 60_000_000)
-                        self.cursorPaster.undoLastPaste()
-                        try? await Task.sleep(nanoseconds: 60_000_000)
-                        // TRANSCRIPT-LOSS SAFETY NET (mirrors the final-paste
-                        // path): keep the polished text on the clipboard as the
-                        // recovery net whether or not auto-copy is on, and never
-                        // restore the prior clipboard over it. If the synthetic
-                        // repaste fails, CursorPaster's toast tells the user to
-                        // press Cmd+V — that must actually paste their transcript.
-                        DictationPasteboard.write(finalText, to: pb)
-                        self.cursorPaster.pasteAtCursor(
-                            finalText,
-                            restoreClipboard: false,
-                            preFormatted: polishOwnedFormatting
-                        )
-                        try? await Task.sleep(nanoseconds: 60_000_000)
-                    }
-                    Qwen3Polisher.shared.updateRollingContext(finalText)
-                    let pasteMs = (CFAbsoluteTimeGetCurrent() - tPasteStart) * 1000
-                    let totalMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-                    fputs("[LATENCY] Paste (optimistic-swap branch): \(Int(pasteMs))ms\n", stderr)
-                    run.finish(outcome: "optimistic-swap", output: finalText, fallback: traceFallback)
-                    fputs("[LATENCY] TOTAL pipeline (optimistic): \(Int(totalMs))ms (parakeet=\(Int(parakeetMs)) formatter=\(Int(formatterMs)) polish=\(polishMs) paste=\(Int(pasteMs)))\n", stderr)
-                    Telemetry.log("latency.pipeline", properties: [
-                        "total_ms": Int(totalMs),
-                        "parakeet_ms": Int(parakeetMs),
-                        "formatter_ms": Int(formatterMs),
-                        "polish_ms": polishMs,
-                        "paste_ms": Int(pasteMs),
-                        "polish_enabled": polishEnabledByUser,
-                        "polish_skipped_short": skipPolish,
-                        "input_chars": formatted.count,
-                        "output_chars": finalText.count,
-                        "optimistic_paste": true
-                    ])
-                    return
-                }
-                if optimisticActive && !optimisticSwapNeeded {
-                    // Optimistic paste already landed the right text — nothing to do.
-                    print("[VOICE] OPTIMISTIC paste was sufficient — polish unchanged")
-                    if autoCopy {
-                        let pb = NSPasteboard.general
-                        DictationPasteboard.write(finalText, to: pb)
-                    }
-                    Qwen3Polisher.shared.updateRollingContext(finalText)
-                    let pasteMs = (CFAbsoluteTimeGetCurrent() - tPasteStart) * 1000
-                    let totalMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-                    fputs("[LATENCY] Paste (optimistic-noop branch): \(Int(pasteMs))ms\n", stderr)
-                    run.finish(outcome: "optimistic", output: finalText, fallback: traceFallback)
-                    fputs("[LATENCY] TOTAL pipeline (optimistic-noop): \(Int(totalMs))ms (parakeet=\(Int(parakeetMs)) formatter=\(Int(formatterMs)) polish=\(polishMs) paste=\(Int(pasteMs)))\n", stderr)
-                    Telemetry.log("latency.pipeline", properties: [
-                        "total_ms": Int(totalMs),
-                        "parakeet_ms": Int(parakeetMs),
-                        "formatter_ms": Int(formatterMs),
-                        "polish_ms": polishMs,
-                        "paste_ms": Int(pasteMs),
-                        "polish_enabled": polishEnabledByUser,
-                        "polish_skipped_short": skipPolish,
-                        "input_chars": formatted.count,
-                        "output_chars": finalText.count,
-                        "optimistic_paste": true,
-                        "optimistic_noop": true
-                    ])
-                    return
-                }
+                let pasteTimer = PipelineTimer()
                 if autoCopy {
                     print("[VOICE] Copying to clipboard...")
                     let pb = NSPasteboard.general
@@ -6872,7 +6680,9 @@ extension AppDelegate: NSWindowDelegate {
                 // and clipboard details out of the trace.
                 var traceStages: [String: Int] = [
                     "transcriptAtMs": transcriptAtMs,
-                    "rulesMs": Int(formatterMs)
+                    "rulesMs": Int(formatterMs),
+                    "postCleanupMs": postCleanupMs,
+                    "deliveryQueueMs": deliveryQueueMs
                 ]
                 if started != nil { traceStages["holdMs"] = Int(duration * 1000) }
                 if traceModelWillRun { traceStages["modelMs"] = polishMs }
@@ -6882,14 +6692,22 @@ extension AppDelegate: NSWindowDelegate {
                     stagesMs: traceStages, pasteVerdict: nil, recordedAt: Date())
                 let traceGate = OneShotGate()
                 var dispatchedReceipt: CursorPaster.PasteReceipt?
+                var pasteDispatchTimer: PipelineTimer?
                 // Set when the paste was refused for a secure (password) field. Text from such a dictation is never logged.
                 var pasteTargetSecure = false
                 func recordPaste(_ verdict: String) {
                     guard traceGate.claim() else { return }
                     let secure = pasteTargetSecure || verdict == "secure-field"
                     trace.pasteVerdict = verdict
+                    let completedAt = keyUpTimer.milliseconds()
+                    trace.stagesMs["deliveryCompleteAtMs"] = completedAt
+                    trace.stagesMs["deliveryMs"] = pasteTimer.milliseconds()
+                    if let pasteDispatchTimer { trace.stagesMs["readbackMs"] = pasteDispatchTimer.milliseconds() }
                     DictationTraceLog.append(trace)
-                    run.timing("pasteAtMs", Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000))
+                    run.update {
+                        $0.timingsMs.merge(trace.stagesMs, uniquingKeysWith: { _, current in current })
+                        $0.timingsMs["pasteAtMs"] = completedAt // legacy alias for delivery completion
+                    }
                     run.finish(outcome: verdict, output: dispatchedReceipt?.insertedText ?? finalText,
                                fallback: trace.fallbackReason, secureField: secure)
                     let runID = run.snapshot.id
@@ -6926,6 +6744,22 @@ extension AppDelegate: NSWindowDelegate {
                     // restoration. A scheduled paste is not confirmation of delivery.
                     await withCheckedContinuation { (landed: CheckedContinuation<Void, Never>) in
                     let landedGate = OneShotGate()
+                    var readbackBackstop: Task<Void, Never>?
+                    func finishDelivery() {
+                        guard landedGate.claim() else { return }
+                        readbackBackstop?.cancel()
+                        readbackBackstop = nil
+                        landed.resume()
+                    }
+                    // Arm before dispatch, including failures that complete synchronously.
+                    readbackBackstop = Task {
+                        do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                        guard landedGate.claim() else { return }
+                        work.expireDelivery()
+                        recordPaste(trace.stagesMs["pasteSentAtMs"] == nil ? "no-dispatch-result" : "unverified")
+                        readbackBackstop = nil
+                        landed.resume()
+                    }
                     var skippedInSecureField = false
                     cursorPaster.pasteAtCursor(
                         finalText,
@@ -6955,11 +6789,12 @@ extension AppDelegate: NSWindowDelegate {
                             // A sent event is not a completed delivery: keep the FIFO
                             // slot until readback has either verified or attempted fallback.
                             defer {
-                                if result != .eventSent, landedGate.claim() { landed.resume() }
+                                if result != .eventSent { finishDelivery() }
                             }
                             switch result {
                             case .eventSent:
-                                trace.stagesMs["pasteSentAtMs"] = Int((CFAbsoluteTimeGetCurrent() - keyUpAt) * 1000)
+                                pasteDispatchTimer = PipelineTimer()
+                                trace.stagesMs["pasteSentAtMs"] = keyUpTimer.milliseconds()
                                 // Wispr plays its paste cue once a dictation is pasted.
                                 SoundEffects.playDone()
                                 // Wispr's auto-cleanup nudge: "Cleaned up! See what's changed".
@@ -6978,7 +6813,7 @@ extension AppDelegate: NSWindowDelegate {
                             // A failed dispatch may report unknown synchronously before
                             // completion. Let the completion record the actual failure.
                             if trace.stagesMs["pasteSentAtMs"] != nil {
-                                defer { if landedGate.claim() { landed.resume() } }
+                                defer { finishDelivery() }
                                 switch verdict {
                                 case .verified: recordPaste("landed"); PillHaptics.pasteConfirmed()
                                 case .notLanded: recordPaste("not-landed")
@@ -7003,15 +6838,6 @@ extension AppDelegate: NSWindowDelegate {
                             self.showPasteRecovery(finalText, id: recoveryID, secureField: reason == .secureField)
                         }
                     )
-                    // Backstop: a paste that never reports back must not hold up the next dictation.
-                    Task {
-                        do { try await Task.sleep(for: .seconds(3)) } catch { return }
-                        // If readback already ended, this timer must not mutate its token.
-                        guard landedGate.claim() else { return }
-                        work.expireDelivery()
-                        recordPaste(trace.stagesMs["pasteSentAtMs"] == nil ? "no-dispatch-result" : "unverified")
-                        landed.resume()
-                    }
                     }
                     // Reduced settle — Wispr Flow ships Cmd-V without these.
                     // (Inter-paste 60ms removed entirely.)
@@ -7019,9 +6845,9 @@ extension AppDelegate: NSWindowDelegate {
                     print("[VOICE] Auto-paste disabled")
                     recordPaste("auto-paste-off")
                 }
-                let pasteMs = (CFAbsoluteTimeGetCurrent() - tPasteStart) * 1000
-                let totalMs = (CFAbsoluteTimeGetCurrent() - tPipelineStart) * 1000
-                fputs("[LATENCY] Paste (incl. queue + settle): \(Int(pasteMs))ms\n", stderr)
+                let pasteMs = pasteTimer.seconds() * 1000
+                let totalMs = pipelineTimer.seconds() * 1000
+                fputs("[LATENCY] Delivery: \(Int(pasteMs))ms; queue: \(deliveryQueueMs)ms\n", stderr)
                 fputs("[LATENCY] TOTAL pipeline: \(Int(totalMs))ms (parakeet=\(Int(parakeetMs)) formatter=\(Int(formatterMs)) polish=\(polishMs) paste=\(Int(pasteMs)))\n", stderr)
                 Telemetry.log("latency.pipeline", properties: [
                     "total_ms": Int(totalMs),
@@ -7029,6 +6855,9 @@ extension AppDelegate: NSWindowDelegate {
                     "formatter_ms": Int(formatterMs),
                     "polish_ms": polishMs,
                     "paste_ms": Int(pasteMs),
+                    "delivery_queue_ms": deliveryQueueMs,
+                    "post_cleanup_ms": postCleanupMs,
+                    "key_up_to_delivery_ms": keyUpTimer.milliseconds(),
                     "polish_enabled": polishEnabledByUser,
                     "polish_skipped_short": skipPolish,
                     "input_chars": formatted.count,
@@ -7069,7 +6898,7 @@ extension AppDelegate: NSWindowDelegate {
                                   cleanupLevelUsed: cleanupForTask,
                                   personalityStyleUsed: personalityForTask,
                                   polishFixCount: fixCount,
-                                  polishEngine: PolishStatus.shared.lastEngine)
+                                  polishEngine: run.snapshot.models["cleanupEngine"])
             // The database row (saved under this session's id when recording
             // stopped) keeps what was heard; add what was pasted beside it.
             if let rowID = claimed?.sessionId {

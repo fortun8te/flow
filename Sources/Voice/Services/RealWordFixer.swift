@@ -46,8 +46,9 @@ final class RealWordFixer: @unchecked Sendable {
         /// Unknown (likely misspelled) words within two words on either side.
         var unknownNearby: Int = 0
 
-        /// Chance the swap is right. At the threshold the original bench measured about 94% of fixes
-        /// right; every point of value above it is one more point of log-odds.
+        /// Legacy confidence heuristic derived from the upstream typing benchmark.
+        /// This is not a calibrated probability for Flow speech; collect reviewed KEEP/alternative
+        /// decisions before replacing it with a measured calibration model.
         var probability: Double {
             1 / (1 + exp(-(Double(value - RealWordFixer.threshold) + log(0.94 / 0.06))))
         }
@@ -236,24 +237,30 @@ final class RealWordFixer: @unchecked Sendable {
 
         // Model tokens of the whole text, as the engine's tokenize(textBefore, startsSentence: true) sees them.
         var ids: [Int] = []
+        var tokenSourceRanges: [NSRange] = []
         ids.reserveCapacity(raw.count)
+        tokenSourceRanges.reserveCapacity(raw.count)
         var lastToken: String?
         var positionOfRaw = [Int](repeating: -1, count: raw.count)
         for (i, t) in raw.enumerated() {
             if t.text == "\n" {
-                if let last = lastToken, !sentenceOpeners.contains(last) { ids.append(model.tokenID(".")); lastToken = "." }
+                if let last = lastToken, !sentenceOpeners.contains(last) {
+                    ids.append(model.tokenID(".")); tokenSourceRanges.append(t.range); lastToken = "."
+                }
                 continue
             }
             let atStart = lastToken.map(sentenceOpeners.contains) ?? true
             let token = isNameShaped(t.text) && !atStart ? "<name>" : t.lower
             positionOfRaw[i] = ids.count
             ids.append(model.tokenID(token))
+            tokenSourceRanges.append(t.range)
             lastToken = token
         }
 
         struct Job { let rawIndex: Int; let typed: Int; let nearby: [Int] }
         var jobs: [Job] = []
         for (i, t) in raw.enumerated() {
+            if Task.isCancelled { return (text, []) }
             guard let typed = model.ids[t.lower], typed >= TinyFixModel.specialTokens, !skip.contains(t.lower) else { continue }
             let slips = mode == .slips
             let mixupList = model.mixups(for: mode)[typed]
@@ -278,6 +285,8 @@ final class RealWordFixer: @unchecked Sendable {
         var left = [Int32](repeating: 0, count: jobs.count * L)
         var right = [Int32](repeating: 0, count: jobs.count * R)
         var cands = [Int32](repeating: 0, count: jobs.count * C)
+        var contextRanges: [NSRange] = []
+        contextRanges.reserveCapacity(jobs.count)
         for (b, job) in jobs.enumerated() {
             let position = positionOfRaw[job.rawIndex]
             if position >= L {
@@ -300,20 +309,38 @@ final class RealWordFixer: @unchecked Sendable {
                 after.append(isNameShaped(t.text) && !atStart ? "<name>" : t.lower)
             }
             for (k, token) in after.enumerated() { right[b * R + (R - 1 - k)] = Int32(model.tokenID(token)) }
+            let lo = tokenSourceRanges[max(0, position - L)].location
+            let hi = raw[max(job.rawIndex, r - 1)].range.upperBound
+            contextRanges.append(NSRange(location: lo, length: hi - lo))
             cands[b * C] = Int32(job.typed)
             for (k, id) in job.nearby.enumerated() { cands[b * C + 1 + k] = Int32(id) }
         }
         let scores = model.scores(left: left, right: right, candidates: cands, batch: jobs.count)
+        guard !Task.isCancelled, scores.count == jobs.count * C else { return (text, []) }
 
         var fixes: [(NSRange, String, Fix)] = []
         let curly = units.contains(0x2019) && !units.contains(39)
         var costs: [Int: Float] = [:]   // typed id * 20,000 + candidate id -> slip cost
         for (b, job) in jobs.enumerated() {
+            if Task.isCancelled { return (text, []) }
             let t = raw[job.rawIndex]
+            guard scores[(b * C)..<(b * C + 1 + job.nearby.count)].allSatisfy(\.isFinite) else { continue }
             let typedScore = scores[b * C]
             let mixups = model.knownMixups[job.typed] ?? []
             let typedHasMixups = job.nearby.contains(where: mixups.contains)
-            var best: (word: String, value: Float, margin: Float, mixup: Bool)?
+            let p = positionOfRaw[job.rawIndex]
+            let unknownNearby = (max(0, p - 2)...min(ids.count - 1, p + 2)).filter { $0 != p && ids[$0] == TinyFixModel.unknown }.count
+            let required = threshold + (unknownNearby > 0 ? 1 : 0)
+            let collector = FlowRunCollector.current
+            let collect = collector?.canCollectWordDecision == true
+            var candidates = collect ? [WordDecisionEvidence.Candidate(text: t.text, rawScore: Double(typedScore),
+                adjustedScore: 0, features: ["unknownNearby": Double(unknownNearby)])] : []
+            func cased(_ word: String) -> String {
+                let matched = matchCase(t.text, word)
+                return t.text.contains("’") || (!t.text.contains("'") && curly)
+                    ? matched.replacingOccurrences(of: "'", with: "’") : matched
+            }
+            var best: (word: String, value: Float, margin: Float, mixup: Bool, index: Int)?
             for (k, id) in job.nearby.enumerated() {
                 let word = model.vocabulary[id]
                 let isMixup = mixups.contains(id)
@@ -329,16 +356,22 @@ final class RealWordFixer: @unchecked Sendable {
                     if typedHasMixups { value -= otherWordPenalty }
                     if differsOnlyInEnding(t.lower, word) { value -= inflectionPenalty }
                 }
-                if best == nil || value > best!.value { best = (word, value, margin, isMixup) }
+                if collect {
+                    candidates.append(WordDecisionEvidence.Candidate(text: cased(word), rawScore: Double(scores[b * C + k + 1]),
+                        adjustedScore: Double(value), features: ["cost": Double(cost), "knownMixup": isMixup ? 1 : 0,
+                            "rawMargin": Double(margin), "unknownNearby": Double(unknownNearby)]))
+                }
+                if best == nil || value > best!.value { best = (word, value, margin, isMixup, k + 1) }
             }
-            let p = positionOfRaw[job.rawIndex]
-            let unknownNearby = (max(0, p - 2)...min(ids.count - 1, p + 2)).filter { $0 != p && ids[$0] == TinyFixModel.unknown }.count
+            if collect, let best, let evidence = WordDecisionEvidence.make(stage: "tinyfix", mode: mode.rawValue,
+                source: text, range: t.range, contextRange: contextRanges[b], candidates: candidates,
+                chosenIndex: best.value >= required && cased(best.word) != t.text ? best.index : 0,
+                margin: Double(best.value), threshold: Double(required), modelID: "tinyfix") {
+                collector?.wordDecision(evidence)
+            }
             // A less certain context needs a bigger margin.
-            guard let best, best.value >= threshold + (unknownNearby > 0 ? 1 : 0) else { continue }
-            var replacement = matchCase(t.text, best.word)
-            if t.text.contains("’") || (!t.text.contains("'") && curly) {
-                replacement = replacement.replacingOccurrences(of: "'", with: "’")
-            }
+            guard let best, best.value >= required else { continue }
+            let replacement = cased(best.word)
             guard replacement != t.text else { continue }
             fixes.append((t.range, replacement, Fix(original: t.text, replacement: replacement, margin: best.margin,
                                                    value: best.value, location: t.range.location,

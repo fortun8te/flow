@@ -22,6 +22,7 @@ import Foundation
 public enum ProperNounVocabulary {
     private static let key = "userProperNouns"
     private static let maxTerms = 600
+    private static let mutationLock = NSRecursiveLock()
 
     private static let seedTerms = [
         "Wispr Flow", "ChatGPT", "OpenAI", "Claude", "Claude Code",
@@ -31,7 +32,7 @@ public enum ProperNounVocabulary {
     static let excludedTermsKey = "voice.dictionaryExcludedTerms"
 
     static func excludedTerms(defaults: UserDefaults = .standard) -> Set<String> {
-        Set(defaults.stringArray(forKey: excludedTermsKey) ?? [])
+        Set((defaults.stringArray(forKey: excludedTermsKey) ?? []).map(VocabularyReplacementRules.key).filter { !$0.isEmpty })
     }
 
     static func preferredSpellingTerms() -> [String] {
@@ -45,23 +46,30 @@ public enum ProperNounVocabulary {
     ]
 
     private static let heardNameLock = NSLock()
-    nonisolated(unsafe) private static var heardNameCache: (revision: Int, regex: NSRegularExpression?, map: [String: String])?
+    nonisolated(unsafe) private static var heardNameCache: (owner: AutoDictionary, revision: Int, excluded: Set<String>, rules: VocabularyReplacementRules)?
+    private static let preferredSpellingLock = NSLock()
+    nonisolated(unsafe) private static var preferredSpellingCache: (terms: [Data], rules: VocabularyReplacementRules)?
+    private static let vocabularyLock = NSLock()
+    nonisolated(unsafe) private static var vocabularyCache: (owner: AutoDictionary, revision: Int, stored: [Data], excluded: Set<String>, view: VocabularyView)?
+
+    struct VocabularyView {
+        let custom: [String]
+        let all: [String]
+    }
 
     /// The built-in fixes plus the misheard names and phrases Flow learned from the user's edits
     /// (AutoDictionary). Rebuilt when the learned list changes, so a new fix applies on the next dictation.
-    private static func heardNameRules(learned: AutoDictionary = .shared) -> (regex: NSRegularExpression?, map: [String: String]) {
-        let revision = learned.currentRevision
+    static func heardNameRules(learned: AutoDictionary = .shared, defaults: UserDefaults = .standard) -> VocabularyReplacementRules {
+        let snapshot = learned.liveSnapshot()
+        let excluded = excludedTerms(defaults: defaults)
         heardNameLock.lock(); defer { heardNameLock.unlock() }
-        if let cache = heardNameCache, cache.revision == revision { return (cache.regex, cache.map) }
-        var map = Dictionary(heardNameFixes.map { ($0.heard, $0.written) }, uniquingKeysWith: { a, _ in a })
-        for fix in learned.liveReplacements() where map[fix.heard] == nil { map[fix.heard] = fix.written }
-        let alternatives = map.keys.sorted { $0.count != $1.count ? $0.count > $1.count : $0 < $1 }
-            .map { NSRegularExpression.escapedPattern(for: $0).replacingOccurrences(of: " ", with: "[ ]") }
-            .joined(separator: "|")
-        let regex = try? NSRegularExpression(pattern: #"(?<![\p{L}\p{N}_./@-])(?:"# + alternatives + #")(?![\p{L}\p{N}_/@-])"#,
-                                             options: .caseInsensitive)
-        heardNameCache = (revision, regex, map)
-        return (regex, map)
+        if let cache = heardNameCache, cache.owner === learned, cache.revision == snapshot.revision, cache.excluded == excluded {
+            return cache.rules
+        }
+        let pairs = heardNameFixes + snapshot.replacements.map { ($0.heard, $0.written) }
+        let rules = VocabularyReplacementRules(pairs, blockedAliases: snapshot.conflictingAliases, excludedTargets: excluded)
+        heardNameCache = (learned, snapshot.revision, excluded, rules)
+        return rules
     }
 
     /// Short all-caps abbreviations Jordan says or types. Written in capitals, whatever the casing
@@ -69,16 +77,29 @@ public enum ProperNounVocabulary {
     /// A dotted abbreviation loses its final dot only before a lowercase word ("A.S.A.P. today").
     static let capsAbbreviations: [String] = ["ASAP", "FYI", "ETA", "TBH", "IDK", "API", "UI", "MCP", "NAS", "PC",
                                               "GPU", "AI", "DM"]
+    private static let defaultAbbreviationRules = abbreviationRules(capsAbbreviations)
+
+    private static func abbreviationRules(_ terms: [String]) -> [(String, NSRegularExpression)] {
+        terms.compactMap { term in
+            let spaced = term.map { NSRegularExpression.escapedPattern(for: String($0)) }.joined(separator: "[ .]")
+            let pattern = #"(?<![\p{L}\p{N}])(?:"# + NSRegularExpression.escapedPattern(for: term) + "|" + spaced
+                + #"(?:\.(?=\s+(?-i:\p{Ll})))?)(?![\p{L}\p{N}])"#
+            return (try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)).map { (term, $0) }
+        }
+    }
 
     /// Writes each capsAbbreviations entry in capitals. A spaced or dotted run only counts when every
     /// letter is separated, so "a sap" is left alone.
     static func applyCapsAbbreviations(_ text: String, terms: [String] = capsAbbreviations) -> String {
+        let rules = terms == capsAbbreviations ? defaultAbbreviationRules : abbreviationRules(terms)
+        let frozen = EntityFreezer.freeze(text, mode: .minimal)
+        let corrected = applyAbbreviations(to: frozen.text, rules: rules)
+        return corrected.utf16.elementsEqual(frozen.text.utf16) ? text : EntityFreezer.unfreeze(corrected, entities: frozen.entities)
+    }
+
+    private static func applyAbbreviations(to text: String, rules: [(String, NSRegularExpression)]) -> String {
         var result = text
-        for term in terms {
-            let spaced = term.map { NSRegularExpression.escapedPattern(for: String($0)) }.joined(separator: "[ .]")
-            let pattern = #"(?<![\p{L}\p{N}])(?:"# + NSRegularExpression.escapedPattern(for: term) + "|" + spaced
-                + #"(?:\.(?=\s+(?-i:\p{Ll})))?)(?![\p{L}\p{N}])"#
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
+        for (term, regex) in rules {
             let mutable = NSMutableString(string: result)
             for match in regex.matches(in: result, range: NSRange(location: 0, length: mutable.length)).reversed() {
                 let found = mutable.substring(with: match.range)
@@ -92,47 +113,31 @@ public enum ProperNounVocabulary {
     /// Writes each misheard name the way Jordan spells it. Links, emails and code stay as they are.
     static func applyHeardNameFixes(_ text: String) -> String {
         let rules = heardNameRules()
-        let heardNameMap = rules.map
         guard let regex = rules.regex else { return text }
         let ns = text as NSString
         guard regex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil else { return text }
         let frozen = EntityFreezer.freeze(text, mode: .minimal)
-        let result = NSMutableString(string: frozen.text)
-        for match in regex.matches(in: frozen.text, range: NSRange(location: 0, length: result.length)).reversed() {
-            let heard = result.substring(with: match.range)
-            if let written = heardNameMap[heard.lowercased()], heard != written {
-                result.replaceCharacters(in: match.range, with: written)
-            }
-        }
-        let corrected = result as String
-        return corrected == frozen.text ? text : EntityFreezer.unfreeze(corrected, entities: frozen.entities)
+        let corrected = rules.apply(to: frozen.text)
+        return corrected.utf16.elementsEqual(frozen.text.utf16) ? text : EntityFreezer.unfreeze(corrected, entities: frozen.entities)
     }
 
     /// Restore the spelling already present. An entry never substitutes a different heard word.
     /// Misheard names (`heardNameFixes`) are written correctly first.
     static func applyPreferredSpelling(_ text: String, terms: [String]) -> String {
-        let text = applyCapsAbbreviations(TypoRepair.applyLearnedSpelling(applyHeardNameFixes(text)))
-        var spelling: [String: String] = [:]
-        for term in terms {
-            let key = term.lowercased()
-            if !key.isEmpty, spelling[key] == nil { spelling[key] = term }
-        }
-        guard !spelling.isEmpty else { return text }
-        let alternatives = spelling.keys.sorted { $0.count != $1.count ? $0.count > $1.count : $0 < $1 }
-            .map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
-        let pattern = #"(?<![\p{L}\p{N}_])(?:"# + alternatives + #")(?![\p{L}\p{N}_])"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return text }
+        // One protected snapshot covers the whole pass, including abbreviation casing.
         let frozen = EntityFreezer.freeze(text, mode: .minimal)
-        let result = NSMutableString(string: frozen.text)
-        let whole = NSRange(location: 0, length: result.length)
-        for match in regex.matches(in: frozen.text, range: whole).reversed() {
-            let heard = result.substring(with: match.range)
-            if let preferred = spelling[heard.lowercased()], heard != preferred {
-                result.replaceCharacters(in: match.range, with: preferred)
-            }
+        let heard = heardNameRules().apply(to: frozen.text)
+        let typed = TypoRepair.applyLearnedSpelling(heard)
+        let prepared = applyAbbreviations(to: typed, rules: defaultAbbreviationRules)
+        let keys = terms.map { Data($0.utf8) }
+        let rules = preferredSpellingLock.withLock { () -> VocabularyReplacementRules in
+            if let cache = preferredSpellingCache, cache.terms == keys { return cache.rules }
+            let rules = VocabularyReplacementRules(terms.map { ($0, $0) })
+            preferredSpellingCache = (keys, rules)
+            return rules
         }
-        let corrected = result as String
-        return corrected == frozen.text ? text : EntityFreezer.unfreeze(corrected, entities: frozen.entities)
+        let corrected = rules.apply(to: prepared)
+        return corrected.utf16.elementsEqual(frozen.text.utf16) ? text : EntityFreezer.unfreeze(corrected, entities: frozen.entities)
     }
 
     /// The user-learned / manually-added custom terms only — NOT the
@@ -140,45 +145,51 @@ public enum ProperNounVocabulary {
     /// what gets STRONG priority in ASR vocabulary boosting. Sorted +
     /// deduped (case-insensitively); persisted in UserDefaults under `key`.
     public static func customTerms() -> [String] {
-        // His own list first, then the names Flow learned from his fixes (AutoDictionary).
-        let stored = (UserDefaults.standard.array(forKey: key) as? [String] ?? []) + AutoDictionary.shared.liveNames()
-        // Case-insensitive dedupe, preserving first-seen casing.
-        let excluded = excludedTerms()
-        var seen = Set<String>()
-        var unique: [String] = []
-        for term in stored {
-            let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            let lower = trimmed.lowercased()
-            if !excluded.contains(lower), seen.insert(lower).inserted {
-                unique.append(trimmed)
-            }
-        }
-        unique.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-        return unique
+        vocabularyView().custom
     }
 
     /// Get the current vocabulary (manual + learned + seed).
     public static func current() -> [String] {
-        let stored = customTerms()
-        let excluded = excludedTerms()
-        // Merge seed terms in case fresh install / cleared defaults.
-        // User terms are never cut by the cap; seeds fill what is left.
+        vocabularyView().all
+    }
+
+    /// Cache the sorted view by exact user preferences and one atomic learned snapshot.
+    /// External settings edits invalidate it without waiting for a dictionary file reload.
+    static func vocabularyView(defaults: UserDefaults = .standard, learned: AutoDictionary = .shared) -> VocabularyView {
+        let manual = defaults.stringArray(forKey: key) ?? []
+        let storedKey = manual.map { Data($0.utf8) }
+        let excluded = excludedTerms(defaults: defaults)
+        let snapshot = learned.liveSnapshot()
+        vocabularyLock.lock(); defer { vocabularyLock.unlock() }
+        if let cache = vocabularyCache, cache.owner === learned, cache.revision == snapshot.revision,
+           cache.stored == storedKey, cache.excluded == excluded { return cache.view }
+        var seen = Set<String>()
+        var custom: [String] = []
+        for term in manual + snapshot.names {
+            let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = VocabularyReplacementRules.key(trimmed)
+            if !key.isEmpty, !excluded.contains(key), seen.insert(key).inserted { custom.append(trimmed) }
+        }
+        custom.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         let longestFirst: (String, String) -> Bool = { $0.count != $1.count ? $0.count > $1.count : $0 < $1 }
-        let user = Array(Set(stored)).sorted(by: longestFirst)
-        let userSet = Set(user)
-        let seeds = Set(seedTerms).subtracting(userSet).filter { !excluded.contains($0.lowercased()) }.sorted(by: longestFirst)
-        var merged = user + seeds.prefix(max(0, maxTerms - user.count))
-        merged.sort(by: longestFirst)   // longest first for prefix-match priority
-        return merged
+        let seeds = seedTerms.filter {
+            let key = VocabularyReplacementRules.key($0)
+            return !seen.contains(key) && !excluded.contains(key)
+        }.sorted(by: longestFirst)
+        let all = (custom + seeds.prefix(max(0, maxTerms - custom.count))).sorted(by: longestFirst)
+        let view = VocabularyView(custom: custom, all: all)
+        vocabularyCache = (learned, snapshot.revision, storedKey, excluded, view)
+        return view
     }
 
     /// Add a manually-entered term.
     public static func add(_ term: String) {
         let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        mutationLock.lock(); defer { mutationLock.unlock() }
         var stored = UserDefaults.standard.array(forKey: key) as? [String] ?? []
-        if !excludedTerms().contains(trimmed.lowercased()), !stored.contains(trimmed) {
+        let normalized = VocabularyReplacementRules.key(trimmed)
+        if !excludedTerms().contains(normalized), !stored.contains(where: { VocabularyReplacementRules.key($0) == normalized }) {
             stored.append(trimmed)
             UserDefaults.standard.set(stored, forKey: key)
             print("[VOICE-VOCAB] added: \(trimmed)")
@@ -188,13 +199,15 @@ public enum ProperNounVocabulary {
     /// Remove a learned/custom term and persist. Case-insensitive so it
     /// reliably removes whatever `customTerms()` surfaced to the UI.
     public static func remove(_ term: String) {
-        let target = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let target = VocabularyReplacementRules.key(term)
         guard !target.isEmpty else { return }
         // A learned word he removes stays out for good.
+        // Do not hold a preference-mutation lock while entering the learned store.
         AutoDictionary.shared.remove(written: target)
+        mutationLock.lock(); defer { mutationLock.unlock() }
         var stored = UserDefaults.standard.array(forKey: key) as? [String] ?? []
         let before = stored.count
-        stored.removeAll { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target }
+        stored.removeAll { VocabularyReplacementRules.key($0) == target }
         if stored.count != before {
             UserDefaults.standard.set(stored, forKey: key)
             print("[VOICE-VOCAB] removed: \(term)")

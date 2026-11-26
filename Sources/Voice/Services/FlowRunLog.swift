@@ -40,7 +40,7 @@ struct FlowRunDecision: Codable, Equatable, Sendable {
 struct FlowRunRecord: Codable, Equatable, Sendable {
     static let currentSchema = 2
     /// Bump when the interpretation of pipeline outputs or learning evidence changes.
-    static let currentPipeline = 2
+    static let currentPipeline = 3
 
     var schemaVersion = FlowRunRecord.currentSchema
     /// "dictation", "opt1", or "followup" (a later line about an earlier run).
@@ -66,6 +66,9 @@ struct FlowRunRecord: Codable, Equatable, Sendable {
     var suspectWords: [String]?
     var stages: [FlowRunStage] = []
     var decisions: [FlowRunDecision] = []
+    /// Bounded scorer observations, including KEEP. Never supervised labels.
+    /// Optional so older run records decode without this field.
+    var wordDecisions: [WordDecisionEvidence]?
     /// Role -> model name or file ("cleanup": "dose1-t4", "opt1": "ExampleModel-1.5-9B-Q4.gguf").
     var models: [String: String] = [:]
     var settings: [String: String] = [:]
@@ -145,6 +148,22 @@ final class FlowRunCollector: @unchecked Sendable {
         }
     }
 
+    /// Call before constructing scorer context/features; collection is optional and bounded.
+    var canCollectWordDecision: Bool {
+        guard FlowRunLog.isEnabled else { return false }
+        return lock.withLock { !written && (record.wordDecisions?.count ?? 0) < WordDecisionEvidence.maxPerRun }
+    }
+
+    func wordDecision(_ evidence: WordDecisionEvidence) {
+        guard evidence.isValid, FlowRunLog.isEnabled else { return }
+        lock.withLock {
+            guard !written, FlowRunLog.isEnabled,
+                  (record.wordDecisions?.count ?? 0) < WordDecisionEvidence.maxPerRun else { return }
+            if record.wordDecisions == nil { record.wordDecisions = [] }
+            record.wordDecisions?.append(evidence)
+        }
+    }
+
     func model(_ role: String, _ name: String?) {
         guard let name, !name.isEmpty else { return }
         lock.withLock {
@@ -193,6 +212,10 @@ final class FlowRunCollector: @unchecked Sendable {
 
     static func decision(_ stage: String, _ verdict: String, reason: String? = nil) {
         current?.decision(stage, verdict, reason: reason)
+    }
+
+    static func wordDecision(_ evidence: WordDecisionEvidence) {
+        current?.wordDecision(evidence)
     }
 
     static func model(_ role: String, _ name: String?) {
@@ -292,6 +315,7 @@ enum FlowRunLog {
         clean.editedText = nil
         clean.asrWords = nil
         clean.suspectWords = nil
+        clean.wordDecisions = nil
         clean.audioPath = nil
         clean.fallbackReason = nil
         // Some routes keep auxiliary recognizer transcripts in settings.
@@ -319,7 +343,11 @@ enum FlowRunLog {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            var line = try encoder.encode(record)
+            var bounded = record
+            if let observations = record.wordDecisions {
+                bounded.wordDecisions = Array(observations.prefix(WordDecisionEvidence.maxPerRun)).filter(\.isValid)
+            }
+            var line = try encoder.encode(bounded)
             line.append(0x0A)
             rotateIfNeeded(adding: line.count)
             if fm.fileExists(atPath: fileURL.path) {

@@ -42,6 +42,8 @@ enum StarterDictionary {
 /// pane will read/write through.
 enum UserDictionary {
     private static let defaultsKey = "voice.userDictionary"
+    // add/remove call setTerms while holding this lock; serialize the complete read-modify-write.
+    private static let mutationLock = NSRecursiveLock()
 
     /// All user-added terms (de-duplicated, original casing preserved).
     static func terms() -> [String] {
@@ -53,7 +55,8 @@ enum UserDictionary {
         for raw in stored {
             let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !t.isEmpty else { continue }
-            if !excluded.contains(t.lowercased()), seen.insert(t.lowercased()).inserted {
+            let key = VocabularyReplacementRules.key(t)
+            if !excluded.contains(key), seen.insert(key).inserted {
                 out.append(t)
             }
         }
@@ -63,6 +66,7 @@ enum UserDictionary {
     /// Replace the user list. Caller is responsible for sanitization beyond
     /// trim+dedupe (which we do on read).
     static func setTerms(_ terms: [String]) {
+        mutationLock.lock(); defer { mutationLock.unlock() }
         UserDefaults.standard.set(terms, forKey: defaultsKey)
         // Lets Companion refresh its copy; silent outside the running app.
         FlowBroadcast.changed("dictionary")
@@ -72,17 +76,19 @@ enum UserDictionary {
     static func add(_ term: String) {
         let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        mutationLock.lock(); defer { mutationLock.unlock() }
         var existing = terms()
-        let lower = trimmed.lowercased()
-        guard !existing.contains(where: { $0.lowercased() == lower }) else { return }
+        let lower = VocabularyReplacementRules.key(trimmed)
+        guard !existing.contains(where: { VocabularyReplacementRules.key($0) == lower }) else { return }
         existing.append(trimmed)
         setTerms(existing)
     }
 
     /// Remove one term (case-insensitive).
     static func remove(_ term: String) {
-        let lower = term.lowercased()
-        let filtered = terms().filter { $0.lowercased() != lower }
+        mutationLock.lock(); defer { mutationLock.unlock() }
+        let lower = VocabularyReplacementRules.key(term)
+        let filtered = terms().filter { VocabularyReplacementRules.key($0) != lower }
         setTerms(filtered)
     }
 }
@@ -92,9 +98,9 @@ enum UserDictionary {
 enum CombinedDictionary {
     static func terms() -> [String] {
         let user = UserDictionary.terms()
-        let userLower = Set(user.map { $0.lowercased() })
+        let userLower = Set(user.map(VocabularyReplacementRules.key))
         let exclusions = ProperNounVocabulary.excludedTerms().union(userLower)
-        let starterUnique = StarterDictionary.terms.filter { !exclusions.contains($0.lowercased()) }
+        let starterUnique = StarterDictionary.terms.filter { !exclusions.contains(VocabularyReplacementRules.key($0)) }
         // User first so their casing wins downstream consumers that dedupe.
         return user + starterUnique
     }
@@ -130,7 +136,7 @@ enum CombinedDictionary {
             for term in list {
                 let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
-                let lower = trimmed.lowercased()
+                let lower = VocabularyReplacementRules.key(trimmed)
                 guard seenLower.insert(lower).inserted else { continue }
                 entries.append(CustomVocabularyTerm(text: trimmed, weight: weight))
             }
@@ -142,7 +148,7 @@ enum CombinedDictionary {
         append(UserDictionary.terms(), weight: userWeight)
         // 3) Static starter dictionary — baseline.
         let excluded = ProperNounVocabulary.excludedTerms()
-        append(StarterDictionary.terms.filter { !excluded.contains($0.lowercased()) }, weight: starterWeight)
+        append(StarterDictionary.terms.filter { !excluded.contains(VocabularyReplacementRules.key($0)) }, weight: starterWeight)
 
         return CustomVocabularyContext(terms: entries)
     }
