@@ -55,6 +55,44 @@ struct ASRVocabularyBoostTests {
         #expect(result.rejected == ["codex → ocodex"])
     }
 
+    @Test func guardPreservesUnalignedWordsAndRejectsNewWords() {
+        #expect(!ASRVocabularyBoost.keepsReplacement(original: ["please"], replacement: [], knownOther: []))
+        #expect(!ASRVocabularyBoost.keepsReplacement(original: [], replacement: ["Orivex"], knownOther: []))
+        let deleted = ASRVocabularyBoost.guardedText(unboosted: "please ask Orivax now",
+                                                    boosted: "ask Orivex now", knownOther: [])
+        #expect(deleted.text == "please ask Orivex now")
+        #expect(deleted.rejected == ["please → "])
+        // A true substitution may change the number of words. Pure insertions
+        // have an unchanged anchor on both sides and are refused independently.
+        let pureInsertion = ASRVocabularyBoost.guardedText(unboosted: "ask Orivex now",
+                                                          boosted: "ask Orivex Qoralis now", knownOther: [])
+        #expect(pureInsertion.text == "ask Orivex now")
+        #expect(pureInsertion.rejected == [" → Qoralis"])
+    }
+
+    @Test func emptyRescoreCannotEraseThePrimaryTranscript() {
+        let result = ASRVocabularyBoost.guardedText(unboosted: "keep every word", boosted: "", knownOther: [])
+        #expect(result.text == "keep every word")
+        #expect(result.rejected == ["keep every word → "])
+        #expect(ASRVocabularyBoost.guardedText(unboosted: "", boosted: "Orivex", knownOther: []).text == "")
+    }
+
+    @Test func trustedNamesNormalizeHorizontalSpacingButDoNotJoinLines() {
+        let terms = ASRVocabularyBoost.trustedTerms(properNouns: ["  Orivex\tLabs  ", "Orivex  Labs", "Acme\nLabs"],
+                                                   dictionary: ["O’Riven", "O'Riven", "I don’t know"])
+        #expect(terms == ["Orivex Labs", "O’Riven"])
+    }
+
+    @Test func decomposedAccentsRemainValidNamesAndGuardEquivalent() {
+        let decomposed = "Orive\u{301}x"
+        #expect(ASRVocabularyBoost.trustedTerms(properNouns: [decomposed], dictionary: []) == [decomposed])
+        #expect(ASRVocabularyBoost.squash(decomposed) == ASRVocabularyBoost.squash("Orivéx"))
+    }
+
+    @Test func guardOnlyVocabularyCanBeProvidedWithoutRereadingPreferences() {
+        #expect(ASRVocabularyBoost.knownOtherWords(terms: ["Orivex"], vocabulary: ["Orivex", "Qoralis Tool"]) == ["qoralis", "tool"])
+    }
+
     @Test func onByDefaultWithMeasuredSimilarityFloor() {
         #expect(ASRVocabularyBoost.enabledByDefault == true)
         let defaults = UserDefaults(suiteName: "ASRVocabularyBoostTests-\(UUID().uuidString)")!

@@ -3,6 +3,12 @@ import XCTest
 @testable import Voice
 
 final class SharedModelTaskTests: XCTestCase {
+    private final class CompletionCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() { lock.withLock { count += 1 } }
+        var value: Int { lock.withLock { count } }
+    }
     private actor Gate {
         var open = false
         var waiters: [CheckedContinuation<Void, Never>] = []
@@ -121,5 +127,46 @@ final class SharedModelTaskTests: XCTestCase {
         await waiter.value
         let cached = try await load.value
         XCTAssertEqual(cached, 42)
+    }
+
+    func testCompletionCallbackWaitsForActualWorkAfterOwnerCancellation() async {
+        let started = expectation(description: "operation started")
+        let completed = expectation(description: "underlying operation completed")
+        completed.assertForOverFulfill = true
+        let gate = Gate(), count = CompletionCount()
+        let load = SharedModelTask<Int>(onCompletion: {
+            count.increment()
+            completed.fulfill()
+        }) {
+            started.fulfill()
+            await gate.wait() // An uncooperative model call cannot yet stop.
+            return 42
+        }
+        await fulfillment(of: [started], timeout: 1)
+        load.cancel()
+        do { _ = try await load.value; XCTFail("Cancelled operation returned a value") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(count.value, 0, "A released waiter must not release the model's lease")
+        await gate.release()
+        await fulfillment(of: [completed], timeout: 1)
+        load.cancel()
+        XCTAssertEqual(count.value, 1)
+    }
+
+    func testImmediateCancellationStillCompletesEveryOwnedOperationOnce() async {
+        let completed = expectation(description: "all cancelled operations completed")
+        completed.expectedFulfillmentCount = 100
+        completed.assertForOverFulfill = true
+        let count = CompletionCount()
+        for _ in 0..<100 {
+            let task = SharedModelTask<Int>(onCompletion: {
+                count.increment()
+                completed.fulfill()
+            }) { 42 }
+            task.cancel()
+            task.cancel()
+        }
+        await fulfillment(of: [completed], timeout: 2)
+        XCTAssertEqual(count.value, 100)
     }
 }

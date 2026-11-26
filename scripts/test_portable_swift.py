@@ -28,6 +28,25 @@ SUITES = {
     "PipelineTimerTests": "Sources/Voice/Services/PipelineTimer.swift",
     "WordDecisionEvidenceTests": "Sources/Voice/Services/WordDecisionEvidence.swift",
     "VocabularyReplacementRulesTests": "Sources/Voice/Services/VocabularyReplacementRules.swift",
+    "BoundedLocalFileCacheTests": "Sources/Voice/Services/BoundedLocalFileCache.swift",
+    "EntityFreezerTests": "Sources/Voice/Services/EntityFreezer.swift",
+    "ImportedTextReplacementRulesTests": "Sources/Voice/Services/ImportedTextReplacementRules.swift",
+    "WisprProfileCacheTests": (
+        "Sources/Voice/Services/WisprPersonalizationProfile.swift",
+        "Sources/Voice/Services/BoundedLocalFileCache.swift",
+        "Sources/Voice/Services/VocabularyReplacementRules.swift",
+        "Sources/Voice/Services/VocabularyPreferenceTransaction.swift",
+    ),
+    "PrivateDataFileTests": "Sources/Voice/Services/PrivateDataFile.swift",
+    "RecentDictationStoreTests": (
+        "Sources/Voice/Services/PrivateDataFile.swift",
+        "Sources/Voice/Services/RecentDictations.swift",
+    ),
+    "HistorySearchQueryTests": "Sources/Voice/Services/HistorySearchQuery.swift",
+    "RecordingAudioLookupTests": "Sources/Voice/Services/RecordingAudioLookup.swift",
+    "AcousticRescoreBudgetTests": "Sources/Voice/Services/AcousticRescoreBudget.swift",
+    "AcousticVocabularySnapshotTests": "Sources/Voice/Services/AcousticVocabularySnapshot.swift",
+    "ModelWorkLeaseTests": "Sources/Voice/Services/ModelWorkLease.swift",
 }
 
 
@@ -47,9 +66,12 @@ def main() -> int:
         entries: list[str] = []
         test_count = 0
         for suite in dict.fromkeys(suites):
-            source = ROOT / SUITES[suite]
+            dependencies = SUITES[suite]
+            if isinstance(dependencies, str):
+                dependencies = (dependencies,)
+            sources = [ROOT / dependency for dependency in dependencies]
             test = ROOT / "Tests/VoiceTests" / f"{suite}.swift"
-            if not source.is_file() or not test.is_file():
+            if not all(source.is_file() for source in sources) or not test.is_file():
                 parser.error(f"Missing source or test for {suite}; run from a complete Flow checkout.")
             text = test.read_text(encoding="utf-8")
             imports = re.findall(r"^import (\w+)\s*$", text, re.MULTILINE)
@@ -66,7 +88,10 @@ def main() -> int:
                 parser.error(f"{suite} has unsupported test signatures; update the portable runner explicitly.")
             copied = directory / test.name
             copied.write_text(text, encoding="utf-8")
-            inputs.extend((str(source), str(copied)))
+            for source in sources:
+                if str(source) not in inputs:
+                    inputs.append(str(source))
+            inputs.append(str(copied))
             entries.append("testCase([" + ",\n".join(
                 f'("{name}", asyncTest({suite}.{name}))' if is_async else f'("{name}", {suite}.{name})'
                 for name, is_async in methods

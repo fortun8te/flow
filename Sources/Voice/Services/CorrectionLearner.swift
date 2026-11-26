@@ -147,7 +147,12 @@ final class CorrectionLearner {
             // Passive retention is weak evidence only; do not match another occurrence of the text.
             guard !BackgroundActivityGate.privacyMode, let field = self.paster.currentText(of: target),
                   field.utf16.elementsEqual(expectedField.utf16) else { return }
-            self.report(self.dictionary.observe(before: original, after: polished, source: .opt1Kept, operation: diffID))
+            let observedAt = Date(), dictionary = self.dictionary
+            let events = await Task.detached(priority: .utility) {
+                dictionary.observe(before: original, after: polished, source: .opt1Kept, now: observedAt, operation: diffID)
+            }.value
+            guard !BackgroundActivityGate.privacyMode else { return }
+            self.report(events)
         }
     }
 
@@ -194,8 +199,17 @@ final class CorrectionLearner {
                                     feedbackSource: "observed-edit", targetScope: "pasted-span")
             }
         }
-        report(dictionary.observe(before: edit.before, after: edit.after, source: .dictationEdit,
-                                  evidenceID: state.dictationID))
+        // AX checks stay on MainActor. Diff classification, lexicon checks and
+        // persistence use local background compute after the evidence is fixed.
+        let observedAt = Date(), evidenceID = state.dictationID, dictionary = self.dictionary
+        Task { @MainActor [weak self] in
+            let events = await Task.detached(priority: .utility) {
+                dictionary.observe(before: edit.before, after: edit.after, source: .dictationEdit,
+                                   now: observedAt, evidenceID: evidenceID)
+            }.value
+            guard !BackgroundActivityGate.privacyMode else { return }
+            self?.report(events)
+        }
     }
 
     /// The words he changed inside the pasted text: the baseline and the current field share a prefix and

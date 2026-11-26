@@ -11,11 +11,11 @@
 //   3. macOS Contacts first/last names (defer — needs permission)
 //   4. A seed list of common brands/products (Wispr Flow, ChatGPT, Claude…)
 //
-// The auto-learning step runs after each dictation is polished — it
-// scans the FINAL text for capitalized words that appeared 2+ times
-// across the user's last 50 dictations and weren't already known. This
-// way the model "learns" the user's frequent proper nouns without
-// requiring manual setup.
+// The auto-learning step uses raw recognition text and prior committed
+// recognitions from other recordings. Capitalized terms seen in 2+ prior
+// dictations become recurring-name observations, keyed by recording ID.
+// AutoDictionary applies its independent-evidence rules before adding
+// vocabulary; cleanup output never supplies these observations.
 
 import Foundation
 
@@ -214,16 +214,14 @@ public enum ProperNounVocabulary {
         }
     }
 
-    /// Learn proper nouns from a polished dictation. Called after each
-    /// successful polish. Heuristic: capitalized multi-letter words that
-    /// aren't at sentence starts, aren't common English words, and
-    /// appeared before.
-    public static func learnFrom(_ polishedText: String, previousDictations: [String]) {
-        let candidates = extractCandidates(from: polishedText)
+    /// Observe recurring terms in raw recognition, using prior recognitions
+    /// from other committed recordings. A stable ID prevents a rerun from
+    /// counting the same recording twice. These are vocabulary hints only.
+    public static func learnFrom(_ recognizedText: String, previousDictations: [String], evidenceID: String? = nil) {
+        let candidates = extractCandidates(from: recognizedText)
         guard !candidates.isEmpty else { return }
 
-        // Only promote terms that appeared in at least one prior dictation.
-        // This avoids learning random one-off names from a single rant.
+        // Count appearances across prior recordings, not repeated words within one.
         var counter: [String: Int] = [:]
         for prior in previousDictations {
             let priorCandidates = extractCandidates(from: prior)
@@ -241,9 +239,11 @@ public enum ProperNounVocabulary {
             // Need ≥2 prior appearances to qualify as a recurring term.
             guard (counter[c] ?? 0) >= 2 else { continue }
             guard !stored.contains(c.lowercased()), !seeds.contains(c.lowercased()) else { continue }
-            AutoDictionary.shared.observeRecurringName(c, context: polishedText)
+            AutoDictionary.shared.observeRecurringName(c, context: recognizedText, evidenceID: evidenceID)
         }
     }
+
+    private static let candidatePattern = try! NSRegularExpression(pattern: #"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?\b"#)
 
     /// Extract candidate proper nouns from text. A candidate is:
     ///   - 3+ letters
@@ -251,11 +251,8 @@ public enum ProperNounVocabulary {
     ///   - NOT a common English word at sentence start
     ///   - NOT all-uppercase (acronyms handled separately)
     private static func extractCandidates(from text: String) -> [String] {
-        // Pattern: capitalized word, possibly multi-word (TitleCase chains).
-        let pattern = #"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?\b"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let ns = text as NSString
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        let matches = candidatePattern.matches(in: text, range: NSRange(location: 0, length: ns.length))
 
         // Filter out words that appear immediately after a sentence boundary
         // (".", "!", "?", or start of string) — they may just be sentence

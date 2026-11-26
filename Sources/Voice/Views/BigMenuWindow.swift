@@ -1272,6 +1272,7 @@ private struct StatCard: View {
 // re-reads customTerms() after every add/remove so the list stays in sync.
 private struct LearnedWordsCard: View {
     @Environment(\.colorScheme) private var scheme
+    @AppStorage("voice.privacyMode") private var privacyMode = false
 
     @State private var terms: [String] = []
     @State private var draft: String = ""
@@ -1279,6 +1280,8 @@ private struct LearnedWordsCard: View {
     /// Corrections waiting for Jordan's yes (LearnedWordQueue), and the one-step Undo.
     @State private var waiting: [PendingLearnedWord] = []
     @State private var canUndo: Bool = false
+    @State private var persistence = AutoDictionary.PersistenceState(status: .ready, unsavedChanges: false)
+    @State private var retryingSave = false
     @State private var review = LearnedWordReview(
         queue: LearnedWordQueue.shared,
         addLive: { ProperNounVocabulary.add($0) },
@@ -1315,6 +1318,26 @@ private struct LearnedWordsCard: View {
                 }
             }
             .buttonStyle(.plain)
+
+            if let message = persistenceMessage {
+                VStack(alignment: .leading, spacing: Sp.xs) {
+                    Text(message)
+                        .font(.bodySmall)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(retryingSave ? "Saving…" : "Retry save") {
+                        retryingSave = true
+                        Task { @MainActor in
+                            _ = await Task.detached(priority: .utility) { AutoDictionary.shared.flush() }.value
+                            retryingSave = false
+                            reload()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(retryingSave || privacyMode)
+                }
+            }
 
             if expanded {
                 if !waiting.isEmpty {
@@ -1392,6 +1415,8 @@ private struct LearnedWordsCard: View {
                 .strokeBorder(Color.primary.opacity(0.06), lineWidth: CardShape.borderUnselected)
         )
         .onAppear { reload() }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .debounce(for: .milliseconds(150), scheduler: RunLoop.main)) { _ in reload() }
     }
 
     /// Corrections Flow heard once. Nothing is live until Jordan says yes, or Flow hears it again.
@@ -1431,8 +1456,30 @@ private struct LearnedWordsCard: View {
 
     private func reload() {
         terms = ProperNounVocabulary.customTerms()
+        persistence = AutoDictionary.shared.persistenceState
         waiting = review.waiting
         canUndo = review.lastAction != nil
+    }
+
+    private var persistenceMessage: String? {
+        if privacyMode, persistence.unsavedChanges {
+            return "Saving new learned words is paused while privacy mode is on."
+        }
+        switch persistence.status {
+        case .ready: return nil
+        case .readFailed:
+            return "Flow couldn't read your saved learned words. The existing file has been preserved."
+        case .unsupportedVersion:
+            return "Flow doesn't support the saved dictionary format. The existing file has been preserved."
+        case .writeFailed:
+            return "Your latest learned words are available in this session, but saving is not confirmed. Retry before quitting Flow."
+        case .overlayFailed:
+            return "Your corrections are saved, but their spelling cache needs to be updated. Retry to finish saving."
+        case .externalConflict:
+            return "The saved dictionary changed elsewhere. Your latest learned words are still in memory; check the saved file before quitting Flow."
+        case .privacyPaused:
+            return "There are unsaved learned words from this session. Retry to save them."
+        }
     }
 
     private func addTerm() {

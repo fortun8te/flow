@@ -34,9 +34,21 @@ Source: `WhisperNowTunedPolisher.swift`, `T2CleanupRequest.swift`, `TypoFixModel
 
 This pass makes shared model loads independently cancellable, publishes readiness before callers resume, rejects stale load completions, and avoids starting the DOSE1 fallback when the selected General model is already ready. It does not terminate an active fallback. S1 no longer rescans its cache metadata on each warm request. TinyNext deduplicates exact-byte contexts within a scoring call, stops cancelled work, and declines oversized contexts instead of silently judging a truncated one. `tinynext-batch` records requested and unique context counts. Existing quality thresholds stay unchanged.
 
+### Bounded work and personalization during dictation
+
+The vocabulary rescoring path captures one immutable set of trusted terms, guard names and threshold settings per transcription. All its chunks use that view; the next transcription can see newly learned words. Session reuse keys on the exact term bytes and acoustic settings, while guard evidence is supplied by the current recording snapshot. Adding a nonboostable name therefore updates the guard without requiring a new acoustic model session.
+
+Optional CTC work shares an allowance of `min(6, 1.8 + 0.015 × decodedWindowWords)` seconds, minus time already consumed. Overlapping windows can contribute to the word count but cannot exceed the six-second cap. A timeout exhausts the remaining allowance for that recording. Flow falls back to primary ASR while a native CoreML operation finishes; its exclusive lease is released only when the underlying operation exits, so a timed-out waiter cannot start overlapping work on the same rescoring session. This bounds Flow's optional wait, not an uninterruptible CoreML kernel's physical execution time. It is separate from the cleanup/paste budget and is not a six-second full-pipeline SLO.
+
+CTC remains overlapped with the following TDT window, with at most one pending CTC request. Pure insertions or deletions from auxiliary rescoring retain the primary ASR words. Shared model preparation has independently cancellable waiters. `asr-vocabulary` run notes identify preparation, busy, timeout, no-candidate and guarded-result paths without recording word text in those timing notes.
+
+While recording, a utility task prepares imported snippet rules and the small personalization profile. Warm reads open/stat bounded regular files; decoding and regex compilation occur only on revision changes. Entity patterns are compiled once and resolve overlaps against original text, preserving enclosing code and reserving literal placeholder tokens. Positive correction classification and persistence move off the main actor after Accessibility evidence has been captured. Recent-history caches avoid repeated JSON decoding, and indexed history queries avoid full scans of growing recording tables. Measure these changes on-device with actual dictionaries; test completion times are not inference benchmarks.
+
 ## 3. Freeze the workload and environment
 
 Use a frozen **validation** snapshot from [TRAINING.md](TRAINING.md). Keep the final test set out of engine search. Cover clean text that should stay unchanged, names and multiword dictionary terms, numbers and corrections, negation, URLs/code, long sections, and the editing modes you intend to support. Exact output equivalence is a useful lossless-optimization check, but a matching incorrect baseline remains incorrect; reviewed quality evaluation is still required.
+
+For Flow versus a complete dictation product, use [COMPETITIVE-HILLCLIMB.md](COMPETITIVE-HILLCLIMB.md). That comparison binds actual audio, field context and vocabulary and measures release-to-verified-insertion timing. Keep it separate from the engine-only HTTP replay below.
 
 Save an experiment record outside the repository containing:
 

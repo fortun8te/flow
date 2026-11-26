@@ -9,11 +9,16 @@ final class SharedModelTask<Value: Sendable>: @unchecked Sendable {
     private let task: Task<Void, Never>
 
     init(priority: TaskPriority = .userInitiated,
+         onCompletion: @escaping @Sendable () -> Void = {},
          operation: @escaping @Sendable () async throws -> Value) {
         let state = State()
         self.state = state
         // Weight mapping and tokenizer setup must not inherit MainActor.
         task = Task.detached(priority: priority) {
+            // The underlying work owns its lease until it actually ends, even
+            // if cancellation already released every waiter. This also runs
+            // when cancellation happens before operation starts.
+            defer { onCompletion() }
             do {
                 try Task.checkCancellation()
                 state.finish(.success(try await operation()))

@@ -15,7 +15,8 @@ import Foundation
 /// One recognised word and how sure the recogniser was (the lowest confidence of its pieces).
 struct ASRWordConfidence: Codable, Equatable, Sendable {
     var word: String
-    var confidence: Float
+    /// Missing/invalid recognizer confidence stays unknown, never an invented zero or one.
+    var confidence: Float?
     var start: Double?
     var end: Double?
 }
@@ -40,7 +41,7 @@ struct FlowRunDecision: Codable, Equatable, Sendable {
 struct FlowRunRecord: Codable, Equatable, Sendable {
     static let currentSchema = 2
     /// Bump when the interpretation of pipeline outputs or learning evidence changes.
-    static let currentPipeline = 3
+    static let currentPipeline = 4
 
     var schemaVersion = FlowRunRecord.currentSchema
     /// "dictation", "opt1", or "followup" (a later line about an earlier run).
@@ -298,7 +299,8 @@ enum FlowRunLog {
         // Tests never write into the real store unless they point it at a folder of their own.
         guard isEnabled else { return }
         if directoryOverride == nil, isRunningTests { return }
-        let work: @Sendable () -> Void = { write(record) }
+        let destination = directory
+        let work: @Sendable () -> Void = { write(record, directory: destination) }
         if synchronously { queue.sync(execute: work) } else { queue.async(execute: work) }
     }
 
@@ -333,34 +335,44 @@ enum FlowRunLog {
         return clean
     }
 
-    private static func write(_ record: FlowRunRecord) {
+    static func sanitizedForStorage(_ record: FlowRunRecord) -> FlowRunRecord {
+        var clean = record
+        if let value = clean.audioSeconds, !value.isFinite || value < 0 { clean.audioSeconds = nil }
+        if let value = clean.asrConfidence, !value.isFinite || !(0...1).contains(value) { clean.asrConfidence = nil }
+        clean.asrWords = clean.asrWords?.map { word in
+            var word = word
+            if let value = word.confidence, !value.isFinite || !(0...1).contains(value) { word.confidence = nil }
+            if let value = word.start, !value.isFinite || value < 0 { word.start = nil }
+            if let value = word.end, !value.isFinite || value < 0 { word.end = nil }
+            if let start = word.start, let end = word.end, end < start { word.start = nil; word.end = nil }
+            return word
+        }
+        if let observations = clean.wordDecisions {
+            clean.wordDecisions = Array(observations.prefix(WordDecisionEvidence.maxPerRun)).filter(\.isValid)
+        }
+        return clean
+    }
+
+    private static func write(_ record: FlowRunRecord, directory: URL) {
         // A queued write must obey a privacy switch changed after enqueueing.
         guard isEnabled else { return }
         do {
-            let fm = FileManager.default
-            try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            excludeFromBackup(directory)
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            var bounded = record
-            if let observations = record.wordDecisions {
-                bounded.wordDecisions = Array(observations.prefix(WordDecisionEvidence.maxPerRun)).filter(\.isValid)
+            let line = try encoder.encode(sanitizedForStorage(record))
+            let file = directory.appendingPathComponent("runs.jsonl")
+            try PrivateDataFile.withExclusiveAccess(to: file) {
+                guard isEnabled else { return }
+                excludeFromBackup(directory)
+                let rotated = try rotateIfNeeded(adding: line.count + 1, directory: directory)
+                try PrivateDataFile.appendLine(line, at: file)
+                if rotated { pruneRotatedFiles(in: directory) }
             }
-            var line = try encoder.encode(bounded)
-            line.append(0x0A)
-            rotateIfNeeded(adding: line.count)
-            if fm.fileExists(atPath: fileURL.path) {
-                let handle = try FileHandle(forWritingTo: fileURL)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: line)
-            } else {
-                try line.write(to: fileURL, options: [.atomic])
-                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-            }
+        } catch PrivateDataFile.PersistenceError.synchronizationAfterPublishFailed {
+            print("[FLOW-RUNS] run record written; storage synchronization unconfirmed")
         } catch {
-            print("[FLOW-RUNS] could not write a run record: \(error.localizedDescription)")
+            print("[FLOW-RUNS] could not confirm a complete run record; an interrupted tail may remain")
         }
     }
 
@@ -374,24 +386,47 @@ enum FlowRunLog {
 
     /// Moves a full file aside as runs-<timestamp>.jsonl and drops the oldest rotated files past the cap.
     static func rotateIfNeeded(adding bytes: Int = 0) {
+        let target = directory
+        try? PrivateDataFile.withExclusiveAccess(to: target.appendingPathComponent("runs.jsonl")) {
+            if try rotateIfNeeded(adding: bytes, directory: target) { pruneRotatedFiles(in: target) }
+        }
+    }
+
+    private static func rotateIfNeeded(adding bytes: Int, directory: URL) throws -> Bool {
         let fm = FileManager.default
-        guard let size = (try? fm.attributesOfItem(atPath: fileURL.path))?[.size] as? Int,
-              size + bytes > maxFileBytes else { return }
+        let file = directory.appendingPathComponent("runs.jsonl")
+        guard let identity = try PrivateDataFile.identity(at: file), identity.bytes > 0,
+              identity.bytes > Int64(max(0, maxFileBytes)) - Int64(max(0, bytes)) else { return false }
         // runs-<sequence>-<date>.jsonl: the sequence keeps the names in age order.
-        let sequence = (rotatedFiles().compactMap { Int($0.lastPathComponent.dropFirst(5).prefix(6)) }.max() ?? 0) + 1
+        let existing = rotatedFiles(in: directory)
+        let previous = existing.compactMap { Int($0.lastPathComponent.split(separator: "-").dropFirst().first ?? "") }.max() ?? 0
+        guard previous < Int.max else { throw POSIXError(.EOVERFLOW) }
+        let sequence = previous + 1
         let stamp = rotationFormatter.string(from: Date())
-        let target = directory.appendingPathComponent(String(format: "runs-%06d-", sequence) + stamp + ".jsonl")
-        try? fm.moveItem(at: fileURL, to: target)
-        let rotated = rotatedFiles()
-        if rotated.count > keepRotated {
-            for old in rotated.prefix(rotated.count - keepRotated) { try? fm.removeItem(at: old) }
+        let target = directory.appendingPathComponent(String(format: "runs-%06lld-", Int64(sequence)) + stamp + ".jsonl")
+        try fm.moveItem(at: file, to: target)
+        return true
+    }
+
+    private static func pruneRotatedFiles(in directory: URL) {
+        let rotated = rotatedFiles(in: directory)
+        if rotated.count > max(0, keepRotated) {
+            for old in rotated.prefix(rotated.count - max(0, keepRotated)) {
+                do { try FileManager.default.removeItem(at: old) }
+                catch { print("[FLOW-RUNS] could not remove an expired run log; current run was saved") }
+            }
         }
     }
 
     /// Rotated files, oldest first.
     static func rotatedFiles() -> [URL] {
+        rotatedFiles(in: directory)
+    }
+
+    private static func rotatedFiles(in directory: URL) -> [URL] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        return names.filter { $0.hasPrefix("runs-") && $0.hasSuffix(".jsonl") }.sorted()
+        return names.filter { $0.hasPrefix("runs-") && $0.hasSuffix(".jsonl") }
+            .sorted { $0.compare($1, options: .numeric) == .orderedAscending }
             .map { directory.appendingPathComponent($0) }
     }
 

@@ -28,7 +28,7 @@ enum ASRVocabularyBoost {
     /// Measured on 13 Nov 2026.
     static let enabledByDefault = true
     /// FluidAudio's size default is 0.55; 0.55 turned "workflow" into "Wispr Flow".
-    static let defaultMinSimilarity: Float = 0.6
+    static let defaultMinSimilarity = AcousticVocabularySnapshot.Options.defaultMinimumSimilarity
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? enabledByDefault
@@ -51,8 +51,8 @@ enum ASRVocabularyBoost {
         var seen = Set<String>()
         var out: [String] = []
         for raw in properNouns + dictionary {
-            let term = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard isBoostable(term), seen.insert(term.lowercased()).inserted else { continue }
+            guard let term = AcousticVocabularySnapshot.normalizedTerm(raw), isBoostable(term),
+                  seen.insert(term.lowercased().replacingOccurrences(of: "’", with: "'")).inserted else { continue }
             out.append(term)
         }
         // A multi-word term that starts with another listed term ("Jordan Example"
@@ -86,11 +86,12 @@ enum ASRVocabularyBoost {
         guard term.count >= 4, term.count <= 32 else { return false }
         let words = term.split(separator: " ")
         guard words.count <= 3 else { return false }
-        let allowed = CharacterSet.letters.union(.decimalDigits).union(CharacterSet(charactersIn: " -'’"))
+        let allowed = CharacterSet.letters.union(.nonBaseCharacters).union(.decimalDigits)
+            .union(CharacterSet(charactersIn: " -'’"))
         guard term.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return false }
         let letters = term.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
         guard letters * 2 > term.count else { return false }
-        if words.allSatisfy({ everydayWords.contains($0.lowercased()) }) { return false }
+        if words.allSatisfy({ everydayWords.contains($0.lowercased().replacingOccurrences(of: "’", with: "'")) }) { return false }
         return true
     }
 
@@ -98,16 +99,17 @@ enum ASRVocabularyBoost {
 
     /// Lowercased letters and digits only ("acme x" -> "acmex").
     static func squash(_ text: String) -> String {
-        String(text.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(Character.init))
+        String(text.precomposedStringWithCanonicalMapping.lowercased().unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }.map(Character.init))
     }
 
     /// Other names Flow knows (starter dictionary, proper-noun seeds), squashed, minus the boosted terms.
     /// A transcript word within one edit of one of these is a different real name ("codex", "Xcode").
-    static func knownOtherWords(terms: [String]) -> Set<String> {
+    static func knownOtherWords(terms: [String], vocabulary: [String] = StarterDictionary.terms + ProperNounVocabulary.current()) -> Set<String> {
         let boosted = Set(terms.map(squash))
         var known = Set<String>()
-        for entry in StarterDictionary.terms + ProperNounVocabulary.current() {
-            for word in entry.split(separator: " ") {
+        for entry in vocabulary {
+            for word in entry.split(whereSeparator: \.isWhitespace) {
                 let w = squash(String(word))
                 if w.count >= 4, !boosted.contains(w) { known.insert(w) }
             }
@@ -134,7 +136,10 @@ enum ASRVocabularyBoost {
     /// "tiktok", "redo" -> "Felix". Spacing/casing-only edits ("acme x" -> "AcmeX") are kept.
     static func keepsReplacement(original: [String], replacement: [String], knownOther: Set<String>) -> Bool {
         let old = squash(original.joined(separator: " ")), new = squash(replacement.joined(separator: " "))
-        guard !old.isEmpty, !new.isEmpty, old != new else { return true }
+        // Vocabulary rescoring may substitute a span, never insert or delete
+        // primary ASR words just because one side has no acoustic alignment.
+        guard !old.isEmpty, !new.isEmpty else { return false }
+        if old == new { return true }
         // Only letters added or cut at the edge of a real word (plural, prefix).
         if old.count >= 4, new.contains(old) || old.contains(new) { return false }
         // What was heard is at least as close to another name Flow knows as to the term.
@@ -149,7 +154,9 @@ enum ASRVocabularyBoost {
                             knownOther: Set<String>) -> (text: String, rejected: [String]) {
         let a = unboosted.split(separator: " ").map(String.init)
         let b = boosted.split(separator: " ").map(String.init)
-        guard !a.isEmpty, !b.isEmpty else { return (boosted, []) }
+        guard !a.isEmpty, !b.isEmpty else {
+            return (unboosted, unboosted == boosted ? [] : [unboosted + " → " + boosted])
+        }
         // Longest common subsequence over exact tokens.
         var lcs = Array(repeating: Array(repeating: 0, count: b.count + 1), count: a.count + 1)
         for i in stride(from: a.count - 1, through: 0, by: -1) {
@@ -184,9 +191,26 @@ enum ASRVocabularyBoost {
     }
 
     static func thresholds(defaults: UserDefaults = .standard) -> VocabularyBoostingSession.Thresholds {
+        let options = options(defaults: defaults)
+        return VocabularyBoostingSession.Thresholds(cbw: options.cbw, minSimilarity: options.minimumSimilarity)
+    }
+
+    private static func options(defaults: UserDefaults) -> AcousticVocabularySnapshot.Options {
         let cbw = (defaults.object(forKey: cbwKey) as? NSNumber).map { Float(truncating: $0) }
         let sim = (defaults.object(forKey: minSimilarityKey) as? NSNumber).map { Float(truncating: $0) }
-        return VocabularyBoostingSession.Thresholds(cbw: cbw, minSimilarity: sim ?? defaultMinSimilarity)
+        return AcousticVocabularySnapshot.Options(cbw: cbw, minimumSimilarity: sim)
+    }
+
+    /// Capture names, guard terms and tuning settings together, once before decoding.
+    /// Later chunks of the same recording keep this view even if learning advances.
+    static func captureSnapshot(defaults: UserDefaults = .standard) -> AcousticVocabularySnapshot? {
+        let vocabulary = ProperNounVocabulary.vocabularyView(defaults: defaults)
+        let dictionary = UserDictionary.terms(defaults: defaults)
+        let terms = trustedTerms(properNouns: vocabulary.custom, dictionary: dictionary)
+        guard !terms.isEmpty else { return nil }
+        return AcousticVocabularySnapshot(terms: terms,
+            knownOther: knownOtherWords(terms: terms, vocabulary: StarterDictionary.terms + vocabulary.all + dictionary),
+            options: options(defaults: defaults))
     }
 }
 
@@ -196,68 +220,96 @@ actor ASRVocabularyBooster {
     static let shared = ASRVocabularyBooster()
 
     private struct Snapshot {
-        let key: String
+        let key: AcousticVocabularySnapshot.SessionKey
         let session: VocabularyBoostingSession
-        let knownOther: Set<String>
     }
-    private struct Request {
-        let key: String
-        let terms: [String]
-        let thresholds: VocabularyBoostingSession.Thresholds
+    private struct RescoreOutput: Sendable {
+        let text: String
+        let wasModified: Bool
+        let replacements: [String]
     }
 
     private var ctcModels: CtcModels?
-    private var ctcLoad: Task<CtcModels?, Never>?
+    private var ctcLoad: SharedModelTask<CtcModels?>?
     private var encoderRetryAfter: ContinuousClock.Instant?
-    private var sessionBuild: (key: String, task: Task<Bool, Never>)?
+    private var sessionBuild: (key: AcousticVocabularySnapshot.SessionKey, task: SharedModelTask<Bool>)?
     private var snapshot: Snapshot?
-    private var sessionFailure: (key: String, retryAfter: ContinuousClock.Instant)?
-    private var rescoring = false
+    private var sessionFailure: (key: AcousticVocabularySnapshot.SessionKey, retryAfter: ContinuousClock.Instant)?
+    private let rescoreLease = ModelWorkLease()
 
     /// Rescore one decode window. `tokenTimings` must be on the clock of `samples`.
-    func rescore(text: String, tokenTimings: [TokenTiming]?, samples: [Float]) async -> ASRVocabularyBoost.Report {
-        let started = CFAbsoluteTimeGetCurrent()
-        func report(_ boosted: String, _ replacements: [String], ran: Bool,
+    /// Every window shares the recording's vocabulary and cumulative work budget.
+    func rescore(text: String, tokenTimings: [TokenTiming]?, samples: [Float],
+                 vocabulary request: AcousticVocabularySnapshot,
+                 budget: AcousticRescoreBudget) async -> ASRVocabularyBoost.Report {
+        let timer = PipelineTimer()
+        let allowance = budget.remainingSeconds(addingWords: text.split(whereSeparator: \.isWhitespace).count)
+        defer { budget.consume(seconds: timer.seconds()) }
+        func report(_ boosted: String, _ replacements: [String], ran: Bool, outcome: String,
                     rejected: [String] = []) -> ASRVocabularyBoost.Report {
-            .init(unboostedText: text, boostedText: boosted, replacements: replacements, ctcRan: ran,
-                  milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000, rejected: rejected)
+            let milliseconds = timer.seconds() * 1_000
+            FlowRunCollector.note("asr-vocabulary", ["outcome": outcome,
+                "milliseconds": String(Int(milliseconds)), "ctcRan": String(ran)])
+            return .init(unboostedText: text, boostedText: boosted, replacements: replacements, ctcRan: ran,
+                         milliseconds: milliseconds, rejected: rejected)
         }
-        guard !Task.isCancelled, let timings = tokenTimings, !timings.isEmpty, !samples.isEmpty,
-              let request = currentRequest() else { return report(text, [], ran: false) }
-        if snapshot?.key != request.key {
+        guard !Task.isCancelled else { return report(text, [], ran: false, outcome: "cancelled") }
+        guard allowance > 0 else { return report(text, [], ran: false, outcome: "budget-exhausted") }
+        guard let timings = tokenTimings, !timings.isEmpty, !samples.isEmpty else {
+            return report(text, [], ran: false, outcome: "missing-input")
+        }
+        if snapshot?.key != request.sessionKey {
             let task = ensureSession(request)
             // Let a cold/downloaded model load in the background, never on the
             // paste deadline. A warm encoder can join a dictionary rebuild briefly.
             if ctcModels != nil, let task {
-                _ = await DictationDeadline.run(seconds: 0.12) { await task.value }
+                _ = await DictationDeadline.run(seconds: min(0.12, allowance)) { try? await task.value }
             }
         }
-        guard !Task.isCancelled, !rescoring, sessionBuild == nil,
-              let captured = snapshot, captured.key == request.key else {
-            return report(text, [], ran: false)
+        guard !Task.isCancelled else { return report(text, [], ran: false, outcome: "cancelled") }
+        guard !rescoreLease.isBusy else { return report(text, [], ran: false, outcome: "busy") }
+        guard sessionBuild == nil, let captured = snapshot, captured.key == request.sessionKey else {
+            return report(text, [], ran: false, outcome: "preparing")
         }
         let session = captured.session
         guard session.hasCTCRescoringCandidates(text: text, tokenTimings: timings) else {
-            return report(text, [], ran: false)
+            return report(text, [], ran: false, outcome: "no-candidates")
         }
-        // An actor can re-enter at the await. Do not let another dictation
-        // drive the same mutable rescoring session at the same time.
-        rescoring = true
-        defer { rescoring = false }
-        guard let output = await session.rescore(text: text, tokenTimings: timings, audioSamples: samples),
-              !Task.isCancelled, output.wasModified else { return report(text, [], ran: true) }
-        let replacements = output.replacements.filter(\.shouldReplace).map {
-            "\($0.originalWord) → \($0.replacementWord ?? "")"
+        let remaining = allowance - timer.seconds()
+        guard remaining > 0 else { return report(text, [], ran: false, outcome: "budget-exhausted") }
+        guard let token = rescoreLease.claim() else { return report(text, [], ran: false, outcome: "busy") }
+        let lease = rescoreLease
+        // A deadline releases this waiter, not an uninterruptible CoreML call.
+        // Only the underlying operation's completion may release the encoder.
+        let operation = SharedModelTask<RescoreOutput?>(onCompletion: { lease.release(token) }) {
+            guard let output = await session.rescore(text: text, tokenTimings: timings, audioSamples: samples) else { return nil }
+            try Task.checkCancellation()
+            return RescoreOutput(text: output.text, wasModified: output.wasModified,
+                replacements: output.replacements.filter(\.shouldReplace).map {
+                    "\($0.originalWord) → \($0.replacementWord ?? "")"
+                })
         }
-        let guarded = ASRVocabularyBoost.guardedText(unboosted: text, boosted: output.text, knownOther: captured.knownOther)
-        let kept = replacements.filter { r in !guarded.rejected.contains { $0.hasPrefix(r.components(separatedBy: " → ")[0]) } }
-        return report(guarded.text, kept, ran: true, rejected: guarded.rejected)
+        defer { operation.cancel() }
+        guard let completion = await DictationDeadline.run(seconds: remaining, { try? await operation.value }) else {
+            if !Task.isCancelled { budget.exhaust() }
+            return report(text, [], ran: true, outcome: Task.isCancelled ? "cancelled" : "timeout")
+        }
+        guard !Task.isCancelled else { return report(text, [], ran: true, outcome: "cancelled") }
+        guard let output = completion else { return report(text, [], ran: true, outcome: "unavailable") }
+        guard output.wasModified else { return report(text, [], ran: true, outcome: "unchanged") }
+        let guarded = ASRVocabularyBoost.guardedText(unboosted: text, boosted: output.text, knownOther: request.knownOther)
+        let kept = output.replacements.filter { r in
+            !guarded.rejected.contains { $0.hasPrefix(r.components(separatedBy: " → ")[0]) }
+        }
+        return report(guarded.text, kept, ran: true, outcome: guarded.text == text ? "guard-reverted" : "modified",
+                      rejected: guarded.rejected)
     }
 
     /// Loads the CTC model and session ahead of the first dictation.
     func prewarm() async {
-        guard let request = currentRequest(), let task = ensureSession(request) else { return }
-        _ = await task.value
+        guard !Task.isCancelled, let request = ASRVocabularyBoost.captureSnapshot(),
+              let task = ensureSession(request) else { return }
+        _ = try? await task.value
     }
 
     func cachedCTCModels() -> CtcModels? { ctcModels }
@@ -265,57 +317,55 @@ actor ASRVocabularyBooster {
     func prewarmCTCModels() async { _ = await loadCTCModels() }
 
     private func loadCTCModels() async -> CtcModels? {
+        guard !Task.isCancelled else { return nil }
         if let ctcModels { return ctcModels }
-        if let ctcLoad { return await ctcLoad.value }
+        if let ctcLoad { return try? await ctcLoad.value }
         guard encoderRetryAfter.map({ $0 <= .now }) != false else { return nil }
-        let task = Task { () -> CtcModels? in
-            defer { self.ctcLoad = nil }
-            do {
-                let loaded = try await CtcModels.downloadAndLoad()
-                self.ctcModels = loaded
-                self.encoderRetryAfter = nil
-                return loaded
-            } catch {
-                self.encoderRetryAfter = .now + .seconds(30)
-                return nil
-            }
-        }
+        let task = SharedModelTask<CtcModels?>(priority: .utility) { await self.loadCTCModelsOnce() }
         ctcLoad = task
-        return await task.value
+        return try? await task.value
     }
 
-    private func currentRequest() -> Request? {
-        let terms = ASRVocabularyBoost.trustedTerms()
-        guard !terms.isEmpty else { return nil }
-        let thresholds = ASRVocabularyBoost.thresholds()
-        let key = terms.joined(separator: "\u{1F}") + "|\(thresholds.cbw ?? -99)|\(thresholds.minSimilarity ?? -99)"
-        return Request(key: key, terms: terms, thresholds: thresholds)
-    }
-
-    private func ensureSession(_ request: Request) -> Task<Bool, Never>? {
-        if snapshot?.key == request.key { return nil }
-        if let sessionBuild { return sessionBuild.key == request.key ? sessionBuild.task : nil }
-        if let failure = sessionFailure, failure.key == request.key, failure.retryAfter > .now { return nil }
-        guard !rescoring else { return nil }
-        let task = Task { () -> Bool in
-            defer { self.sessionBuild = nil }
-            guard let models = await self.loadCTCModels() else { return false }
-            do {
-                let vocabulary = CustomVocabularyContext(terms: request.terms.map(ASRVocabularyBoost.vocabularyTerm))
-                let made = try await VocabularyBoostingSession(vocabulary: vocabulary, ctcModels: models,
-                                                               thresholds: request.thresholds)
-                self.snapshot = Snapshot(key: request.key, session: made,
-                                         knownOther: ASRVocabularyBoost.knownOtherWords(terms: request.terms))
-                self.sessionFailure = nil
-                print("[VOICE-VOCAB] batch boosting ready: \(request.terms.count) trusted terms")
-                return true
-            } catch {
-                self.sessionFailure = (request.key, .now + .seconds(30))
-                print("[VOICE-VOCAB] batch boosting unavailable")
-                return false
-            }
+    private func loadCTCModelsOnce() async -> CtcModels? {
+        defer { ctcLoad = nil }
+        do {
+            let loaded = try await CtcModels.downloadAndLoad()
+            ctcModels = loaded
+            encoderRetryAfter = nil
+            return loaded
+        } catch {
+            encoderRetryAfter = .now + .seconds(30)
+            return nil
         }
-        sessionBuild = (request.key, task)
+    }
+
+    private func ensureSession(_ request: AcousticVocabularySnapshot) -> SharedModelTask<Bool>? {
+        if snapshot?.key == request.sessionKey { return nil }
+        if let sessionBuild { return sessionBuild.key == request.sessionKey ? sessionBuild.task : nil }
+        if let failure = sessionFailure, failure.key == request.sessionKey, failure.retryAfter > .now { return nil }
+        guard !rescoreLease.isBusy else { return nil }
+        let task = SharedModelTask<Bool>(priority: .utility) { await self.buildSession(request) }
+        sessionBuild = (request.sessionKey, task)
         return task
+    }
+
+    private func buildSession(_ request: AcousticVocabularySnapshot) async -> Bool {
+        defer { sessionBuild = nil }
+        guard let models = await loadCTCModels() else { return false }
+        do {
+            let vocabulary = CustomVocabularyContext(terms: request.terms.map(ASRVocabularyBoost.vocabularyTerm))
+            let thresholds = VocabularyBoostingSession.Thresholds(cbw: request.options.cbw,
+                                                                  minSimilarity: request.options.minimumSimilarity)
+            let made = try await VocabularyBoostingSession(vocabulary: vocabulary, ctcModels: models,
+                                                           thresholds: thresholds)
+            snapshot = Snapshot(key: request.sessionKey, session: made)
+            sessionFailure = nil
+            print("[VOICE-VOCAB] batch boosting ready: \(request.terms.count) trusted terms")
+            return true
+        } catch {
+            sessionFailure = (request.sessionKey, .now + .seconds(30))
+            print("[VOICE-VOCAB] batch boosting unavailable")
+            return false
+        }
     }
 }

@@ -16,31 +16,22 @@ enum WisprImportService {
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
         return try JSONDecoder().decode([Entry].self, from: Data(contentsOf: file))
     }
+    private static let replacementCache = BoundedLocalFileCache<ImportedTextReplacementRules>(maximumBytes: 4 * 1024 * 1024) { data in
+        guard let pairs = try? JSONDecoder().decode([Replacement].self, from: data) else { return nil }
+        return ImportedTextReplacementRules(pairs.map { ($0.from, $0.to) })
+    }
+
+    /// Called on a utility task while recording. The release path rechecks the
+    /// file identity, so a refreshed or deleted archive never leaves stale rules.
+    static func prepareReplacements() {
+        _ = replacementCache.load(from: archiveDirectory.appendingPathComponent("replacements.json"))
+    }
+
     static func applyReplacements(to text: String) -> String {
-        let file = archiveDirectory.appendingPathComponent("replacements.json")
-        guard let data = try? Data(contentsOf: file), let replacements = try? JSONDecoder().decode([Replacement].self, from: data) else { return text }
-        return applyReplacements(to: text, using: replacements)
+        replacementCache.load(from: archiveDirectory.appendingPathComponent("replacements.json"))?.apply(to: text) ?? text
     }
     static func applyReplacements(to text: String, using replacements: [Replacement]) -> String {
-        var mapping = [String: String]()
-        // A whitespace-only trigger would match the spaces between ordinary
-        // words and silently corrupt every dictation. Ignore invalid triggers
-        // even if an older archive or external importer supplied one.
-        for pair in replacements where !pair.from.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            mapping[pair.from.lowercased()] = pair.to
-        }
-        let terms = mapping.keys.sorted { $0.count == $1.count ? $0 < $1 : $0.count > $1.count }
-        guard !terms.isEmpty else { return text }
-        let alternatives = terms.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
-        let pattern = "(?<![\\p{L}\\p{N}_])(?:" + alternatives + ")(?![\\p{L}\\p{N}_])"
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return text }
-        let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
-        let output = NSMutableString(string: text)
-        for match in matches.reversed() {
-            guard let range = Range(match.range, in: text), let replacement = mapping[String(text[range]).lowercased()] else { continue }
-            output.replaceCharacters(in: match.range, with: replacement)
-        }
-        return output as String
+        ImportedTextReplacementRules(replacements.map { ($0.from, $0.to) }).apply(to: text)
     }
     private static let importQueue = DispatchQueue(label: "voice.wispr.import")
     private static func preserveAndWrite(_ data: Data, to file: URL) throws {

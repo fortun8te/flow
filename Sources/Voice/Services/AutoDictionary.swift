@@ -158,27 +158,61 @@ final class AutoDictionary: @unchecked Sendable {
     }
 
     static let settingsKey = "voice.autoDictionary"
+    static let persistenceSettingsKey = "voice.autoDictionaryPersistence"
+
+    struct PersistenceState: Equatable, Sendable {
+        enum Status: String, Sendable { case ready, readFailed, unsupportedVersion, writeFailed, overlayFailed, externalConflict, privacyPaused }
+        let status: Status
+        let unsavedChanges: Bool
+    }
+
+    // Separate readers/tools in this process must not overwrite one another's
+    // newer observations. Weak entries keep temporary/test stores bounded.
+    private final class LockReference {
+        weak var value: NSRecursiveLock?
+        init(_ value: NSRecursiveLock) { self.value = value }
+    }
+    private static let storeLocksLock = NSLock()
+    nonisolated(unsafe) private static var storeLocks: [String: LockReference] = [:]
+    private static func sharedLock(for url: URL) -> NSRecursiveLock {
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        storeLocksLock.lock(); defer { storeLocksLock.unlock() }
+        if let lock = storeLocks[path]?.value { return lock }
+        storeLocks = storeLocks.filter { $0.value.value != nil }
+        let lock = NSRecursiveLock()
+        storeLocks[path] = LockReference(lock)
+        return lock
+    }
 
     let storeURL: URL
     let overlayURL: URL
     /// Where the short review list goes. nil: not mirrored (CLI tools).
     private let settings: UserDefaults?
-    private let lock = NSLock()
+    private let lock: NSRecursiveLock
+    private let writeData: @Sendable (Data, URL) throws -> Void
     private var entries: [String: AutoDictionaryEntry] = [:]
-    private var loadedStamp: Date?
+    private var loadedStamp: PrivateDataFile.Identity?
+    private var hasLoaded = false
     private var checkedAt = Date.distantPast
     /// Bumped on every change; consumers cache on it.
     private(set) var revision = 0
     private var cachedLiveSnapshot: LiveSnapshot?
     /// A delayed keep or replay must not revive an operation that was already undone.
     private var undoneOperations: Set<String> = []
-    private var suspendSaves = false
+    private var batchDepth = 0
+    private var dirty = false
+    private var overlayDirty = false
+    private var storageReadable = true
+    private var persistenceStatus: PersistenceState.Status = .ready
     var judgeProvider: () -> WordJudge? = { WordJudge.lexicon(wait: false) }
 
-    init(directory: URL, settings: UserDefaults? = AutoDictionary.defaultSettings) {
+    init(directory: URL, settings: UserDefaults? = AutoDictionary.defaultSettings,
+         writeData: @escaping @Sendable (Data, URL) throws -> Void = { try PrivateDataFile.replace($0, at: $1) }) {
         storeURL = directory.appendingPathComponent("auto-dictionary.json")
         overlayURL = directory.appendingPathComponent("typo_dictionary.user.json")
+        lock = Self.sharedLock(for: storeURL)
         self.settings = settings
+        self.writeData = writeData
         lock.lock(); reloadIfChangedLocked(force: true); lock.unlock()
     }
 
@@ -288,17 +322,33 @@ final class AutoDictionary: @unchecked Sendable {
         return revision
     }
 
+    var persistenceState: PersistenceState {
+        lock.lock(); defer { lock.unlock() }
+        return PersistenceState(status: persistenceStatus, unsavedChanges: dirty || overlayDirty)
+    }
+
+    /// Retry a failed write without adding another observation. This never
+    /// discards the in-memory correction or overwrites changed external data.
+    @discardableResult
+    func flush() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard Self.learningEnabled else { return false }
+        if !dirty { reloadIfChangedLocked(force: true) }
+        saveLocked()
+        return !dirty && !overlayDirty && storageReadable
+    }
+
     // MARK: Learning
 
     /// One piece of evidence: Flow wrote `before`, Jordan (or a kept Opt+1) made it `after`.
     @discardableResult
     func observe(before: String, after: String, source: Source, now: Date = Date(),
                  operation: UUID? = nil, evidenceID: String? = nil, judge: WordJudge? = nil) -> [Event] {
-        guard before != after, let judge = judge ?? judgeProvider() else { return [] }
+        guard Self.learningEnabled, before != after, let judge = judge ?? judgeProvider() else { return [] }
         let pairs = Self.substitutions(before: before, after: after)
         guard !pairs.isEmpty else { return [] }
         lock.lock(); defer { lock.unlock() }
-        reloadIfChangedLocked()
+        guard beginMutationLocked(), Self.learningEnabled else { return [] }
         let observation = Self.observationID(evidenceID ?? operation?.uuidString, source: source, before: before, after: after)
         guard !undoneOperations.contains(observation) else { return [] }
         var events: [Event] = []
@@ -342,50 +392,63 @@ final class AutoDictionary: @unchecked Sendable {
     @discardableResult
     func observePair(heard: String, written: String, source: Source, now: Date = Date(),
                      evidenceID: String? = nil, judge: WordJudge? = nil) -> [Event] {
-        guard let judge = judge ?? judgeProvider() else { return [] }
+        guard Self.learningEnabled, let judge = judge ?? judgeProvider() else { return [] }
         let h = heard.trimmingCharacters(in: .whitespacesAndNewlines), w = written.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !h.isEmpty, !w.isEmpty, h != w, h.split(separator: " ").count <= 3, w.split(separator: " ").count <= 3 else { return [] }
+        guard !h.isEmpty, !w.isEmpty, h != w,
+              h.split(whereSeparator: \.isWhitespace).count <= 3, w.split(whereSeparator: \.isWhitespace).count <= 3,
+              !h.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              !w.unicodeScalars.contains(where: CharacterSet.newlines.contains) else { return [] }
         var pair = Pair(heard: h, written: w, writtenAtSentenceStart: false)
         guard let classified = Self.classify(pair, judge: judge) else { return [] }
         if classified.kind == .spelling { pair = Pair(heard: h.lowercased(), written: w.lowercased(), writtenAtSentenceStart: false) }
         lock.lock(); defer { lock.unlock() }
-        reloadIfChangedLocked()
+        guard beginMutationLocked(), Self.learningEnabled else { return [] }
         let observation = Self.observationID(evidenceID, source: source, before: h, after: w)
         guard !undoneOperations.contains(observation) else { return [] }
         if let reverse = entries[Self.key(w, h)], reverse.kind != .soundAlike { return [] }
+        var events: [Event] = []
+        if source.isOwnEdit {
+            guard let retractions = retractEarlierSnapshotLocked(pair: pair, observation: observation, now: now) else { return [] }
+            events += retractions
+        }
         let example = AutoDictionaryEntry.Example(before: h, after: w, source: source.rawValue, at: now)
         let event = sightLocked(pair: pair, kind: classified.kind, replaces: classified.replaces,
                                 clearName: classified.clearName, source: source, example: example,
                                 observation: observation, now: now)
         pruneLocked(now: now)
         saveLocked()
-        return event.map { [$0] } ?? []
+        if let event { events.append(event) }
+        return events
     }
 
     /// Many observations, one save at the end (the history seed).
     func batch(_ body: () -> Void) {
-        lock.lock(); suspendSaves = true; lock.unlock()
+        lock.lock(); defer { lock.unlock() }
+        guard beginMutationLocked() else { return }
+        batchDepth += 1
+        defer { batchDepth -= 1; saveLocked() }
         body()
-        lock.lock(); suspendSaves = false; saveLocked(); lock.unlock()
     }
 
     /// Empties the store (tests).
     func removeAll() {
         lock.lock(); defer { lock.unlock() }
+        guard beginMutationLocked(), !entries.isEmpty || !undoneOperations.isEmpty else { return }
         entries = [:]
         undoneOperations = []
-        saveLocked()
+        markChangedLocked()
+        saveLocked(allowDuringPrivacy: true)
     }
 
     /// A name seen again in his own dictations (no fix involved): vocabulary only, after 3 sightings.
     @discardableResult
     func observeRecurringName(_ name: String, context: String, now: Date = Date(),
                               evidenceID: String? = nil, judge: WordJudge? = nil) -> [Event] {
-        guard let judge = judge ?? judgeProvider() else { return [] }
+        guard Self.learningEnabled, let judge = judge ?? judgeProvider() else { return [] }
         let word = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard Self.isNameLike(word, atSentenceStart: false, judge: judge) else { return [] }
         lock.lock(); defer { lock.unlock() }
-        reloadIfChangedLocked()
+        guard beginMutationLocked(), Self.learningEnabled else { return [] }
         let example = AutoDictionaryEntry.Example(before: Self.clip(context, around: word), after: Self.clip(context, around: word),
                                                  source: Source.recurringName.rawValue, at: now)
         let event = sightLocked(pair: Pair(heard: word, written: word, writtenAtSentenceStart: false), kind: .name,
@@ -399,11 +462,13 @@ final class AutoDictionary: @unchecked Sendable {
 
     /// Opt+1 Undo: every learned fix the undone edit made is taken out, and a keep it counted is taken back.
     @discardableResult
-    func observeUndo(original: String, candidate: String, operation: UUID? = nil, now: Date = Date()) -> [Event] {
+    func observeUndo(original: String, candidate: String, operation: UUID? = nil, evidenceID: String? = nil,
+                     now: Date = Date()) -> [Event] {
         lock.lock(); defer { lock.unlock() }
-        reloadIfChangedLocked()
-        let observation = Self.observationID(operation?.uuidString, source: .opt1Kept, before: original, after: candidate)
+        guard beginMutationLocked() else { return [] }
+        let observation = Self.observationID(evidenceID ?? operation?.uuidString, source: .opt1Kept, before: original, after: candidate)
         guard undoneOperations.insert(observation).inserted else { return [] }
+        markChangedLocked()
         var events: [Event] = []
         let persisted = entries.values.filter { $0.observations?[observation] == Source.opt1Kept.rawValue }.map(\.key)
         for key in persisted {
@@ -411,30 +476,35 @@ final class AutoDictionary: @unchecked Sendable {
             guard e.observations?.removeValue(forKey: observation) == Source.opt1Kept.rawValue else { continue }
             e.count = max(0, e.count - 1)
             e.sources[Source.opt1Kept.rawValue] = max(0, (e.sources[Source.opt1Kept.rawValue] ?? 1) - 1)
-            if e.count == 0 && e.status == .pending { entries[key] = nil } else { entries[key] = e }
+            setEntryLocked(e.count == 0 && e.status == .pending ? nil : e, for: key)
         }
         for pair in Self.substitutions(before: original, after: candidate) {
             let key = Self.key(pair.heard, pair.written)
-            if entries[key]?.status == .live, let e = undoLocked(key: key, now: now) { events.append(e) }
+            // Importing an old Undo still revokes that operation's vote, but
+            // must not veto a correction the user independently made later.
+            if let entry = entries[key], entry.status == .live,
+               now >= (entry.lastOwnEditAt ?? entry.lastSeen), let event = undoLocked(key: key, now: now) {
+                events.append(event)
+            }
         }
-        saveLocked()
+        saveLocked(allowDuringPrivacy: true)
         return events
     }
 
     /// Jordan removes a learned word himself (Settings): out for good.
     func remove(written: String, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
-        reloadIfChangedLocked()
+        guard beginMutationLocked() else { return }
         let target = Self.normalized(written)
         var changed = false
         for (key, var e) in entries where Self.normalized(e.written) == target && e.status != .removed {
             e.status = .removed
             e.removedAt = now
             e.undos = max(e.undos, Rules.permanentUndos)
-            entries[key] = e
+            setEntryLocked(e, for: key)
             changed = true
         }
-        if changed { saveLocked() }
+        if changed { saveLocked(allowDuringPrivacy: true) }
     }
 
     // MARK: Evidence rules
@@ -471,7 +541,7 @@ final class AutoDictionary: @unchecked Sendable {
             // A user edit can strengthen evidence from the same run, but it
             // is still one observation. Repeated polling never adds a vote.
             guard source.isOwnEdit, Source(rawValue: previous)?.isOwnEdit != true else {
-                if pair.written != e.written { refreshOwnSpelling(); entries[key] = e }
+                if pair.written != e.written { refreshOwnSpelling(); setEntryLocked(e, for: key) }
                 return nil
             }
             e.sources[previous] = max(0, (e.sources[previous] ?? 0) - 1)
@@ -480,7 +550,7 @@ final class AutoDictionary: @unchecked Sendable {
             // identities and then counting an old replay as new evidence.
             guard observations.count < Rules.maxEvidenceRecords else {
                 refreshOwnSpelling()
-                entries[key] = e
+                setEntryLocked(e, for: key)
                 return nil
             }
             if source == .opt1Kept, (e.sources[source.rawValue] ?? 0) >= Rules.maxPassiveEvidence { return nil }
@@ -505,7 +575,7 @@ final class AutoDictionary: @unchecked Sendable {
                 event = Event(change: .promoted, heard: e.heard, written: e.written, kind: e.kind)
             }
         }
-        entries[key] = e
+        setEntryLocked(e, for: key)
         return event
     }
 
@@ -527,7 +597,7 @@ final class AutoDictionary: @unchecked Sendable {
                 entry.status = .pending
                 entry.liveSince = nil
             }
-            entries[entry.key] = entry.count == 0 ? nil : entry
+            setEntryLocked(entry.count == 0 ? nil : entry, for: entry.key)
             if wasLive && entry.status != .live {
                 events.append(Event(change: .removed, heard: entry.heard, written: entry.written, kind: entry.kind))
             }
@@ -570,18 +640,18 @@ final class AutoDictionary: @unchecked Sendable {
         e.observations = [:]
         e.liveSince = nil
         e.lastOwnEditAt = nil
-        entries[key] = e
+        setEntryLocked(e, for: key)
         return wasLive ? Event(change: .removed, heard: e.heard, written: e.written, kind: e.kind) : nil
     }
 
     private func pruneLocked(now: Date) {
         for (key, e) in entries where e.status == .pending && now.timeIntervalSince(e.lastSeen) > Rules.pendingDecaySeconds {
-            entries[key] = nil
+            setEntryLocked(nil, for: key)
         }
         let pending = entries.values.filter { $0.status == .pending }
         if pending.count > Rules.maxPending {
             let drop = pending.sorted { ($0.count, $0.lastSeen) < ($1.count, $1.lastSeen) }.prefix(pending.count - Rules.maxPending)
-            for e in drop { entries[e.key] = nil }
+            for e in drop { setEntryLocked(nil, for: e.key) }
         }
     }
 
@@ -779,6 +849,34 @@ final class AutoDictionary: @unchecked Sendable {
 
     // MARK: Storage
 
+    private static var learningEnabled: Bool { !UserDefaults.standard.bool(forKey: "voice.privacyMode") }
+
+    private func markChangedLocked() {
+        dirty = true
+        revision &+= 1
+        cachedLiveSnapshot = nil
+    }
+
+    private func setEntryLocked(_ entry: AutoDictionaryEntry?, for key: String) {
+        guard entries[key] != entry else { return }
+        entries[key] = entry
+        markChangedLocked()
+    }
+
+    private func beginMutationLocked() -> Bool {
+        // Hot reads are throttled, but a writer must first see another writer's
+        // committed state. Never replace local changes whose save failed.
+        if batchDepth == 0 && !dirty { reloadIfChangedLocked(force: true) }
+        return storageReadable
+    }
+
+    private func fileStamp() throws -> PrivateDataFile.Identity? { try PrivateDataFile.identity(at: storeURL) }
+
+    private func setPersistenceStatus(_ status: PersistenceState.Status) {
+        persistenceStatus = status
+        settings?.set(["status": status.rawValue, "unsavedChanges": dirty || overlayDirty], forKey: Self.persistenceSettingsKey)
+    }
+
     private struct File: Codable {
         var version: Int
         var entries: [AutoDictionaryEntry]
@@ -786,61 +884,131 @@ final class AutoDictionary: @unchecked Sendable {
     }
 
     private func reloadIfChangedLocked(force: Bool = false) {
+        guard !dirty, batchDepth == 0 else { return }
         let now = Date()
         guard force || now.timeIntervalSince(checkedAt) > 1 else { return }
         checkedAt = now
-        let stamp = (try? FileManager.default.attributesOfItem(atPath: storeURL.path))?[.modificationDate] as? Date
-        guard force || stamp != loadedStamp else { return }
-        loadedStamp = stamp
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        if let data = try? Data(contentsOf: storeURL), let file = try? decoder.decode(File.self, from: data) {
-            entries = Dictionary(file.entries.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-            undoneOperations = Set(file.undoneOperations ?? [])
-        } else if !force {
-            entries = [:]
-            undoneOperations = []
+        do {
+            let stamp = try fileStamp()
+            guard !hasLoaded || stamp != loadedStamp || !storageReadable else { return }
+            var loaded: [String: AutoDictionaryEntry] = [:]
+            var undone: Set<String> = []
+            if stamp != nil {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                guard let data = try PrivateDataFile.read(storeURL) else { throw CocoaError(.fileReadNoSuchFile) }
+                let file = try decoder.decode(File.self, from: data)
+                guard (1...2).contains(file.version) else {
+                    storageReadable = false
+                    setPersistenceStatus(.unsupportedVersion)
+                    return
+                }
+                guard file.entries.allSatisfy({ $0.count >= 0 && $0.undos >= 0 && $0.sources.values.allSatisfy { $0 >= 0 } }),
+                      stamp == (try fileStamp()) else { throw CocoaError(.fileReadCorruptFile) }
+                loaded = Dictionary(file.entries.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+                undone = Set(file.undoneOperations ?? [])
+            }
+            if !hasLoaded || entries != loaded || undoneOperations != undone {
+                entries = loaded
+                undoneOperations = undone
+                revision &+= 1
+                cachedLiveSnapshot = nil
+            }
+            loadedStamp = stamp
+            hasLoaded = true
+            storageReadable = true
+            setPersistenceStatus(.ready)
+        } catch {
+            // A partial external write, permissions failure or corrupt JSON is
+            // not a request to forget the user's words. Retry on the next read;
+            // never mark the failed stamp loaded or overwrite those bytes.
+            storageReadable = false
+            setPersistenceStatus(.readFailed)
+            return
         }
-        revision += 1
         // Older builds promoted passive model output by repeated keeps. Keep
         // those entries visible for review but stop applying them automatically.
         var repaired = false
         for (key, var e) in entries where e.status == .live && !Self.hasPromotionEvidence(e) {
             e.status = .pending
             e.liveSince = nil
-            entries[key] = e
+            setEntryLocked(e, for: key)
             repaired = true
         }
-        // Rebuild old serialized overlays too: older builds picked one target
-        // for conflicting live aliases even when the entries themselves are valid.
-        let hasConflictingAliases = Self.unambiguousLiveEntries(Array(entries.values)).count
-            < entries.values.filter { $0.status == .live }.count
-        if repaired || hasConflictingAliases { saveLocked() }
+        // The overlay is derived, never evidence. Repair an interrupted second
+        // write (or an older build's conflicting alias) after a restart too.
+        if loadedStamp != nil {
+            let stored = (try? PrivateDataFile.read(overlayURL)).flatMap {
+                try? JSONDecoder().decode([String: String].self, from: $0)
+            }
+            overlayDirty = stored != spellingOverlayLocked()
+        }
+        if repaired || overlayDirty { saveLocked() }
         else if force { mirrorLocked() }
     }
 
-    private func saveLocked() {
-        revision += 1
-        if suspendSaves { return }
+    private func spellingOverlayLocked() -> [String: String] {
+        var spellings: [String: String] = [:]
+        for e in Self.unambiguousLiveEntries(Array(entries.values)) where e.kind == .spelling {
+            spellings[e.heard.lowercased()] = e.written
+        }
+        return spellings
+    }
+
+    private func acceptPublishedWriteLocked(_ data: Data) throws -> Bool {
+        // A file editor need not take our advisory lock. Bind the cache to the
+        // bytes we actually published, never to its intervening replacement.
+        let stamp = try fileStamp()
+        guard stamp != nil, try PrivateDataFile.read(storeURL) == data, try fileStamp() == stamp else {
+            setPersistenceStatus(.externalConflict)
+            return false
+        }
+        loadedStamp = stamp
+        return true
+    }
+
+    private func saveLocked(allowDuringPrivacy: Bool = false) {
+        guard batchDepth == 0, dirty || overlayDirty, storageReadable else { return }
+        guard allowDuringPrivacy || Self.learningEnabled else { setPersistenceStatus(.privacyPaused); return }
         do {
-            let dir = storeURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            let list = entries.values.sorted { ($0.status.rawValue, $0.written.lowercased()) < ($1.status.rawValue, $1.written.lowercased()) }
-            try encoder.encode(File(version: 2, entries: list, undoneOperations: undoneOperations.sorted()))
-                .write(to: storeURL, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
-            var spellings: [String: String] = [:]
-            for e in Self.unambiguousLiveEntries(Array(entries.values)) where e.kind == .spelling {
-                spellings[e.heard.lowercased()] = e.written
+            try PrivateDataFile.withExclusiveAccess(to: storeURL) {
+                guard allowDuringPrivacy || Self.learningEnabled else { setPersistenceStatus(.privacyPaused); return }
+                guard try fileStamp() == loadedStamp else {
+                    setPersistenceStatus(.externalConflict)
+                    return
+                }
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                if dirty {
+                    let list = entries.values.sorted {
+                        ($0.status.rawValue, $0.written.lowercased(), $0.key) < ($1.status.rawValue, $1.written.lowercased(), $1.key)
+                    }
+                    let data = try encoder.encode(File(version: 2, entries: list, undoneOperations: undoneOperations.sorted()))
+                    do {
+                        try writeData(data, storeURL)
+                    } catch PrivateDataFile.PersistenceError.synchronizationAfterPublishFailed {
+                        // Rename completed, but the directory sync did not.
+                        // Keep the write dirty and recognize our own published
+                        // bytes so retry is not mistaken for an external edit.
+                        guard try acceptPublishedWriteLocked(data) else { return }
+                        throw PrivateDataFile.PersistenceError.synchronizationAfterPublishFailed
+                    }
+                    guard try acceptPublishedWriteLocked(data) else { return }
+                    dirty = false
+                    overlayDirty = true
+                }
+                do {
+                    try writeData(encoder.encode(spellingOverlayLocked()), overlayURL)
+                    overlayDirty = false
+                    setPersistenceStatus(.ready)
+                } catch {
+                    setPersistenceStatus(.overlayFailed)
+                }
             }
-            try encoder.encode(spellings).write(to: overlayURL, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: overlayURL.path)
-            loadedStamp = (try? FileManager.default.attributesOfItem(atPath: storeURL.path))?[.modificationDate] as? Date
         } catch {
-            print("[VOICE-AUTODICT] could not save the learned dictionary: \(error.localizedDescription)")
+            setPersistenceStatus(.writeFailed)
+            print("[VOICE-AUTODICT] could not persist the learned dictionary; in-memory corrections retained")
         }
         mirrorLocked()
         if settings != nil { FlowBroadcast.changed("dictionary") }

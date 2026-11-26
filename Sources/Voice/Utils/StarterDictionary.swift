@@ -42,14 +42,12 @@ enum StarterDictionary {
 /// pane will read/write through.
 enum UserDictionary {
     private static let defaultsKey = "voice.userDictionary"
-    // add/remove call setTerms while holding this lock; serialize the complete read-modify-write.
-    private static let mutationLock = NSRecursiveLock()
 
     /// All user-added terms (de-duplicated, original casing preserved).
-    static func terms() -> [String] {
-        let stored = UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
+    static func terms(defaults: UserDefaults = .standard) -> [String] {
+        let stored = defaults.stringArray(forKey: defaultsKey) ?? []
         // Defensive: trim, drop empties, de-dupe case-insensitively.
-        let excluded = ProperNounVocabulary.excludedTerms()
+        let excluded = ProperNounVocabulary.excludedTerms(defaults: defaults)
         var seen = Set<String>()
         var out: [String] = []
         for raw in stored {
@@ -66,8 +64,7 @@ enum UserDictionary {
     /// Replace the user list. Caller is responsible for sanitization beyond
     /// trim+dedupe (which we do on read).
     static func setTerms(_ terms: [String]) {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        UserDefaults.standard.set(terms, forKey: defaultsKey)
+        VocabularyPreferenceTransaction.withLock { UserDefaults.standard.set(terms, forKey: defaultsKey) }
         // Lets Companion refresh its copy; silent outside the running app.
         FlowBroadcast.changed("dictionary")
     }
@@ -76,20 +73,22 @@ enum UserDictionary {
     static func add(_ term: String) {
         let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        var existing = terms()
-        let lower = VocabularyReplacementRules.key(trimmed)
-        guard !existing.contains(where: { VocabularyReplacementRules.key($0) == lower }) else { return }
-        existing.append(trimmed)
-        setTerms(existing)
+        VocabularyPreferenceTransaction.withLock {
+            var existing = terms()
+            let lower = VocabularyReplacementRules.key(trimmed)
+            guard !existing.contains(where: { VocabularyReplacementRules.key($0) == lower }) else { return }
+            existing.append(trimmed)
+            setTerms(existing)
+        }
     }
 
     /// Remove one term (case-insensitive).
     static func remove(_ term: String) {
-        mutationLock.lock(); defer { mutationLock.unlock() }
-        let lower = VocabularyReplacementRules.key(term)
-        let filtered = terms().filter { VocabularyReplacementRules.key($0) != lower }
-        setTerms(filtered)
+        VocabularyPreferenceTransaction.withLock {
+            let lower = VocabularyReplacementRules.key(term)
+            let filtered = terms().filter { VocabularyReplacementRules.key($0) != lower }
+            setTerms(filtered)
+        }
     }
 }
 

@@ -263,13 +263,6 @@ class RecordingCoordinator {
             }
 
 
-            // Disk safety: prune audio folder if it's over the 5GB cap.
-            // Non-blocking background pass on the main actor (storage is
-            // not Sendable; the prune itself is cheap I/O).
-            Task { @MainActor [weak self] in
-                _ = self?.storage.pruneAudioBySize()
-            }
-
             // Sync model state to UI as Parakeet downloads/loads.
             state.modelState = .downloading(progress: 0)
 
@@ -326,6 +319,10 @@ class RecordingCoordinator {
     // MARK: - Recording Control
 
     private func warmDictationAssistants() {
+        Task.detached(priority: .utility) {
+            WisprImportService.prepareReplacements()
+            _ = WisprPersonalizationProfile.load()
+        }
         guard (UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true),
               CleanupLevel.current != .none else { return }
         // Refresh the chosen cleanup model while audio is being captured,

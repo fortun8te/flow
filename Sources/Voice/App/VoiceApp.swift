@@ -683,276 +683,6 @@ enum MeetingsLoadState: Equatable {
     case error(String)
 }
 
-/// Persisted history of the last dictations. Capped at 100 (see
-/// `RecentDictations.limit`). Lives here (not in a service) because it's
-/// UI-shaped state for the menu.
-///
-/// `text` is the polished (final) version that was actually pasted at the cursor.
-/// `rawText` is the pre-polish formatted version (optional for backward compat —
-/// older persisted entries didn't capture it). When both are present the UI can
-/// show a before/after compare.
-struct RecentDictation: Codable, Identifiable {
-    let text: String
-    let timestamp: Date
-    /// Pre-polish formatted text. Optional so we don't break decoding of older
-    /// entries written before this field existed.
-    var rawText: String? = nil
-    /// Bundle ID of the app text was pasted into (e.g. "com.tinyspeck.slackmacgap").
-    var pasteTargetBundleID: String? = nil
-    /// Milliseconds the Qwen3 polish stage took. Nil if polish was skipped/disabled.
-    var polishMs: Int? = nil
-    /// Raw transcript from Granite 4.0 1B (second ASR), captured at the moment
-    /// of dictation. Optional for backward compat with older entries.
-    var graniteText: String? = nil
-    /// Raw transcript from Moonshine Tiny (third ASR), captured at the moment
-    /// of dictation. Optional for backward compat with older entries.
-    var moonshineText: String? = nil
-    /// Raw Parakeet ASR before TextFormatter ran — the actual speech recognizer output.
-    /// Stored to let the pipeline view show all 3 stages: ASR → Formatter → Polish.
-    var parakeetRawText: String? = nil
-    /// Low-confidence words flagged by Parakeet's per-token confidence scoring.
-    /// Passed to Qwen3 as hints; shown in the pipeline view.
-    var parakeetSuspects: [String]? = nil
-    /// Recording duration in seconds. Optional for back-compat with older entries
-    /// captured before this field existed. Used by the BigMenu stats row to
-    /// compute words-per-minute over recent dictations.
-    var durationSeconds: Int? = nil
-    /// Number of spoken punctuation/formatting commands the TextFormatter
-    /// converted to characters (period, comma, new line, exclamation, etc.).
-    /// Surfaced as "fixes made by voice" in the BigMenu stats row.
-    // NOTE: BigMenuWindow's computeStats() should sum `polishFixCount` (not
-    // `voiceCommandCount`) for the "fixes by voice" stat card. Keep this field
-    // around for back-compat but the UI now prefers polishFixCount.
-    var voiceCommandCount: Int? = nil
-    /// Number of fix-events the polish stage applied (spelling/capitalization/grammar/filler).
-    /// Computed by diffing raw → polished at finishRecording time.
-    var polishFixCount: Int? = nil
-    /// Cleanup level the polish stage was running on when this dictation was captured.
-    /// Optional for back-compat with older entries. Display value: "None" / "Light" / "Medium" / "High".
-    var cleanupLevelUsed: String? = nil
-    /// Personality preset in effect when the polish ran. "Neutral" / "Formal" / "Casual" / "Excited".
-    var personalityStyleUsed: String? = nil
-    /// Engine that actually polished this dictation. Tagged by Qwen3Polisher
-    /// during polish so the history view can show "Cloud (Qwen 235B)" vs
-    /// "Local (Qwen3 4B)". Optional for back-compat with older entries.
-    /// Format: "cloud:qwen-3-235b" / "local:qwen3-4b" / "local:qwen3-1.7b" / "rules-only"
-    var polishEngine: String? = nil
-    /// True when this dictation was CANCELLED rather than committed. Cancelled
-    /// dictations are retained (audio kept on disk, transcript saved) but were
-    /// never pasted at the cursor and were not fully polished. Optional /
-    /// defaults false for back-compat with older entries.
-    var cancelled: Bool = false
-    /// On-disk path to the retained .caf audio for this dictation. Populated for
-    /// cancelled dictations so the user can recover / re-process the recording
-    /// from History. Optional for back-compat with older entries (committed
-    /// dictations don't set this — their audio is referenced via the Meeting row).
-    var audioFilePath: String? = nil
-    var deletedAt: Date? = nil
-    var id: String { "\(timestamp.timeIntervalSince1970)" }
-
-    /// True when raw differs meaningfully from polished — i.e. polish actually
-    /// changed something. Used by the UI to decide whether to show a compare
-    /// affordance.
-    var hasPolishDiff: Bool {
-        guard let raw = rawText else { return false }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            != text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// True when we have a raw transcript to show, regardless of whether
-    /// polish changed anything. Used to enable the "show raw" affordance
-    /// on every entry that has the pre-polish text available.
-    var hasRawText: Bool {
-        guard let raw = rawText else { return false }
-        return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-}
-
-fileprivate extension String {
-    var nonEmptyOrNil: String? { isEmpty ? nil : self }
-}
-
-enum RecentDictations {
-    private static let key = "recentDictations"
-    private static let limit = 100
-
-    /// File at ~/Library/Application Support/Voice/recent_dictations.json.
-    /// Mirrors the pattern used by StorageService / Telemetry.
-    private static var fileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let voiceDir = appSupport.appendingPathComponent("Voice", isDirectory: true)
-        try? FileManager.default.createDirectory(at: voiceDir, withIntermediateDirectories: true)
-        return voiceDir.appendingPathComponent("recent_dictations.json")
-    }
-
-    /// Read items from disk. On first run, migrate any legacy UserDefaults
-    /// blob to the new file and delete the old key.
-    static func all() -> [RecentDictation] { stored().filter { $0.deletedAt == nil } }
-
-    static func retainingHistory(_ items: [RecentDictation], now: Date) -> [RecentDictation] {
-        items.filter { $0.deletedAt.map { now.timeIntervalSince($0) < 7 * 24 * 3600 } ?? true }
-    }
-
-    static func trash(now: Date = Date()) -> [RecentDictation] {
-        stored().filter { item in
-            item.deletedAt.map { now.timeIntervalSince($0) < 7 * 24 * 3600 } ?? false
-        }
-    }
-
-    static func restore(id: String) {
-        var items = stored()
-        guard let index = items.firstIndex(where: { $0.id == id }),
-              trash().contains(where: { $0.id == id }) else { return }
-        items[index].deletedAt = nil
-        save(items)
-    }
-
-    private static func stored() -> [RecentDictation] {
-        let url = fileURL
-        if FileManager.default.fileExists(atPath: url.path) {
-            do {
-                let data = try Data(contentsOf: url)
-                let items = try JSONDecoder().decode([RecentDictation].self, from: data)
-                let retained = retainingHistory(items, now: Date())
-                if retained.count != items.count { save(retained) }
-                return retained
-            } catch {
-                NSLog("[VOICE-STORAGE] failed to read recent_dictations.json: \(error)")
-                return []
-            }
-        }
-        // No file yet — try migrating from UserDefaults.
-        if let legacy = UserDefaults.standard.data(forKey: key),
-           let items = try? JSONDecoder().decode([RecentDictation].self, from: legacy) {
-            do {
-                let encoded = try JSONEncoder().encode(items)
-                try encoded.write(to: url, options: .atomic)
-                UserDefaults.standard.removeObject(forKey: key)
-                NSLog("[VOICE-STORAGE] migrated \(items.count) dictations from UserDefaults to file")
-            } catch {
-                NSLog("[VOICE-STORAGE] migration write failed: \(error)")
-            }
-            return items
-        }
-        return []
-    }
-
-    /// Write items to disk, silently swallowing errors after logging.
-    private static func save(_ items: [RecentDictation]) {
-        do {
-            let data = try JSONEncoder().encode(items)
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            NSLog("[VOICE-STORAGE] failed to write recent_dictations.json: \(error)")
-        }
-    }
-
-    /// Back-compat single-text add — used by code paths that don't know the
-    /// pre-polish version. Newer callers should use `add(raw:polished:)`.
-    static func add(_ text: String) {
-        add(raw: nil, polished: text)
-    }
-
-    /// Add a dictation with both the pre-polish formatted text and the final
-    /// polished text. `raw` is optional — pass nil if polish was skipped /
-    /// disabled / unchanged, and only the polished version will be stored.
-    static func delete(id: String) {
-        var items = stored()
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        items[index].deletedAt = Date()
-        save(items)
-    }
-
-    static func add(raw: String?, polished: String, pasteTargetBundleID: String? = nil, polishMs: Int? = nil,
-                    granite: String? = nil, moonshine: String? = nil,
-                    parakeetRaw: String? = nil, suspects: [String]? = nil,
-                    durationSeconds: Int? = nil, voiceCommandCount: Int? = nil,
-                    cleanupLevelUsed: String? = nil,
-                    personalityStyleUsed: String? = nil,
-                    polishFixCount: Int? = nil,
-                    polishEngine: String? = nil,
-                    cancelled: Bool = false,
-                    audioFilePath: String? = nil) {
-        let trimmed = polished.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let trimmedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Always persist `rawText` when it's non-empty (even when identical to
-        // the polished version). The History UI uses `hasPolishDiff` to gate
-        // the compare button — keeping `rawText` populated lets us surface
-        // "polish was a no-op for this one" cleanly, and means users who want
-        // to see the raw transcript always can.
-        let rawForStorage: String? = {
-            guard let r = trimmedRaw, !r.isEmpty else { return nil }
-            return r
-        }()
-        var items = stored()
-        items.insert(
-            RecentDictation(text: trimmed, timestamp: Date(), rawText: rawForStorage,
-                            pasteTargetBundleID: pasteTargetBundleID, polishMs: polishMs,
-                            graniteText: granite?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil,
-                            moonshineText: moonshine?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil,
-                            parakeetRawText: parakeetRaw?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil,
-                            parakeetSuspects: (suspects?.isEmpty == false) ? suspects : nil,
-                            durationSeconds: durationSeconds,
-                            voiceCommandCount: voiceCommandCount,
-                            polishFixCount: polishFixCount,
-                            cleanupLevelUsed: cleanupLevelUsed,
-                            personalityStyleUsed: personalityStyleUsed,
-                            polishEngine: polishEngine,
-                            cancelled: cancelled,
-                            audioFilePath: audioFilePath),
-            at: 0
-        )
-        let retainedTrash = items.filter { $0.deletedAt.map { Date().timeIntervalSince($0) < 7 * 24 * 3600 } ?? false }
-        items = Array(items.filter { $0.deletedAt == nil }.prefix(limit)) + retainedTrash
-        // Raw per-engine ASR alternatives are kept for every item: they are training data, and the 7-day trim
-        // removed them (25 Nov 2026). The 100-item cap above still bounds the history.
-        save(items)
-    }
-
-    /// Count distinct fix events between raw and polished text. A "fix event" is
-    /// any contiguous run of words that differs between the two. This collapses
-    /// e.g. "i think" → "I think" + "yeah" → "" into 2 fixes, not 2.5.
-    static func countFixes(raw: String, polished: String) -> Int {
-        let rawTokens = raw.lowercased().split(separator: " ").map(String.init)
-        let polTokens = polished.lowercased().split(separator: " ").map(String.init)
-
-        // Myers-lite: count edit runs via 2D LCS-style backtrack.
-        let m = rawTokens.count
-        let n = polTokens.count
-        if m == 0 { return n > 0 ? 1 : 0 }
-        if n == 0 { return 1 }
-
-        var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
-        for i in 0..<m {
-            for j in 0..<n {
-                if rawTokens[i] == polTokens[j] {
-                    dp[i+1][j+1] = dp[i][j] + 1
-                } else {
-                    dp[i+1][j+1] = max(dp[i][j+1], dp[i+1][j])
-                }
-            }
-        }
-
-        // Backtrack to count edit runs (contiguous mismatch streaks).
-        var i = m, j = n
-        var runs = 0
-        var inMismatch = false
-        while i > 0 || j > 0 {
-            if i > 0 && j > 0 && rawTokens[i-1] == polTokens[j-1] {
-                if inMismatch { runs += 1; inMismatch = false }
-                i -= 1; j -= 1
-            } else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
-                inMismatch = true; j -= 1
-            } else {
-                inMismatch = true; i -= 1
-            }
-        }
-        if inMismatch { runs += 1 }
-        return runs
-    }
-}
-
 // MARK: - Cleanup Level
 
 enum CleanupLevel: String, CaseIterable, Identifiable {
@@ -5701,7 +5431,7 @@ extension AppDelegate: NSWindowDelegate {
                 // When there's no transcript at all but we DID keep audio, store a
                 // placeholder so the row still appears and the audio is reachable.
                 let storedText = bestTranscript.isEmpty ? "(cancelled — audio retained)" : bestTranscript
-                RecentDictations.add(
+                let historySaved = RecentDictations.add(
                     raw: nil,
                     polished: storedText,
                     pasteTargetBundleID: capturedTargetForCancel,
@@ -5712,8 +5442,10 @@ extension AppDelegate: NSWindowDelegate {
                     personalityStyleUsed: nil,
                     polishFixCount: nil,
                     cancelled: true,
-                    audioFilePath: retainedAudioURL?.path
+                    audioFilePath: audioExists ? retainedAudioURL?.path : nil,
+                    recordingID: claimedForCancel?.sessionId.uuidString ?? cancelledSession.uuidString
                 )
+                self.reportHistorySaveFailure(historySaved)
                 print("[VOICE-CANCEL] retained: audio=\(retainedAudioURL?.lastPathComponent ?? "none") transcriptChars=\(bestTranscript.count) duration=\(duration.map(String.init) ?? "?")s → saved to History (unpolished, not pasted)")
             } else {
                 // Nothing to keep (cancelled during spin-up, no audio, no text).
@@ -5812,7 +5544,7 @@ extension AppDelegate: NSWindowDelegate {
         //    drain (the cancellation point is past the audio-claim stage).
         if cancelledWork?.session == recordingState.recordingSessionID, !bestTranscript.isEmpty {
             let duration = startedAtForCancel.map { Int(Date().timeIntervalSince($0)) }
-            RecentDictations.add(
+            let historySaved = RecentDictations.add(
                 raw: nil,
                 polished: bestTranscript,
                 pasteTargetBundleID: capturedTargetForCancel,
@@ -5823,8 +5555,10 @@ extension AppDelegate: NSWindowDelegate {
                 personalityStyleUsed: nil,
                 polishFixCount: nil,
                 cancelled: true,
-                audioFilePath: nil
+                audioFilePath: nil,
+                recordingID: cancelledWork?.session.uuidString
             )
+            reportHistorySaveFailure(historySaved)
             print("[VOICE-CANCEL-INFLIGHT] retained partial transcript: chars=\(bestTranscript.count) duration=\(duration.map(String.init) ?? "?")s → saved to History (cancelled, unpolished)")
         } else {
             print("[VOICE-CANCEL-INFLIGHT] no partial transcript to retain")
@@ -5845,6 +5579,12 @@ extension AppDelegate: NSWindowDelegate {
         print("[VOICE] Confirm → transcribe + paste")
         exitLockMode()
         finishRecording()
+    }
+
+    private func reportHistorySaveFailure(_ saved: Bool) {
+        guard !saved, !UserDefaults.standard.bool(forKey: "voice.privacyMode"),
+              let message = RecentDictations.lastStorageError else { return }
+        NotificationCenter.default.post(name: .voiceError, object: nil, userInfo: ["message": message])
     }
 
     /// End recording, drain the streaming engine, then copy + paste at cursor.
@@ -6130,7 +5870,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Without this, a rejected dictation is invisible after the toast dismisses.
                 // We mark the polish stage as "skipped" (polishMs = nil, no fix count)
                 // since the language gate ran before polish.
-                RecentDictations.add(
+                let historySaved = RecentDictations.add(
                     raw: nil,
                     polished: rawText,
                     pasteTargetBundleID: capturedTargetForTask,
@@ -6143,8 +5883,11 @@ extension AppDelegate: NSWindowDelegate {
                     voiceCommandCount: nil,
                     cleanupLevelUsed: nil,
                     personalityStyleUsed: nil,
-                    polishFixCount: nil
+                    polishFixCount: nil,
+                    audioFilePath: claimed?.audioURL?.path,
+                    recordingID: claimed?.sessionId.uuidString ?? mySession.uuidString
                 )
+                self.reportHistorySaveFailure(historySaved)
                 NotificationCenter.default.post(
                     name: .voiceError,
                     object: nil,
@@ -6883,10 +6626,10 @@ extension AppDelegate: NSWindowDelegate {
                 let trimmedPol = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
                 let trimmedRaw = formatted.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmedPol.isEmpty, !trimmedRaw.isEmpty,
-                      trimmedPol.lowercased() != trimmedRaw.lowercased() else { return 0 }
+                      trimmedPol != trimmedRaw else { return 0 }
                 return RecentDictations.countFixes(raw: trimmedRaw, polished: trimmedPol)
             }()
-            RecentDictations.add(raw: formatted, polished: finalText,
+            let historySaved = RecentDictations.add(raw: formatted, polished: finalText,
                                   pasteTargetBundleID: capturedTargetForTask,
                                   polishMs: polishChanged ? polishMs : nil,
                                   granite: graniteTranscript,
@@ -6898,7 +6641,10 @@ extension AppDelegate: NSWindowDelegate {
                                   cleanupLevelUsed: cleanupForTask,
                                   personalityStyleUsed: personalityForTask,
                                   polishFixCount: fixCount,
-                                  polishEngine: run.snapshot.models["cleanupEngine"])
+                                  polishEngine: run.snapshot.models["cleanupEngine"],
+                                  audioFilePath: claimed?.audioURL?.path,
+                                  recordingID: claimed?.sessionId.uuidString ?? mySession.uuidString)
+            self.reportHistorySaveFailure(historySaved)
             // The database row (saved under this session's id when recording
             // stopped) keeps what was heard; add what was pasted beside it.
             if let rowID = claimed?.sessionId {
@@ -6906,13 +6652,16 @@ extension AppDelegate: NSWindowDelegate {
                 catch { vlog("[VOICE] finalText not stored: \(error.localizedDescription)") }
             }
 
-            // Auto-learn proper nouns from the polished text. Looks at the
-            // user's last 50 dictations and promotes capitalized terms that
-            // appear ≥2 times into the proper-noun vocabulary — so the next
-            // polish pass treats them as fixed brand/contact names instead
-            // of "correcting" their spelling.
-            let priorDictations = RecentDictations.all().prefix(50).map(\.text)
-            ProperNounVocabulary.learnFrom(finalText, previousDictations: Array(priorDictations))
+            // Observe repeated names in recognition, not names invented by
+            // cleanup. Exclude this just-saved recording and cancelled history;
+            // a replay carries the same evidence ID and cannot add another vote.
+            if !BackgroundActivityGate.privacyMode {
+                let recordingID = claimed?.sessionId.uuidString ?? mySession.uuidString
+                let priorRecognition = RecentDictations.recognitionHistory(RecentDictations.all(), excluding: recordingID)
+                Task.detached(priority: .utility) {
+                    ProperNounVocabulary.learnFrom(rawText, previousDictations: priorRecognition, evidenceID: recordingID)
+                }
+            }
             Telemetry.log("dictation.completed", properties: [
                 "chars": formatted.count,
                 "duration_s": durationSeconds,

@@ -13,6 +13,8 @@ enum AutoDictionarySeed {
         var wisprDictionaryRows = 0
         var flowEdits = 0
         var opt1Kept = 0
+        var opt1Undone = 0
+        var unreadableSources = 0
         var promoted: [AutoDictionary.Event] = []
     }
 
@@ -28,6 +30,7 @@ enum AutoDictionarySeed {
     static func run(into dictionary: AutoDictionary, judge: AutoDictionary.WordJudge,
                     wispr: URL = wisprDatabase, voice: URL = voiceDirectory) -> Report {
         var report = Report()
+        guard !UserDefaults.standard.bool(forKey: "voice.privacyMode") else { return report }
         var evidence: [(at: Date, apply: () -> [AutoDictionary.Event])] = []
 
         let wisprDate = DateFormatter()
@@ -63,7 +66,9 @@ enum AutoDictionarySeed {
             guard let s = any as? String else { return .distantPast }
             return iso.date(from: s) ?? isoFraction.date(from: s) ?? .distantPast
         }
-        for row in jsonLines(voice.appendingPathComponent("training/dictations.jsonl")) where row["kind"] as? String == "edit" {
+        let flowRows = jsonLines(voice.appendingPathComponent("training/dictations.jsonl"))
+        if flowRows == nil { report.unreadableSources += 1 }
+        for row in flowRows ?? [] where row["kind"] as? String == "edit" {
             guard row["feedbackSource"] as? String == "observed-edit",
                   row["targetScope"] as? String == "pasted-span",
                   let id = row["id"] as? String, !id.isEmpty,
@@ -79,8 +84,28 @@ enum AutoDictionarySeed {
             evidence.append((at, { dictionary.observe(before: pasted, after: corrected, source: .flowHistory,
                                                        now: at, evidenceID: id, judge: judge) }))
         }
-        let attempts = jsonLines(voice.appendingPathComponent("opt1-evidence/attempts.jsonl"))
+        let attemptRows = jsonLines(voice.appendingPathComponent("opt1-evidence/attempts.jsonl"))
+        if attemptRows == nil { report.unreadableSources += 1 }
+        let attempts = attemptRows ?? []
         let undone = Set(attempts.filter { $0["outcome"] as? String == "undone" }.compactMap { $0["operationID"] as? String })
+        let applied = Dictionary(grouping: attempts.filter { $0["outcome"] as? String == "applied" },
+                                 by: { $0["operationID"] as? String ?? "" })
+        // Imported Undo also retracts a keep seeded on an earlier launch, not
+        // only the positive rows in this particular import snapshot.
+        for row in attempts where row["outcome"] as? String == "undone" {
+            guard let id = row["operationID"] as? String, !id.isEmpty else { continue }
+            let matching = (applied[id] ?? []).compactMap { item -> (String, String)? in
+                guard let input = item["input"] as? String, let output = item["proposedOutput"] as? String else { return nil }
+                return (input, output)
+            }
+            let sameEdit = matching.first.map { first in matching.allSatisfy { $0.0 == first.0 && $0.1 == first.1 } } ?? false
+            // An absent/ambiguous applied row can still revoke this operation's
+            // stored passive vote, but cannot identify another alias to veto.
+            let input = sameEdit ? matching[0].0 : "", output = sameEdit ? matching[0].1 : ""
+            let at = date(row["recordedAt"])
+            report.opt1Undone += 1
+            evidence.append((at, { dictionary.observeUndo(original: input, candidate: output, evidenceID: id, now: at) }))
+        }
         for row in attempts where row["outcome"] as? String == "applied" {
             guard let id = row["operationID"] as? String, !undone.contains(id),
                   let input = row["input"] as? String, let output = row["proposedOutput"] as? String else { continue }
@@ -90,8 +115,14 @@ enum AutoDictionarySeed {
                                                        now: at, evidenceID: id, judge: judge) }))
         }
 
-        dictionary.batch {
-            for item in evidence.sorted(by: { $0.at < $1.at }) { report.promoted += item.apply() }
+        let ordered = evidence.sorted(by: { $0.at < $1.at })
+        // Release the store between bounded chunks so a large history import
+        // cannot hold dictionary reads behind its entire corpus.
+        for start in stride(from: 0, to: ordered.count, by: 16) {
+            guard !UserDefaults.standard.bool(forKey: "voice.privacyMode") else { break }
+            dictionary.batch {
+                for item in ordered[start..<min(start + 16, ordered.count)] { report.promoted += item.apply() }
+            }
         }
         return report
     }
@@ -117,10 +148,16 @@ enum AutoDictionarySeed {
         return rows
     }
 
-    private static func jsonLines(_ url: URL) -> [[String: Any]] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").compactMap {
-            (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+    private static func jsonLines(_ url: URL) -> [[String: Any]]? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        var rows: [[String: Any]] = []
+        for line in text.split(separator: "\n") where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Dropping a corrupt Undo line while accepting earlier keeps would
+            // manufacture positive evidence. Reject this source as a unit.
+            guard let row = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return nil }
+            rows.append(row)
         }
+        return rows
     }
 }

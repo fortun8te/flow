@@ -8,10 +8,8 @@
 //   swift run -c release Voice --rerun-audio        # last 10
 //   swift run -c release Voice --rerun-audio 25     # last 25
 //
-// A RecentDictation stores no audio path, so we bridge to the .caf via
-// StorageService: the segments table holds the raw Parakeet text (== the
-// dictation's `parakeetRawText`), and the owning meeting row holds the
-// audioFilePath. See StorageService.audioPathsByNormalizedSegmentText().
+// Prefer each entry's retained audio path and recording ID. Older entries
+// may use an unambiguous text lookup; repeated text cannot identify audio.
 //
 // Lives in the Voice target (not a separate one) for the same reason as
 // PolishHarness: the transcription + polish pipelines use internal access.
@@ -25,36 +23,38 @@ enum RerunAudioHarness {
         FileHandle.standardOutput.write(Data((msg + "\n").utf8))
     }
 
-    private static func norm(_ s: String?) -> String {
-        (s ?? "").lowercased()
-            .split(separator: " ", omittingEmptySubsequences: true)
-            .joined(separator: " ")
-    }
-
     struct Item {
         let entry: RecentDictation
         let audioURL: URL
     }
 
     static func run(limit: Int) async {
+        guard limit > 0 else { hprint("[RERUN] limit must be positive."); return }
         hprint("[RERUN] Loading recent dictations (limit \(limit))…")
 
-        // --- Bridge rawText → audioFilePath via voice.db ---
+        // --- Open exact recording references; build the legacy index only if needed ---
         let storage = StorageService()
         do { try storage.initialize() } catch {
             hprint("[RERUN] FATAL: cannot open voice.db: \(error)"); return
         }
-        let pathByRaw = storage.audioPathsByNormalizedSegmentText()
-        hprint("[RERUN] indexed \(pathByRaw.count) audio-backed segments from voice.db")
+        var legacyPaths: [String: String]?
 
         // --- Resolve the last N non-cancelled entries to on-disk .caf ---
         var items: [Item] = []
         for e in RecentDictations.all() where !e.cancelled {
-            guard let path = pathByRaw[norm(e.parakeetRawText)] ?? pathByRaw[norm(e.text)] else {
-                continue
-            }
+            guard let path = RecordingAudioLookup.resolve(
+                storedPath: e.audioFilePath, recordingID: e.recordingID, rawText: e.parakeetRawText, text: e.text,
+                pathForID: { value in
+                    guard let id = UUID(uuidString: value) else { return nil }
+                    return try? storage.audioPath(forRecordingID: id)
+                }, legacyPaths: {
+                    if let legacyPaths { return legacyPaths }
+                    let index = storage.audioPathsByNormalizedSegmentText()
+                    legacyPaths = index
+                    hprint("[RERUN] indexed \(index.count) unambiguous legacy text references")
+                    return index
+                }, exists: { FileManager.default.fileExists(atPath: $0) }) else { continue }
             let url = URL(fileURLWithPath: path)
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
             items.append(Item(entry: e, audioURL: url))
             if items.count >= limit { break }
         }

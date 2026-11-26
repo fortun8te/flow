@@ -12,8 +12,8 @@
 //   - drops or rewrites already-correct identifiers
 //
 // Sentinel format: ⟦E0⟧, ⟦E1⟧, ⟦E2⟧… using mathematical white square
-// brackets (U+27E6 / U+27E7). These survive Qwen3 tokenization as a
-// single visible chunk and don't collide with any normal English text.
+// brackets (U+27E6 / U+27E7). Literal markers already present in the input
+// are reserved so restoring a protected span cannot overwrite user text.
 //
 // Phase 1 of the multi-agent polish pipeline plan. Subsequent phases
 // (ensemble drafts, critic) build on top of this — every draft polishes
@@ -58,19 +58,20 @@ public enum EntityFreezer {
         public var isEmpty: Bool { entities.isEmpty }
     }
 
-    /// Pattern priority — longest / most specific first. An email must be
-    /// frozen before its domain part would otherwise match the domain pass.
+    /// Matches are collected against the original input, then longer enclosing
+    /// spans win. Otherwise freezing an email inside code first leaves the rest
+    /// of that code exposed to editing.
     private static let patterns: [(name: String, regex: String)] = [
         // Emails — full RFC-ish, but pragmatic.
         ("email", #"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"#),
 
         // Full URLs with scheme.
-        ("url", #"https?://[^\s)\]\}>,]+"#),
+        ("url", #"https?://[^\s)\]\}>,`]+"#),
 
         // Bare domains with TLD — matches "github.com/user", "example.io",
         // "api.example.co.uk/v2". Requires at least one alphanumeric label
         // before the TLD to avoid matching ". com" or "the .net".
-        ("domain", #"\b[A-Za-z0-9][A-Za-z0-9\-]*(?:\.[A-Za-z0-9\-]+)*\.(?:com|io|net|org|dev|app|ai|co|us|uk|gov|edu|me|tv|fm|so|sh|xyz|tech|cloud)(?:/[^\s)\]\}>,]*)?\b"#),
+        ("domain", #"\b[A-Za-z0-9][A-Za-z0-9\-]*(?:\.[A-Za-z0-9\-]+)*\.(?:com|io|net|org|dev|app|ai|co|us|uk|gov|edu|me|tv|fm|so|sh|xyz|tech|cloud)(?:/[^\s)\]\}>,`]*)?\b"#),
 
         // Backtick-protected spans (already explicitly user-marked).
         ("backtick", #"`[^`\n]+`"#),
@@ -90,10 +91,15 @@ public enum EntityFreezer {
         "email", "url", "domain", "backtick", "path"
     ]
 
+    private static let compiledPatterns: [(name: String, regex: NSRegularExpression)] = patterns.compactMap {
+        guard let regex = try? NSRegularExpression(pattern: $0.regex) else { return nil }
+        return ($0.name, regex)
+    }
+    private static let markerPattern = try! NSRegularExpression(pattern: #"⟦E[0-9]+⟧"#)
+
     /// Freeze fragile spans. Returns the frozen text and a map for
-    /// unfreezing. Iterates patterns in priority order; later patterns
-    /// won't re-match content already replaced with a sentinel because
-    /// sentinels contain `⟦` and `⟧`, which none of the patterns match.
+    /// unfreezing. Each protected range is replaced exactly once; nested
+    /// entities remain inside their enclosing code, URL or email span.
     ///
     /// `mode` controls how much we freeze. Cloud callers should pass
     /// `.minimal` so the model sees natural contractions in context.
@@ -105,40 +111,42 @@ public enum EntityFreezer {
         if mode == .skip {
             return Frozen(text: input, entities: [:])
         }
-        var working = input
-        var entities: [String: String] = [:]
-        var counter = 0
-
-        for (name, pattern) in patterns {
+        let original = input as NSString
+        let fullRange = NSRange(location: 0, length: original.length)
+        var ranges: [NSRange] = []
+        for (name, regex) in compiledPatterns {
             if mode == .minimal, !minimalModePatterns.contains(name) { continue }
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let ns = working as NSString
-            let range = NSRange(location: 0, length: ns.length)
-            let matches = regex.matches(in: working, range: range)
-
-            // Reverse so earlier indices stay valid as we substitute.
-            for match in matches.reversed() {
-                // For patterns that use a capture group (path), prefer it.
-                let captureRange: NSRange = {
-                    if match.numberOfRanges > 1, match.range(at: 1).location != NSNotFound {
-                        return match.range(at: 1)
-                    }
-                    return match.range
-                }()
-                guard captureRange.location != NSNotFound else { continue }
-                let original = ns.substring(with: captureRange)
-
-                // Skip if already frozen (shouldn't happen but defensive).
-                if original.contains("⟦") && original.contains("⟧") { continue }
-
-                let sentinel = "⟦E\(counter)⟧"
-                entities[sentinel] = original
-                counter += 1
-                working = (working as NSString).replacingCharacters(in: captureRange, with: sentinel)
+            for match in regex.matches(in: input, range: fullRange) {
+                let range = match.numberOfRanges > 1 ? match.range(at: 1) : match.range
+                if range.location != NSNotFound, range.length > 0 { ranges.append(range) }
             }
         }
+        ranges.sort { $0.length != $1.length ? $0.length > $1.length : $0.location < $1.location }
+        var occupied = IndexSet()
+        let selected = ranges.filter { range in
+            let indices = range.location..<NSMaxRange(range)
+            guard !occupied.intersects(integersIn: indices) else { return false }
+            occupied.insert(integersIn: indices)
+            return true
+        }.sorted { $0.location < $1.location }
+        guard !selected.isEmpty else { return Frozen(text: input, entities: [:]) }
 
-        return Frozen(text: working, entities: entities)
+        let reserved = Set(markerPattern.matches(in: input, range: fullRange).map {
+            original.substring(with: $0.range)
+        })
+        var entities: [String: String] = [:]
+        var replacements: [(NSRange, String)] = []
+        var counter = 0
+        for range in selected {
+            while reserved.contains("⟦E\(counter)⟧") { counter += 1 }
+            let sentinel = "⟦E\(counter)⟧"
+            counter += 1
+            entities[sentinel] = original.substring(with: range)
+            replacements.append((range, sentinel))
+        }
+        let working = NSMutableString(string: input)
+        for (range, sentinel) in replacements.reversed() { working.replaceCharacters(in: range, with: sentinel) }
+        return Frozen(text: working as String, entities: entities)
     }
 
     /// Restore frozen spans. Iterates sentinels in reverse-numeric order
