@@ -6,12 +6,14 @@ final class DraftDecisionModelTests: XCTestCase {
 
     func testColdDecisionSkipsTextAndWarmDecisionReadsReply() async {
         let model = stub()
-        let cold = await model.decide(state: "Cold draft", questions: questions)
-        XCTAssertNil(cold)
+        let cold = await model.decideWithStatus(state: "Cold draft", questions: questions)
+        XCTAssertEqual(cold.status, .warming)
+        XCTAssertNil(cold.probabilities)
         let ready = await waitForReady(model)
         XCTAssertTrue(ready)
-        let warm = await model.decide(state: "Warm draft", questions: questions)
-        XCTAssertEqual(warm, ["same": ["yes": 0.92, "no": 0.08]])
+        let warm = await model.decideWithStatus(state: "Warm draft", questions: questions)
+        XCTAssertEqual(warm.status, .answered)
+        XCTAssertEqual(warm.probabilities, ["same": ["yes": 0.92, "no": 0.08]])
     }
 
     func testTimeoutReturnsWithoutQueuingASecondDraft() async {
@@ -19,10 +21,11 @@ final class DraftDecisionModelTests: XCTestCase {
         await model.prewarm()
         let ready = await waitForReady(model)
         XCTAssertTrue(ready)
-        let timeout = await model.decide(state: "slow", questions: questions, timeout: .milliseconds(30))
-        XCTAssertNil(timeout)
-        let busy = await model.decide(state: "Another draft", questions: questions)
-        XCTAssertNil(busy)
+        let timeout = await model.decideWithStatus(state: "slow", questions: questions, timeout: .milliseconds(30))
+        XCTAssertEqual(timeout.status, .timedOut)
+        XCTAssertNil(timeout.probabilities)
+        let busy = await model.decideWithStatus(state: "Another draft", questions: questions)
+        XCTAssertEqual(busy.status, .busy)
         // A response that arrives after its deadline must not poison the next request.
         for _ in 0..<100 {
             try? await Task.sleep(for: .milliseconds(20))
@@ -53,10 +56,19 @@ final class DraftDecisionModelTests: XCTestCase {
         await model.prewarm()
         let ready = await waitForReady(model)
         XCTAssertTrue(ready)
-        let reply = await model.decide(state: "bad", questions: questions)
+        let reply = await model.decideWithStatus(state: "bad", questions: questions)
         let retained = await model.isReady
-        XCTAssertNil(reply)
+        XCTAssertEqual(reply.status, .workerFailed)
+        XCTAssertNil(reply.probabilities)
         XCTAssertFalse(retained)
+    }
+
+    func testUnavailableAndInvalidRequestsAreDistinct() async {
+        let model = DraftDecisionModel(configuration: nil)
+        let missing = await model.decideWithStatus(state: "The blue kettle is cold.", questions: questions)
+        XCTAssertEqual(missing.status, .unavailable)
+        let invalid = await model.decideWithStatus(state: "", questions: questions)
+        XCTAssertEqual(invalid.status, .invalidInput)
     }
 
     private func waitForReady(_ model: DraftDecisionModel) async -> Bool {

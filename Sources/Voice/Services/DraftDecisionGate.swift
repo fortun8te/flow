@@ -42,14 +42,45 @@ enum DraftDecisionGate {
         return max(.zero, min(timeout, now.duration(to: deadline)))
     }
 
-    static func shouldKeepOriginal(_ original: String, edited: String, deadline: ContinuousClock.Instant? = nil) async -> Bool {
-        guard enabled, !Task.isCancelled,
-              needsReview(original: original, edited: edited),
-              let bytes = try? JSONEncoder().encode(["original": original, "proposed_copy_edit": edited]) else { return false }
+    /// Do not shorten tiny generation windows or reserve time for a cold worker.
+    static func reservedSeconds(available: Double, eligible: Bool, ready: Bool) -> Double {
+        guard available.isFinite, available >= 0.6, eligible, ready else { return 0 }
+        return 0.15
+    }
+
+    static func reservation(for source: String, available: Double) async -> Double {
+        guard enabled, !Task.isCancelled, source.utf8.count <= 2_000,
+              source.split(whereSeparator: \.isWhitespace).count >= 4 else { return 0 }
+        let ready = await DraftDecisionModel.shared.canReview
+        return reservedSeconds(available: available, eligible: true, ready: ready)
+    }
+
+    static func shouldKeepOriginal(_ original: String, edited: String, deadline: ContinuousClock.Instant? = nil,
+                                   collector: FlowRunCollector? = nil) async -> Bool {
+        let run = collector ?? FlowRunCollector.current
+        func skipped(_ reason: String) -> Bool {
+            run?.decision("decision-gate", "skipped", reason: reason)
+            return false
+        }
+        guard enabled else { return skipped("disabled") }
+        guard !Task.isCancelled else { return skipped("cancelled") }
+        guard needsReview(original: original, edited: edited) else { return skipped("not-needed-or-too-large") }
+        guard let bytes = try? JSONEncoder().encode(["original": original, "proposed_copy_edit": edited]) else {
+            return skipped("invalid-input")
+        }
         let state = String(decoding: bytes, as: UTF8.self)
         let budget = reviewBudget(deadline: deadline)
-        guard budget >= .milliseconds(50) else { return false }
-        let answer = await DraftDecisionModel.shared.decide(state: state, questions: ["meaning": meaningQuestion], timeout: budget)
-        return !Task.isCancelled && vetoes(changedProbability: answer?["meaning"]?["B"])
+        guard budget >= .milliseconds(50) else { return skipped("no-budget") }
+        let started = ContinuousClock.now
+        let attempt = await DraftDecisionModel.shared.decideWithStatus(state: state, questions: ["meaning": meaningQuestion], timeout: budget)
+        let elapsed = started.duration(to: .now).components
+        let ms = Int(Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15)
+        run?.stage("d1-review", text: nil, ms: ms, detail: ["status": attempt.status.rawValue])
+        guard !Task.isCancelled else { return skipped("cancelled") }
+        guard attempt.status == .answered else { return skipped(attempt.status.rawValue) }
+        run?.model("decision", "d1-2b")
+        let veto = vetoes(changedProbability: attempt.probabilities?["meaning"]?["B"])
+        run?.decision("decision-gate", veto ? "veto" : "accepted")
+        return veto
     }
 }

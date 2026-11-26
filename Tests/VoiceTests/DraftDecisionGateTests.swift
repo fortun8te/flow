@@ -16,6 +16,13 @@ final class DraftDecisionGateTests: XCTestCase {
         XCTAssertEqual(DraftDecisionGate.reviewBudget(deadline: now - .milliseconds(10), now: now), .zero)
     }
 
+    func testReservationOnlyForReadyEligibleReview() {
+        XCTAssertEqual(DraftDecisionGate.reservedSeconds(available: 1.0, eligible: true, ready: true), 0.15)
+        XCTAssertEqual(DraftDecisionGate.reservedSeconds(available: 0.5, eligible: true, ready: true), 0)
+        XCTAssertEqual(DraftDecisionGate.reservedSeconds(available: 1.0, eligible: true, ready: false), 0)
+        XCTAssertEqual(DraftDecisionGate.reservedSeconds(available: 1.0, eligible: false, ready: true), 0)
+    }
+
     func testOnlyAConfidentWellFormedMeaningVerdictVetoes() {
         XCTAssertTrue(DraftDecisionGate.vetoes(changedProbability: 0.50))
         XCTAssertFalse(DraftDecisionGate.vetoes(changedProbability: 0.49))

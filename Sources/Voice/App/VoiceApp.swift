@@ -3798,7 +3798,7 @@ extension AppDelegate {
                     await Qwen3Polisher.shared.polishInPlace(text, preset: preset, level: level)
                 }
                 run.stage("polish", text: proposed, ms: run.elapsedMs)
-                if let proposed, await DraftDecisionGate.shouldKeepOriginal(text, edited: proposed) {
+                if let proposed, await DraftDecisionGate.shouldKeepOriginal(text, edited: proposed, collector: run) {
                     run.decision("decision-gate", "kept-original", reason: "meaning changed")
                     polishedRaw = text
                 } else {
@@ -6492,7 +6492,7 @@ extension AppDelegate: NSWindowDelegate {
                     let deadline = remoteStarted + .seconds(budget)
                     let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline,
                         review: { section, edited in
-                            let vetoed = await DraftDecisionGate.shouldKeepOriginal(section, edited: edited, deadline: deadline)
+                            let vetoed = await DraftDecisionGate.shouldKeepOriginal(section, edited: edited, deadline: deadline, collector: run)
                             if vetoed { run.decision("decision-gate", "kept-section", reason: "meaning check vetoed a section edit") }
                             return vetoed
                         }) { section in
@@ -6504,7 +6504,8 @@ extension AppDelegate: NSWindowDelegate {
                     cleanupRoute = "local"
                     run.update { $0.settings["budgetSeconds"] = String(format: "%.2f", shortBudget) }
                     let localLeft = max(0.05, shortBudget - RemoteCleanup.seconds(since: remoteStarted))
-                    let answer = await DictationDeadline.run(seconds: localLeft) { await polishDraft(formatted, false) }
+                    let reserve = await DraftDecisionGate.reservation(for: formatted, available: localLeft)
+                    let answer = await DictationDeadline.run(seconds: max(0.05, localLeft - reserve)) { await polishDraft(formatted, false) }
                     finalText = answer ?? formatted
                     if answer == nil {
                         traceFallback = "deadline"
@@ -6547,7 +6548,7 @@ extension AppDelegate: NSWindowDelegate {
                 let remaining = DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
                                                                    words: draftWords)
                 if await DraftDecisionGate.shouldKeepOriginal(formatted, edited: finalText,
-                    deadline: ContinuousClock.now + .seconds(remaining)) {
+                    deadline: ContinuousClock.now + .seconds(remaining), collector: run) {
                     let partial = finalText.utf8.count <= 600 &&
                         DictationDeadline.remainingSeconds(sinceKeyRelease: CFAbsoluteTimeGetCurrent() - keyUpAt,
                                                            words: draftWords) > 0.05

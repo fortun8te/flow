@@ -135,7 +135,7 @@ enum DictationTextPreparation {
             if !vetoed && !Task.isCancelled { parts[previous.index] = previous.edited }
         }
         parts.append(String(source[cursor...]))
-        return (parts.joined(), timedOut)
+        return (Task.isCancelled ? source : parts.joined(), timedOut)
     }
 
     private static let filename = try? NSRegularExpression(

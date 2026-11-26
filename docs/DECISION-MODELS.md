@@ -103,3 +103,7 @@ Some gates decide, and others only explain. In the dictation path, the content g
 ## What these gates are not
 
 They are not a general quality metric. They catch specific, costly failures: lost numbers, flipped negations, invented names, lost text, and pastes that did not land. Output quality is measured separately, and the evaluation scripts are described in [TRAINING.md](TRAINING.md).
+
+### D1 availability and scheduling
+
+D1 installations are rechecked after a short backoff. Flow accepts the legacy candidate layout or `~/Library/Application Support/Voice/Models/D1/venv/bin/python` with the `d1-2B-mlx8bit` checkpoint directory next to `venv`. The network sandbox is unchanged. A ready, idle D1 may reserve 150 ms from the existing cleanup budget when at least 600 ms remains. Run records distinguish actual decisions from busy, cold, unavailable, invalid, timed-out, cancelled and skipped checks.
