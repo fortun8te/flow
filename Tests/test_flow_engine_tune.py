@@ -22,8 +22,8 @@ def cases():
     return rows
 
 
-def fixture(root, name, offset, latency=100, repetitions=6, runtime="control", usage=True):
-    workload = cases()
+def fixture(root, name, offset, latency=100, repetitions=6, runtime="control", usage=True, workload=None):
+    workload = cases() if workload is None else workload
     identity = {"model": "local-cleanup", "artifactSHA256": export.digest("invented weights"), "runnerSHA256": export.digest("invented runner"),
                 "promptSHA256": export.digest("invented system prompt"), "userPrefixSHA256": export.digest(""),
                 "chatTemplateKwargs": None, "runtimeID": runtime, "environmentID": "invented-machine; same-OS-and-power",
@@ -221,6 +221,101 @@ class EngineTuneTests(unittest.TestCase):
         del rows[0]["attempts"]
         write_run(path, rows, metadata)
         with self.assertRaisesRegex(ValueError, "every attempt"):
+            read_run(path)
+
+    def test_reviewed_newline_only_output_is_a_complete_engine_attempt(self):
+        workload = [{"id": "line", "input": "new line", "target": "\n", "kind": "dictation", "requireExactLayout": True}]
+        workload[0]["caseHash"] = export.case_hash(workload[0])
+        runs = [fixture(self.temp.name, name, index, latency, runtime=runtime, workload=workload)
+                for index, (name, latency, runtime) in enumerate((("before", 100, "control"), ("candidate", 80, "candidate"), ("after", 102, "control")))]
+        report = engine.compare_runs(*(engine.load_run(run[0], workload, "frozen-dataset", "valid") for run in runs))
+        self.assertTrue(report["eligibleForReview"])
+        self.assertEqual(report["candidate"]["failedAttempts"], 0)
+
+    def set_case_latencies(self, run, values):
+        path, rows, metadata = run
+        for row, latencies in zip(rows, values):
+            for sample, latency in zip(row["attempts"], latencies):
+                sample["latencyMs"] = latency
+            row["latencyMs"] = engine.statistics.median(latencies)
+        write_run(path, rows, metadata)
+
+    def test_short_case_tail_regression_cannot_hide_behind_long_cases(self):
+        self.set_case_latencies(self.before, ([10] * 6, [1000] * 6))
+        self.set_case_latencies(self.after, ([10] * 6, [1000] * 6))
+        self.set_case_latencies(self.candidate, ([8] * 5 + [20], [800] * 6))
+        report = self.compare()
+        self.assertTrue(report["gates"]["medianImprovedAgainstBothControls"])
+        self.assertTrue(report["gates"]["p95NotRegressedAgainstEitherControl"])
+        self.assertTrue(report["gates"]["noCaseMedianRegression"])
+        self.assertFalse(report["gates"]["noCaseP95Regression"])
+        self.assertEqual(report["tailLatencyRegressedCaseIDs"], ["violet"])
+        self.assertEqual(report["status"], "candidate-rejected")
+
+    def test_short_case_control_tail_drift_is_inconclusive(self):
+        self.set_case_latencies(self.before, ([10] * 6, [1000] * 6))
+        self.set_case_latencies(self.after, ([10] * 5 + [20], [1000] * 6))
+        self.set_case_latencies(self.candidate, ([8] * 6, [800] * 6))
+        report = self.compare()
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertEqual(report["controlDriftCaseIDs"], ["violet"])
+
+    def test_successful_status_cannot_hide_an_overdue_attempt(self):
+        path, rows, metadata = self.candidate
+        rows[0]["attempts"][-1]["latencyMs"] = 31000
+        metadata["completedAt"] = (engine.timestamp(metadata["startedAt"]) + timedelta(seconds=60)).isoformat()
+        write_run(path, rows, metadata)
+        report = self.compare()
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertEqual(report["candidate"]["failures"][0]["error"], "deadline-exceeded")
+
+    def test_successful_status_cannot_hide_an_exceeded_generation_cap(self):
+        path, rows, metadata = self.candidate
+        rows[0]["attempts"][-1]["completionTokens"] = 2049
+        write_run(path, rows, metadata)
+        report = self.compare()
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertEqual(report["candidate"]["failures"][0]["error"], "output-token-limit-exceeded")
+
+    def test_overdue_warmup_does_not_establish_calibration(self):
+        path, rows, metadata = self.candidate
+        metadata["warmups"][0]["latencyMs"] = 31000
+        write_run(path, rows, metadata)
+        with self.assertRaisesRegex(ValueError, "warmup failed"):
+            read_run(path)
+
+    def test_model_switch_during_run_invalidates_speed_evidence(self):
+        for path, rows, metadata in (self.before, self.candidate, self.after):
+            for sample in metadata["warmups"] + [sample for row in rows for sample in row["attempts"]]:
+                sample["serverModel"] = "invented-weights-a"
+            if metadata["identity"]["runtimeID"] == "candidate":
+                rows[0]["attempts"][-1]["serverModel"] = "invented-weights-b"
+            write_run(path, rows, metadata)
+        report = self.compare()
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertFalse(report["gates"]["stableReportedServerModel"])
+
+    def test_running_or_aborted_manifest_is_never_a_complete_result(self):
+        path, rows, metadata = self.candidate
+        for status in ("running", "aborted"):
+            metadata["status"] = status
+            write_run(path, rows, metadata)
+            with self.assertRaisesRegex(ValueError, "completed replay"):
+                read_run(path)
+
+    def test_boolean_temperature_or_failure_count_is_not_numeric_evidence(self):
+        path, rows, metadata = self.candidate
+        metadata["failures"] = False
+        write_run(path, rows, metadata)
+        with self.assertRaisesRegex(ValueError, "failure count"):
+            read_run(path)
+        metadata["failures"] = 0
+        metadata["identity"]["temperature"] = False
+        metadata["modelID"] = export.digest(export.canonical(metadata["identity"]))
+        for row in rows:
+            row["modelID"] = metadata["modelID"]
+        write_run(path, rows, metadata)
+        with self.assertRaisesRegex(ValueError, "request configuration"):
             read_run(path)
 
 

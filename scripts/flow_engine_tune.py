@@ -13,14 +13,13 @@ confidence interval or evidence about native Flow latency.
 """
 import argparse
 from datetime import datetime, timezone
-import json
 import math
 from pathlib import Path
 import re
 import statistics
 
-from export_flow_runs import canonical, digest, write_private
-from flow_hillclimb import load_dataset, parse_jsonl, percentile95, positive_number, predictions_by_id, validate_protocol
+from export_flow_runs import canonical, digest, strict_json_loads, write_private
+from flow_hillclimb import empty_output, load_dataset, parse_jsonl, percentile95, positive_number, predictions_by_id, validate_protocol
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 OPTIMIZATION_FIELDS = {"runtimeID", "cachePrompt"}
@@ -38,9 +37,11 @@ def timestamp(value):
 def load_run(path, cases, dataset_id, split):
     contents = Path(path).read_bytes().decode("utf-8")
     metadata_bytes = Path(str(path) + ".manifest.json").read_bytes()
-    metadata = json.loads(metadata_bytes)
+    metadata = strict_json_loads(metadata_bytes)
     if not isinstance(metadata, dict) or metadata.get("schemaVersion") != 3:
         raise ValueError("engine comparison requires a complete replay manifest from the current runner")
+    if metadata.get("status", "complete") != "complete":
+        raise ValueError("engine comparison requires a completed replay, not running or aborted output")
     if metadata.get("predictionsSHA256") != digest(contents):
         raise ValueError("prediction hash mismatch; rerun from a stable complete replay snapshot")
     if metadata.get("datasetID") != dataset_id or metadata.get("split") != split:
@@ -51,6 +52,8 @@ def load_run(path, cases, dataset_id, split):
     for key in ("artifactSHA256", "promptSHA256", "userPrefixSHA256", "runnerSHA256"):
         if not isinstance(identity.get(key), str) or not SHA256.fullmatch(identity[key]):
             raise ValueError("model and prompt identities must use exact SHA-256 digests")
+    if "harnessSHA256" in identity and (not isinstance(identity["harnessSHA256"], str) or not SHA256.fullmatch(identity["harnessSHA256"])):
+        raise ValueError("harness identity must use an exact SHA-256 digest")
     if any(not isinstance(identity.get(key), str) or not identity[key].strip() for key in ("model", "runtimeID", "environmentID")):
         raise ValueError("model, engine runtime and environment identity must be nonempty; supply --environment-id when replaying")
     if identity.get("cachePrompt") not in {"on", "off", "server-default"}:
@@ -59,7 +62,9 @@ def load_run(path, cases, dataset_id, split):
         raise ValueError("chat template options must be a JSON object or absent")
     protocol, protocol_id = metadata.get("benchmarkProtocol"), metadata.get("benchmarkProtocolID")
     validate_protocol(protocol, protocol_id)
-    if identity.get("temperature") != 0 or identity.get("maxTokens") != protocol["maxTokens"] or identity.get("timeoutSeconds") != protocol["timeoutSeconds"]:
+    if (isinstance(identity.get("temperature"), bool) or identity.get("temperature") != 0
+            or type(identity.get("maxTokens")) is not int or identity["maxTokens"] != protocol["maxTokens"]
+            or not positive_number(identity.get("timeoutSeconds")) or identity["timeoutSeconds"] != protocol["timeoutSeconds"]):
         raise ValueError("request configuration disagrees with its timing protocol")
     rows = parse_jsonl(contents, "engine predictions")
     predictions, model_id, row_protocol_id = predictions_by_id(rows, cases, dataset_id)
@@ -67,16 +72,21 @@ def load_run(path, cases, dataset_id, split):
         raise ValueError("manifest and prediction identities disagree")
     if any(not isinstance(row.get("attempts"), list) for row in rows):
         raise ValueError("engine timing requires every actual attempt, not a summarized latency")
-    if metadata.get("cases") != len(cases) or metadata.get("attempts") != len(cases) * protocol["repetitions"]:
+    if (type(metadata.get("cases")) is not int or type(metadata.get("attempts")) is not int
+            or metadata["cases"] != len(cases) or metadata["attempts"] != len(cases) * protocol["repetitions"]):
         raise ValueError("manifest does not describe the complete attempted workload")
-    if metadata.get("failures") != sum(bool(row.get("error")) for row in rows):
+    if type(metadata.get("failures")) is not int or metadata["failures"] != sum(bool(row.get("error")) for row in rows):
         raise ValueError("manifest failure count disagrees with predictions")
     warmups = metadata.get("warmups")
     if not isinstance(warmups, list) or len(warmups) != protocol["warmupRequests"]:
         raise ValueError("warmup evidence is incomplete")
     if any(not isinstance(sample, dict) or sample.get("error") or sample.get("finish_reason") != "stop"
-           or not positive_number(sample.get("latencyMs")) for sample in warmups):
+           or not positive_number(sample.get("latencyMs")) or sample["latencyMs"] > protocol["timeoutSeconds"] * 1000 for sample in warmups):
         raise ValueError("authored warmup failed")
+    samples = [sample for row in rows for sample in row["attempts"]] + warmups
+    if any(sample.get("serverModel") is not None and (not isinstance(sample["serverModel"], str)
+           or not sample["serverModel"].strip() or len(sample["serverModel"]) > 1024) for sample in samples):
+        raise ValueError("reported server model identities must be bounded nonempty strings or unavailable")
     start, end = timestamp(metadata.get("startedAt")), timestamp(metadata.get("completedAt"))
     if end <= start:
         raise ValueError("run completion must follow its start")
@@ -84,21 +94,35 @@ def load_run(path, cases, dataset_id, split):
     total_ms += sum(sample["latencyMs"] for sample in warmups)
     if total_ms > (end - start).total_seconds() * 1000 + 1:
         raise ValueError("recorded request durations exceed the sequential run's wall time")
-    return {"metadata": metadata, "predictions": predictions, "start": start, "end": end,
+    return {"metadata": metadata, "predictions": predictions, "cases": {case["id"]: case for case in cases}, "start": start, "end": end,
+            "serverModels": {sample.get("serverModel") for sample in samples},
             "predictionsSHA256": digest(contents), "manifestSHA256": digest(metadata_bytes.decode("utf-8"))}
 
 
-def failed_sample(sample):
-    return bool(sample.get("error")) or sample.get("finish_reason") != "stop" or not sample["output"].strip()
+def failed_sample(sample, case, protocol):
+    if sample.get("error"):
+        return sample["error"]
+    if sample.get("finish_reason") != "stop":
+        return "incomplete-response"
+    if empty_output(case, sample["output"]):
+        return "empty-output"
+    if sample["latencyMs"] > protocol["timeoutSeconds"] * 1000:
+        return "deadline-exceeded"
+    if sample.get("completionTokens") is not None and sample["completionTokens"] > protocol["maxTokens"]:
+        return "output-token-limit-exceeded"
+    return None
 
 
 def metrics(run):
     rows = run["predictions"]
     samples = [sample for row in rows.values() for sample in row["attempts"]]
     latencies = [sample["latencyMs"] for sample in samples]
-    failures = [{"id": sample["id"], "sampleIndex": sample["sampleIndex"],
-                 "error": sample.get("error") or "incomplete-or-empty-output", "finishReason": sample.get("finish_reason")}
-                for sample in samples if failed_sample(sample)]
+    failures = []
+    for sample in samples:
+        failure = failed_sample(sample, run["cases"][sample["id"]], run["metadata"]["benchmarkProtocol"])
+        if failure:
+            failures.append({"id": sample["id"], "sampleIndex": sample["sampleIndex"],
+                             "error": failure, "finishReason": sample.get("finish_reason")})
     counts = [sample["completionTokens"] for sample in samples if sample.get("completionTokens") is not None]
     complete_usage = len(counts) == len(samples)
     # Whole-request time includes prefill, decode, transport and response parsing.
@@ -110,6 +134,8 @@ def metrics(run):
             "totalRequestSeconds": sum(latencies) / 1000,
             "completionTokenSamples": len(counts), "completionTokens": sum(counts) if complete_usage else None,
             "completionTokensPerRequestSecond": throughput,
+            "reportedServerModels": sorted(model for model in run["serverModels"] if model is not None),
+            "serverModelEvidenceComplete": None not in run["serverModels"],
             "perCase": {identifier: {"samples": len(row["attempts"]),
                         "p50Ms": statistics.median(sample["latencyMs"] for sample in row["attempts"]),
                         "p95Ms": percentile95([sample["latencyMs"] for sample in row["attempts"]])}
@@ -139,8 +165,8 @@ def compare_runs(before, candidate, after, min_improvement=0.05, max_control_dri
     if not before["predictions"].keys() == candidate["predictions"].keys() == after["predictions"].keys():
         raise ValueError("complete workloads differ")
     bm, cm, am = (metrics(run) for run in (before, candidate, after))
-    drift_cases = [identifier for identifier in bm["perCase"] if not ratio_close(
-        bm["perCase"][identifier]["p50Ms"], am["perCase"][identifier]["p50Ms"], max_control_drift)]
+    drift_cases = [identifier for identifier in bm["perCase"] if any(not ratio_close(
+        bm["perCase"][identifier][key], am["perCase"][identifier][key], max_control_drift) for key in ("p50Ms", "p95Ms"))]
     controls_stable = not drift_cases and all(ratio_close(bm[key], am[key], max_control_drift) for key in ("p50Ms", "p95Ms"))
     changed_cases = []
     for identifier, row in before["predictions"].items():
@@ -150,23 +176,30 @@ def compare_runs(before, candidate, after, min_improvement=0.05, max_control_dri
             changed_cases.append(identifier)
     regressed_cases = [identifier for identifier, value in cm["perCase"].items()
                        if value["p50Ms"] > min(bm["perCase"][identifier]["p50Ms"], am["perCase"][identifier]["p50Ms"]) * (1 + max_case_regression)]
+    tail_regressed_cases = [identifier for identifier, value in cm["perCase"].items()
+                           if value["p95Ms"] > min(bm["perCase"][identifier]["p95Ms"], am["perCase"][identifier]["p95Ms"]) * (1 + max_case_regression)]
+    server_models = set().union(*(run["serverModels"] for run in (before, candidate, after)))
     gates = {"repeatedSamples": bmeta["benchmarkProtocol"]["repetitions"] >= 6,
              "successfulWarmup": bmeta["benchmarkProtocol"]["warmupRequests"] > 0,
              "allAttemptsComplete": all(not value["failedAttempts"] and not value["failedCaseHeaders"] for value in (bm, cm, am)),
+             "stableReportedServerModel": len(server_models) == 1,
              "controlsStable": controls_stable,
              "exactOutputEquivalence": not changed_cases,
              "medianImprovedAgainstBothControls": cm["p50Ms"] <= min(bm["p50Ms"], am["p50Ms"]) * (1 - min_improvement),
              "p95NotRegressedAgainstEitherControl": cm["p95Ms"] <= min(bm["p95Ms"], am["p95Ms"]),
-             "noCaseMedianRegression": not regressed_cases}
-    inconclusive = any(not gates[key] for key in ("repeatedSamples", "successfulWarmup", "allAttemptsComplete", "controlsStable"))
+             "noCaseMedianRegression": not regressed_cases,
+             "noCaseP95Regression": not tail_regressed_cases}
+    inconclusive = any(not gates[key] for key in ("repeatedSamples", "successfulWarmup", "allAttemptsComplete", "controlsStable", "stableReportedServerModel"))
     eligible = all(gates.values())
     return {"schemaVersion": 1, "status": "eligible-for-review" if eligible else "inconclusive" if inconclusive else "candidate-rejected",
             "eligibleForReview": eligible, "promoted": False, "gates": gates,
             "policy": {"minSamplesPerCase": 6, "minMedianImprovement": min_improvement,
                        "maxSymmetricControlDrift": max_control_drift, "maxCaseMedianRegression": max_case_regression,
+                       "maxCaseP95Regression": max_case_regression,
                        "allowedOptimizationIdentityFields": sorted(OPTIMIZATION_FIELDS)},
             "before": bm, "candidate": cm, "after": am, "controlDriftCaseIDs": drift_cases,
             "outputChangedCaseIDs": changed_cases, "latencyRegressedCaseIDs": regressed_cases,
+            "tailLatencyRegressedCaseIDs": tail_regressed_cases,
             "candidateMedianRatioToBefore": cm["p50Ms"] / bm["p50Ms"],
             "candidateMedianRatioToAfter": cm["p50Ms"] / am["p50Ms"],
             "runs": {name: {"configurationID": run["metadata"]["modelID"], "identity": run["metadata"]["identity"],
