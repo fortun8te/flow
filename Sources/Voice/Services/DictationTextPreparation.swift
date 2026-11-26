@@ -31,8 +31,12 @@ enum DictationTextPreparation {
     }
     static func finalize(polished: String, formatted: String) -> String {
         let nonempty = polished.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? formatted : polished
-        let result = WisprImportService.applyReplacements(to: AmericanSpelling.apply(DictationFinalPass.apply(nonempty)))
-        return preservingFilenameCase(result, original: formatted)
+        let layoutPreserved = DictationLayout.preservingLineBreaks(in: nonempty, from: formatted)
+        // Explicit user snippets may themselves insert newlines. Apply them
+        // after checking model layout so their requested formatting survives.
+        let result = WisprImportService.applyReplacements(to: AmericanSpelling.apply(DictationFinalPass.apply(layoutPreserved)))
+        return DictationLayout.restoringBoundaryBreaks(
+            in: preservingFilenameCase(result, original: formatted), from: formatted)
     }
 
     static let sectionLimit = 900
@@ -40,39 +44,7 @@ enum DictationTextPreparation {
     /// Use complete lines and prefer sentence ends inside a long line. The
     /// whitespace between sections stays outside the editor's input.
     static func cleanupSections(in text: String, limit: Int = sectionLimit) -> [Range<String.Index>] {
-        guard limit > 0 else { return [] }
-        var ranges: [Range<String.Index>] = []
-        for line in text.split(whereSeparator: \.isNewline) {
-            var start = line.startIndex
-            while start < line.endIndex {
-                while start < line.endIndex && text[start].isWhitespace { text.formIndex(after: &start) }
-                guard start < line.endIndex else { break }
-                let limitIndex = text.index(start, offsetBy: limit, limitedBy: line.endIndex) ?? line.endIndex
-                var end = limitIndex
-                if limitIndex < line.endIndex {
-                    let prefix = text[start...limitIndex]
-                    let mid = text.index(start, offsetBy: limit / 2)
-                    let sentenceEnd = prefix.indices.reversed().first { index in
-                        index > mid && text[index].isWhitespace && ".!?".contains(text[text.index(before: index)])
-                    }
-                    if let boundary = sentenceEnd ?? prefix.lastIndex(where: \.isWhitespace) {
-                        end = boundary
-                    } else {
-                        // A URL, pasted identifier or other long unbroken token
-                        // is preserved as-is and never sent to the editor.
-                        start = text[limitIndex..<line.endIndex].firstIndex(where: \.isWhitespace) ?? line.endIndex
-                        continue
-                    }
-                }
-                var contentEnd = end
-                while contentEnd > start && text[text.index(before: contentEnd)].isWhitespace {
-                    text.formIndex(before: &contentEnd)
-                }
-                if start < contentEnd { ranges.append(start..<contentEnd) }
-                start = end
-            }
-        }
-        return ranges
+        DictationLayout.cleanupSections(in: text, limit: limit)
     }
 
     static func sectionRequestSeconds(tuned: Double, general: Double, remaining: Double) -> Double {
@@ -108,7 +80,7 @@ enum DictationTextPreparation {
             let reply = await DictationDeadline.run(seconds: seconds) { await cleanup(original) }
             guard let answer = reply else { timedOut = true; break }
             parts.append(String(source[cursor..<range.lowerBound]))
-            if let edited = answer?.trimmingCharacters(in: .whitespacesAndNewlines), !edited.isEmpty,
+            if let answer, let edited = DictationLayout.singleLineReply(answer),
                WhisperNowContentGuard.trip(source: original, output: edited) == nil,
                !WhisperNowContentGuard.shortened(source: original, output: edited),
                Qwen3Polisher.reviewIdentifiersPreserved(edited, original: original) {
@@ -177,7 +149,8 @@ enum DictationTextPreparation {
         // The paster checks the captured app when known. Ordinary dictation can
         // still paste in editors that do not expose their focused field to AX.
         DeliveryIntent(shouldPaste: autoPaste && !final.isEmpty, restoreClipboard: !autoCopy,
-                       preFormatted: !skipPolish && final != formatted && fieldContextProvided,
+                       preFormatted: final.contains(where: \.isNewline)
+                           || (!skipPolish && final != formatted && fieldContextProvided),
                        requireCapturedTarget: false, shouldSubmit: autoPaste && command.shouldSubmit)
     }
     nonisolated static func predominantlyNonLatin(_ text: String) -> Bool {

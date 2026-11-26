@@ -55,6 +55,7 @@ enum RemoteCleanup {
                             appContextLabel: String?, longProse: Bool, timeout: TimeInterval,
                             client: Client = sharedClient) async -> String? {
         guard isEnabled, !BackgroundActivityGate.privacyMode, !Task.isCancelled,
+              !text.contains(where: \.isNewline),
               cleanupLevel != "none", Qwen3Polisher.isEnabled,
               Qwen3Polisher.effectiveAutomaticCleanupModel == WhisperNowTunedPolisher.settingValue,
               WhisperNowTunedPolisher.usesT4, !WhisperNowTunedPolisher.usesT2Contracts,
@@ -74,7 +75,10 @@ enum RemoteCleanup {
     /// The network step and the guards, with the connection passed in so tests can use a fake server.
     static func guardedCleanup(_ input: String, client: Client, base: URL, token: String, timeout: TimeInterval,
                                userVocabulary: [String]?, personalityStyle: String, appContextLabel: String?) async -> String? {
-        guard timeout.isFinite, timeout > 0, !BackgroundActivityGate.privacyMode, !Task.isCancelled else { return nil }
+        // The live caller cleans multiline drafts section by section. A whole
+        // document reply cannot establish where a spoken line break belonged.
+        guard timeout.isFinite, timeout > 0, !BackgroundActivityGate.privacyMode, !Task.isCancelled,
+              !input.contains(where: \.isNewline) else { return nil }
         let clockStart = ContinuousClock.now
         guard input.count >= 4, input.count <= WhisperNowTunedPolisher.maximumInputCharacters,
               S1MiniPolisher.validateInput(input) == nil, !Qwen3Polisher.isNonEnglish(input) else { return nil }

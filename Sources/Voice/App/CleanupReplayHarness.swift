@@ -547,8 +547,10 @@ enum CleanupReplayHarness {
         var engine: String? { lock.withLock { lastEngine } }
     }
 
-    static func liveFinishClean(formatted: String, bundleID: String?,
+    static func liveFinishClean(formatted input: String, bundleID: String?,
                                 environment: Environment) async -> (outcome: Outcome, results: [String]) {
+        let formatted = TextFormatterConfig.fromDefaults().interpretVoiceCommands
+            ? TextFormatter.interpretLineBreakCommands(input) : input
         let parameters = environment.parameters(bundleID: bundleID)
         let polishEnabled = UserDefaults.standard.object(forKey: "polishEnabled") as? Bool ?? true
         let preferredWords = ProperNounVocabulary.preferredSpellingTerms()
@@ -574,7 +576,9 @@ enum CleanupReplayHarness {
         let started = CFAbsoluteTimeGetCurrent()
         var finalText: String
         var route = "single"
-        if CleanupLevel.current == .none || !polishEnabled {
+        if DictationLayout.isBreakOnly(formatted) {
+            finalText = formatted; route = "skip:layout-command"
+        } else if CleanupLevel.current == .none || !polishEnabled {
             finalText = formatted; route = "skip:polish-off"
         } else if parameters.polishContext != .code, Qwen3Polisher.isEnabled,
                   formatted.count > 1_200 || formatted.contains(where: \.isNewline) {
@@ -597,7 +601,8 @@ enum CleanupReplayHarness {
             Outcome(final: text, route: route, input: formatted, controlLine: nil,
                     result: log.results.joined(separator: "|"), engine: log.engine, cleanupMs: ms)
         }
-        if WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
+        if !DictationLayout.isBreakOnly(formatted),
+           WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
             return (outcome(""), log.results)
         }
         if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -605,14 +610,17 @@ enum CleanupReplayHarness {
         let level = parameters.cleanupLevel
         finalText = T2CleanupOptions.finalizedTranscript(candidate: finalText, preparedASR: formatted,
             level: level, recognizedT2: usesModelTranscript)
+            .map { DictationLayout.preservingLineBreaks(in: $0, from: formatted) }
             ?? DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+        finalText = DictationLayout.restoringBoundaryBreaks(in: finalText, from: formatted)
         finalText = DictationFinalPass.apply(finalText)
-        if polishEnabled && level != "none" {
+        if polishEnabled && level != "none" && !DictationLayout.isBreakOnly(finalText) {
             finalText = DictationReferee.dictationPass(finalText, isCode: parameters.polishContext == .code)
         }
         // tinynext recheck, as the live finish task runs it (suspects here are the formatter's; live adds
         // the recognizer's low-confidence words). Model-less, it returns the text unchanged.
-        if polishEnabled && level != "none" && parameters.polishContext != .code {
+        if polishEnabled && level != "none" && parameters.polishContext != .code
+            && !DictationLayout.isBreakOnly(finalText) {
             let rechecked = LowConfidenceRecheck.recheck(finalText, suspects: suspects, protectedTerms: vocabulary)
             if !rechecked.changes.isEmpty { log.add("tinynext:\(rechecked.changes.count)", engine: nil) }
             finalText = rechecked.text
@@ -620,7 +628,8 @@ enum CleanupReplayHarness {
         if parameters.polishContext != .code {
             finalText = ProperNounVocabulary.applyPreferredSpelling(finalText, terms: preferredWords)
         }
-        if polishEnabled && level != "none" {
+        if polishEnabled && level != "none" && TextFormatterConfig.fromDefaults().detectParagraphs
+            && !DictationLayout.isBreakOnly(finalText) {
             finalText = parameters.polishContext == .code
                 ? DictationParagraphs.format(finalText)
                 : DictationParagraphs.formatDictation(finalText, isEmail: parameters.polishContext == .email)

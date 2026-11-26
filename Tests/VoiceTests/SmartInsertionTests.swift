@@ -120,4 +120,58 @@ final class SmartInsertionTests: XCTestCase {
             XCTAssertEqual(SmartInsertion.boundarySpaced("Next", after: ending), " Next")
         }
     }
+
+    func testListsAndHeadingsStartOnTheirOwnLineAtAnExistingCursor() {
+        XCTAssertEqual(insert("- Keep the backup\n- Send the report", into: "Tasks:", at: 6),
+                       "Tasks:\n- Keep the backup\n- Send the report")
+        XCTAssertEqual(insert("1. Keep the backup\n2. Send the report", into: "Tasks: Next task.", at: 7),
+                       "Tasks: \n1. Keep the backup\n2. Send the report\nNext task.")
+        XCTAssertEqual(insert("## Next section", into: "Introduction.", at: 13), "Introduction.\n## Next section")
+        XCTAssertEqual(insert("> Keep this quote", into: "Read:", at: 5), "Read:\n> Keep this quote")
+    }
+
+    func testStructuredPasteReusesExistingLineBoundaries() {
+        XCTAssertEqual(insert("- Keep the backup", into: "Tasks:\n\nDone.", at: 7),
+                       "Tasks:\n- Keep the backup\nDone.")
+        XCTAssertEqual(insert("- Keep the backup", into: "Tasks:\n  ", at: 9), "Tasks:\n  - Keep the backup")
+        XCTAssertEqual(insert("- Keep the backup\n", into: "Done.", at: 0), "- Keep the backup\nDone.")
+        XCTAssertEqual(insert("- Keep the backup", into: "Old\r\nTasks:", at: 11), "Old\r\nTasks:\r\n- Keep the backup")
+    }
+
+    func testFencedCodeDoesNotGlueToSurroundingProse() {
+        XCTAssertEqual(insert("```swift\nlet value = 1\n```", into: "Example:Next.", at: 8),
+                       "Example:\n```swift\nlet value = 1\n```\nNext.")
+    }
+
+    func testInlineNumbersHyphensAndPlainParagraphsKeepNormalSpacing() {
+        XCTAssertEqual(insert("1.25 kg", into: "Weight:", at: 7), "Weight: 1.25 kg")
+        XCTAssertEqual(insert("-5", into: "value=", at: 6, code: true), "value=-5")
+        XCTAssertEqual(insert("#tag", into: "Use ", at: 4), "Use #tag")
+        XCTAssertEqual(insert("the report.\n\nAlso, keep the backup.", into: "Send ", at: 5),
+                       "Send the report.\n\nAlso, keep the backup.")
+    }
+
+    func testRememberedBoundaryStartsAListAfterThePreviousDictation() {
+        XCTAssertEqual(SmartInsertion.boundarySpaced("- First item\n- Second item", after: ":"),
+                       "\n- First item\n- Second item")
+        XCTAssertEqual(SmartInsertion.boundarySpaced("- First item", after: "\n"), "- First item")
+    }
+
+    func testBlockInferenceKeepsCodeOperatorsAndQuotedLiteralsInline() {
+        XCTAssertEqual(insert("* 2", into: "return value ", at: 13, code: true), "return value * 2")
+        XCTAssertEqual(insert("> 5", into: "if x ", at: 5, code: true), "if x > 5")
+        XCTAssertEqual(insert("> literal", into: "Use \"\" here", at: 5), "Use \"> literal\" here")
+        XCTAssertEqual(insert("- literal", into: "Use '' here", at: 5), "Use '- literal' here")
+    }
+
+    func testStructuredReplacementDoesNotOrphanExistingSentencePunctuation() {
+        XCTAssertEqual(insert("- item", into: "Replace.", at: 0, replacing: 7), "- item.")
+        XCTAssertEqual(insert("- item.", into: "Replace.", at: 0, replacing: 7), "- item.")
+        XCTAssertEqual(insert("- item", into: "Replace!", at: 0, replacing: 7), "- item!")
+    }
+
+    func testIndentedListContinuationStaysSeparateFromFollowingText() {
+        XCTAssertEqual(insert("- item\n  continuation", into: "Tail", at: 0), "- item\n  continuation\nTail")
+        XCTAssertEqual(insert("- item\n\tcontinuation", into: "Tail", at: 0), "- item\n\tcontinuation\nTail")
+    }
 }

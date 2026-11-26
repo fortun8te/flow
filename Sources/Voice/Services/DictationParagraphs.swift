@@ -65,16 +65,26 @@ enum DictationParagraphs {
         guard input.contains(where: \.isNewline) else { return formatLine(input, isEmail: isEmail) }
         var result = ""
         var cursor = input.startIndex
-        var fence: String?
+        var fence: (marker: Character, length: Int)?
         for span in input.split(whereSeparator: \.isNewline) {
             result += input[cursor..<span.startIndex]
             let line = String(span)
             let trimmed = line.drop(while: \.isWhitespace)
-            if let marker = ["```", "~~~"].first(where: trimmed.hasPrefix) {
-                if fence == nil { fence = marker }
-                else if fence == marker { fence = nil }
+            let marker = trimmed.first
+            let runLength = (marker == "`" || marker == "~")
+                ? trimmed.prefix(while: { $0 == marker }).count : 0
+            if let active = fence {
+                // A shorter fence or a marker followed by content is literal
+                // code. It must not expose the following lines to reflow.
+                if marker == active.marker, runLength >= active.length,
+                   trimmed.dropFirst(runLength).allSatisfy(\.isWhitespace) {
+                    fence = nil
+                }
                 result += line
-            } else if fence != nil || line.first?.isWhitespace == true ||
+            } else if let marker, runLength >= 3 {
+                fence = (marker, runLength)
+                result += line
+            } else if line.first?.isWhitespace == true ||
                         existingStructure.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil {
                 result += line
             } else {
@@ -361,8 +371,10 @@ enum DictationParagraphs {
                     guard let b = breakCosts[i] else { continue }
                     cost += b
                 }
-                // Below the readable length a topic break still needs 10+ words on each side.
-                if total < readableMinimumWords, i > 0, prefix[j] - prefix[i] < readableShortestParagraph { continue }
+                // Every paragraph from a short topic split needs 10+ words,
+                // including the first one. Otherwise the topic bonus can
+                // isolate a one-word opener such as "Done.".
+                if total < readableMinimumWords, prefix[j] - prefix[i] < readableShortestParagraph { continue }
                 if cost < best[j] { best[j] = cost; from[j] = i }
             }
         }

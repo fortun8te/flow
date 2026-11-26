@@ -40,6 +40,8 @@ final class PasteNeverLosesTextTests: XCTestCase {
         XCTAssertEqual(pb.string(forType: .string), "Six violet beads belong beside the lantern.")
         XCTAssertFalse(CursorPaster.keepForManualPaste("   ", pasteboard: pb))
         XCTAssertEqual(pb.string(forType: .string), "Six violet beads belong beside the lantern.")
+        XCTAssertTrue(CursorPaster.keepForManualPaste("\n\n", pasteboard: pb))
+        XCTAssertEqual(pb.string(forType: .string), "\n\n")
     }
 
     func testEveryDictationIsWrittenToTheTrainingLog() throws {

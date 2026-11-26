@@ -67,6 +67,9 @@ struct TextFormatterConfig {
         if defaults.object(forKey: "fmt_detectLists") != nil {
             config.detectLists = defaults.bool(forKey: "fmt_detectLists")
         }
+        if defaults.object(forKey: "fmt_detectParagraphs") != nil {
+            config.detectParagraphs = defaults.bool(forKey: "fmt_detectParagraphs")
+        }
         if defaults.object(forKey: "fmt_preferBullets") != nil {
             config.preferBulletsForOrdinalOnly = defaults.bool(forKey: "fmt_preferBullets")
         }
@@ -141,14 +144,14 @@ class TextFormatter {
 
     // MARK: - Cached regexes (compiled once at init time, reused on every format call)
     // Keeping these as lazy statics keeps `format` allocation-free on the hot path.
-    private static let rxSpaceBeforePunct   = try! NSRegularExpression(pattern: #"\s+([,.!?;:])"#)
+    private static let rxSpaceBeforePunct   = try! NSRegularExpression(pattern: #"[ \t]+([,.!?;:])"#)
     private static let rxRepeatedDots       = try! NSRegularExpression(pattern: #"\.{2,}"#)
     private static let rxRepeatedCommas     = try! NSRegularExpression(pattern: #",{2,}"#)
     private static let rxPunctSpacing       = try! NSRegularExpression(pattern: #"([.!?,;:])([A-Za-z])"#)
     private static let rxStandaloneI        = try! NSRegularExpression(pattern: #"\bi\b"#)
     private static let rxWord               = try! NSRegularExpression(pattern: #"[A-Za-z]+"#)
     private static let rxEmailLikeAtPattern = try! NSRegularExpression(
-        pattern: #"([A-Za-z0-9._%+\-]+)\s+at\s+([A-Za-z0-9.\-]+)"#,
+        pattern: #"([A-Za-z0-9._%+\-]+)[ \t]+at[ \t]+([A-Za-z0-9.\-]+)"#,
         options: .caseInsensitive
     )
     // Sentence-start: position 0, OR after `.!?` plus optional close-quote/paren and whitespace,
@@ -167,7 +170,17 @@ class TextFormatter {
     /// punctuation, no doubles, no em dashes, terminal punctuation, contractions
     /// fixed, numbers normalized.
     func format(_ text: String) -> String {
-        var result = text
+        format(text, lineBreakCommandsHandled: false)
+    }
+
+    private func format(_ text: String, lineBreakCommandsHandled: Bool) -> String {
+        // An explicit break at the edge is an insertion command too. Keep it
+        // outside passes that trim the draft, while still trimming incidental
+        // leading newlines from generated bullet markup.
+        let sourceEdges = Self.boundaryBreaks(in: text)
+        var leadingBreaks = sourceEdges.leading
+        var trailingBreaks = sourceEdges.trailing
+        var result = sourceEdges.body
 
         // BUGFIX (Yo/Yeah specific): normalize known Parakeet quirks BEFORE
         // any other pass. "yoat" / "yote" → "yo", "houst" → "host". Conservative
@@ -210,16 +223,22 @@ class TextFormatter {
         //     "...store. So, I went home." → "...store.\n\nSo, I went home."
         //     Segment-gap-based breaks live in `formatSegments` (we don't have
         //     timestamps here).
-        result = insertTransitionalParagraphBreaks(result)
+        if config.detectParagraphs {
+            result = insertTransitionalParagraphBreaks(result)
+        }
 
         // 1f. Dense-prose paragraph splitter for long dictations (≥120 words).
         //     Fires AFTER transitional breaks so we don't re-split already-broken text.
-        result = splitDenseParagraphs(result)
+        if config.detectParagraphs {
+            result = splitDenseParagraphs(result)
+        }
 
         // 1g. Email/letter salutation detection.
         //     "Dear John I hope you're doing well" → "Dear John,\n\nI hope you're doing well."
         //     Runs BEFORE voice commands so salutation lines don't confuse command detection.
-        result = formatSalutation(result)
+        if config.detectParagraphs {
+            result = formatSalutation(result)
+        }
 
         // 2a. Special-character phrase formatting — MUST run BEFORE voice commands.
         //     If voice commands fire first, "open quote"/"close quote" become the
@@ -238,6 +257,13 @@ class TextFormatter {
             // voice-command pass so the trailing "scratch that" tokens are
             // still verbatim text we can pattern-match against.
             result = applyScratchThat(result)
+            if !lineBreakCommandsHandled {
+                result = Self.interpretLineBreakCommands(result)
+            }
+            let commandEdges = Self.boundaryBreaks(in: result)
+            leadingBreaks += commandEdges.leading
+            trailingBreaks = commandEdges.trailing + trailingBreaks
+            result = commandEdges.body
             result = applyVoiceCommands(result)
         }
 
@@ -350,20 +376,22 @@ class TextFormatter {
         // 13a. NEW: topic-shift paragraph breaks ("Also...", "Oh and...", "Wait...").
         //      Runs AFTER terminal punctuation has been inferred so the `.!?`
         //      boundary the regex matches on is reliably present.
-        result = insertTopicShiftBreaks(result)
+        if config.detectParagraphs {
+            result = insertTopicShiftBreaks(result)
+        }
 
         // 14. BUGFIX: restore protected URLs / emails. Runs before final whitespace
         // pass so cleanWhitespace can normalize spacing around them, but after all
         // structural passes so the placeholders survive everything that mattered.
         // Keep the opaque spans protected through final punctuation spacing.
 
-        // 15. Whitespace pass — LAST. Verified newline/bullet/backtick-safe:
-        // only collapses runs of spaces and 3+ newlines, trims outer whitespace,
+        // 15. Whitespace pass — LAST. Preserve requested newline runs:
+        // only collapses runs of spaces, trims incidental outer whitespace,
         // never touches single newlines, leading `-` bullets, or backticks.
         result = cleanWhitespace(result)
         result = restoreURLsAndEmails(result, urlMap)
 
-        return result
+        return leadingBreaks + result + trailingBreaks
     }
 
     // MARK: - Segmented (timed) formatting
@@ -383,6 +411,10 @@ class TextFormatter {
         longPauseThreshold: TimeInterval? = nil,
         mediumPauseThreshold: TimeInterval = 0.8
     ) -> String {
+        // Empty recognition windows do not create empty paragraphs or become
+        // the timing anchor for the next spoken segment. A real newline is
+        // still meaningful, even when it is the segment's only content.
+        let segments = segments.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
         guard !segments.isEmpty else { return "" }
         if segments.count == 1 { return format(segments[0].text) }
 
@@ -392,6 +424,8 @@ class TextFormatter {
         // We build one long string with `\n\n` and `\n` delimiters in place,
         // then split on `\n\n` for the per-paragraph format pass.
         var current = segments[0].text
+        var currentUTF16Count = current.utf16.count
+        var inferredBreaks: [NSRange] = []
 
         for i in 1..<segments.count {
             let gap = segments[i].startTime - segments[i - 1].endTime
@@ -402,20 +436,44 @@ class TextFormatter {
             let endsLine      = prevLast.map { lineTerminals.contains($0) } ?? false
             let nextIsCapped  = nextFirst.map { $0.isUppercase } ?? false
 
-            if gap >= paragraphThreshold {
-                current += "\n\n" + segments[i].text
-            } else if gap >= mediumPauseThreshold && endsLine && nextIsCapped {
-                current += "\n" + segments[i].text
+            let separator: String
+            var inferred = false
+            if current.trimmingCharacters(in: .whitespaces).last?.isNewline == true ||
+                segments[i].text.trimmingCharacters(in: .whitespaces).first?.isNewline == true {
+                // The recognizer or speaker already supplied the boundary.
+                separator = ""
+            } else if config.detectParagraphs && gap >= paragraphThreshold {
+                separator = "\n\n"
+                inferred = true
+            } else if config.detectParagraphs && gap >= mediumPauseThreshold && endsLine && nextIsCapped {
+                separator = "\n"
+                inferred = true
             } else {
-                current += " " + segments[i].text
+                separator = " "
             }
+            if inferred { inferredBreaks.append(NSRange(location: currentUTF16Count, length: separator.utf16.count)) }
+            current += separator + segments[i].text
+            currentUTF16Count += separator.utf16.count + segments[i].text.utf16.count
+        }
+
+        if config.interpretVoiceCommands {
+            // Classify commands with the complete quote/code context. A spoken
+            // boundary wins over a pause at exactly the same position, while
+            // two explicit commands still produce two requested boundaries.
+            let commands = Self.lineBreakCommandEdits(in: current)
+            let commandStarts = Set(commands.map { $0.range.location })
+            let commandEnds = Set(commands.map { NSMaxRange($0.range) })
+            let redundantPauses = inferredBreaks.filter {
+                commandEnds.contains($0.location) || commandStarts.contains(NSMaxRange($0))
+            }.map { (range: $0, replacement: "") }
+            current = Self.applyingLineBreakEdits(commands + redundantPauses, to: current)
         }
 
         // Format each paragraph independently so capitalization/cleanup runs
         // bounded by the paragraph break.
         return current
             .components(separatedBy: "\n\n")
-            .map { format($0) }
+            .map { format($0, lineBreakCommandsHandled: config.interpretVoiceCommands) }
             .joined(separator: "\n\n")
     }
 
@@ -447,11 +505,78 @@ class TextFormatter {
 
     /// Spoken phrase → replacement. Order matters (longer phrases first within
     /// a section, otherwise "exclamation" would consume "exclamation point").
+    private static let lineBreakCommand = try! NSRegularExpression(
+        pattern: #"[ \t]*[,;:]?[ \t]*\b((?:new|next)[ \t]+paragraph|(?:new|next)[ \t]+line|line[ \t]+break)\b[,;:.!?]?[ \t]*"#,
+        options: .caseInsensitive
+    )
+    private static let layoutInlineCode = try! NSRegularExpression(
+        pattern: #"(?s)(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)"#
+    )
+    private static let layoutLiterals = try! NSRegularExpression(
+        pattern: #"`[^`\r\n]*(?:`|(?=\r?\n)|\z)|"(?:\\.|[^"\\])*(?:"|\z)|“[^”]*(?:”|\z)|(?<![\p{L}\p{N}])'[^'\r\n]*'(?![\p{L}\p{N}])|‘[^’]*(?:’|\z)|(?i:\b(?:open[ \t]+)?quote\b[^\r\n]*?\b(?:end[ \t]+quote|close[ \t]+quote|unquote)\b)"#
+    )
+    private static let layoutMentionLead = try! NSRegularExpression(
+        pattern: #"(?i)\b(?:a|the|each|every|word|words|phrase|command|text|string|literal|say|says|saying|called|type|typing|typed)[ \t]+$"#
+    )
+    private static let layoutMentionTail = try! NSRegularExpression(
+        pattern: #"(?i)\A[ \t]+(?:command|character|characters|phrase|means|mean)\b"#
+    )
+
+    /// The same minimal layout command pass is used before model cleanup and
+    /// by the rules formatter. It changes only explicitly spoken boundaries;
+    /// quoted/code text and mentions such as "the new line command" stay text.
+    static func interpretLineBreakCommands(_ text: String) -> String {
+        applyingLineBreakEdits(lineBreakCommandEdits(in: text), to: text)
+    }
+
+    private static func lineBreakCommandEdits(in text: String) -> [(range: NSRange, replacement: String)] {
+        let ns = text as NSString
+        let whole = NSRange(location: 0, length: ns.length)
+        let matches = lineBreakCommand.matches(in: text, range: whole)
+        guard !matches.isEmpty else { return [] }
+        let literals = layoutLiterals.matches(in: text, range: whole).map(\.range)
+            + layoutInlineCode.matches(in: text, range: whole).map(\.range)
+            + DictationFinalPass.fencedCodeRanges(in: text).map { NSRange($0, in: text) }
+        var edits: [(range: NSRange, replacement: String)] = []
+        for match in matches {
+            let command = match.range(at: 1)
+            guard !literals.contains(where: { NSIntersectionRange($0, command).length > 0 }) else { continue }
+            let before = ns.substring(to: command.location)
+            let after = ns.substring(from: command.location + command.length)
+            guard layoutMentionLead.firstMatch(in: before, range: NSRange(before.startIndex..., in: before)) == nil,
+                  layoutMentionTail.firstMatch(in: after, range: NSRange(after.startIndex..., in: after)) == nil else {
+                continue
+            }
+            let paragraph = ns.substring(with: command).lowercased().hasSuffix("paragraph")
+            edits.append((match.range, paragraph ? "\n\n" : "\n"))
+        }
+        return edits
+    }
+
+    private static func applyingLineBreakEdits(_ edits: [(range: NSRange, replacement: String)], to text: String) -> String {
+        guard !edits.isEmpty else { return text }
+        let output = NSMutableString(string: text)
+        for edit in edits.sorted(by: { $0.range.location > $1.range.location }) {
+            output.replaceCharacters(in: edit.range, with: edit.replacement)
+        }
+        return output as String
+    }
+
+    /// Trim incidental edge spaces without losing a requested blank line.
+    /// Whitespace-only input has one boundary, so its breaks are counted once.
+    private static func boundaryBreaks(in text: String) -> (leading: String, body: String, trailing: String) {
+        guard let first = text.firstIndex(where: { !$0.isWhitespace }),
+              let last = text.lastIndex(where: { !$0.isWhitespace }) else {
+            return (String(text.filter(\.isNewline)), "", "")
+        }
+        let afterLast = text.index(after: last)
+        return (String(text[..<first].filter(\.isNewline)), String(text[first..<afterLast]),
+                String(text[afterLast...].filter(\.isNewline)))
+    }
+
     private let voiceCommands: [(pattern: String, replacement: String)] = [
-        // Structural — most explicit first.
-        ("new paragraph", "\n\n"),
-        ("new line", "\n"),
-        ("next line", "\n"),
+        // Line/paragraph commands are handled separately so their boundary
+        // breaks survive trimming without retaining generated bullet padding.
 
         // Punctuation — multi-word phrases first.
         ("exclamation point", "!"),
@@ -514,7 +639,7 @@ class TextFormatter {
     ///   4. Loop — multiple "scratch thats" in one utterance all resolve.
     private func applyScratchThat(_ text: String) -> String {
         guard let regex = try? NSRegularExpression(
-            pattern: "\\b(?:scratch|strike)\\s+that\\b[.!?,]?",
+            pattern: "\\b(?:scratch|strike)[ \\t]+that\\b[.!?,]?",
             options: .caseInsensitive
         ) else { return text }
 
@@ -567,7 +692,7 @@ class TextFormatter {
             // This catches "...store period next I went..." but not "the period drama".
             let pattern: String
             if Self.ambiguousVoiceCommands.contains(command.pattern) {
-                pattern = "\\b\(escaped)\\b(?=\\s*$|\\s+[A-Z]|\\s*\\n)"
+                pattern = "\\b\(escaped)\\b(?=[ \\t]*$|[ \\t]+[A-Z]|[ \\t]*\\n)"
             } else if command.replacement.contains("\n") {
                 // "smaller. New line. Make the card" -> the command's own full stop goes with it.
                 pattern = "[ \t]*[,;:]?[ \t]*\\b\(escaped)\\b[,;:.]?[ \t]*"
@@ -602,7 +727,10 @@ class TextFormatter {
     private func removeFillerWords(_ text: String) -> String {
         var result = text
         for filler in fillerWords {
-            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: filler))\\b,?\\s*"
+            let word = "\\b\(NSRegularExpression.escapedPattern(for: filler))\\b,?[ \\t]*"
+            // Removing a hesitation at the end of a line also removes its
+            // preceding spaces, but never consumes the line break itself.
+            let pattern = "[ \\t]*\(word)(?=\\R|\\z)|\(word)"
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
                 result = regex.stringByReplacingMatches(
                     in: result,
@@ -1061,7 +1189,7 @@ class TextFormatter {
         let hourWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)"
         let minWord  = "(?:oh|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)"
         // Captures: 1=hour phrase, 2=optional minute phrase, 3=am/pm marker
-        let pat = "(?i)\\b(\(hourWord)(?:\\s+\(hourWord))?)(?:\\s+(\(minWord)(?:\\s+\(minWord))?))?\\s+(a\\.?\\s*m\\.?|p\\.?\\s*m\\.?)\\b"
+        let pat = "(?i)\\b(\(hourWord)(?:[ \\t]+\(hourWord))?)(?:[ \\t]+(\(minWord)(?:[ \\t]+\(minWord))?))?[ \\t]+(a\\.?[ \\t]*m\\.?|p\\.?[ \\t]*m\\.?)\\b"
         guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
         var result = text
         let ns = result as NSString
@@ -1109,7 +1237,7 @@ class TextFormatter {
         let mag      = "(million|billion|thousand|k)"
         let currency = "(?:dollars?|bucks?|euros?|pounds?|yen|usd|gbp|eur)"
         // (1=int phrase) (optional " point " + 2=fractional phrase) ws mag ws currency
-        let pat = "(?i)\\b(\(intWords)(?:\\s+(?:and\\s+)?\(intWords))*)(?:\\s+point\\s+(\(intWords)(?:\\s+\(intWords))*))?\\s+\(mag)\\s+\(currency)\\b"
+        let pat = "(?i)\\b(\(intWords)(?:[ \\t]+(?:and[ \\t]+)?\(intWords))*)(?:[ \\t]+point[ \\t]+(\(intWords)(?:[ \\t]+\(intWords))*))?[ \\t]+\(mag)[ \\t]+\(currency)\\b"
         guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
         var result = text
         let ns = result as NSString
@@ -1148,7 +1276,7 @@ class TextFormatter {
     private func normalizeVersionNumbers(_ text: String) -> String {
         let comp = "(?:\\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
         // "version <comp> (point|dot|.|\s) <comp> ..." — require at least 2 components.
-        let pat = "(?i)\\bversion\\s+(\(comp))(?:\\s*(?:point|dot|\\.)\\s*(\(comp)))(?:\\s*(?:point|dot|\\.)\\s*(\(comp)))?(?:\\s*(?:point|dot|\\.)\\s*(\(comp)))?\\b"
+        let pat = "(?i)\\bversion[ \\t]+(\(comp))(?:[ \\t]*(?:point|dot|\\.)[ \\t]*(\(comp)))(?:[ \\t]*(?:point|dot|\\.)[ \\t]*(\(comp)))?(?:[ \\t]*(?:point|dot|\\.)[ \\t]*(\(comp)))?\\b"
         guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
         var result = text
         let ns = result as NSString
@@ -1189,7 +1317,7 @@ class TextFormatter {
         let numTok = "(?:\\d{1,2}|\(nWord))"
         // 3-5 number tokens separated by spaces or commas, optionally followed
         // by a launch word.
-        let pat = "(?i)\\b(\(numTok))[,\\s]+(\(numTok))[,\\s]+(\(numTok))(?:[,\\s]+(\(numTok)))?(?:[,\\s]+(\(numTok)))?(\\s+(?:go|liftoff|lift\\s*off|blast\\s*off))?"
+        let pat = "(?i)\\b(\(numTok))[, \\t]+(\(numTok))[, \\t]+(\(numTok))(?:[, \\t]+(\(numTok)))?(?:[, \\t]+(\(numTok)))?([ \\t]+(?:go|liftoff|lift[ \\t]*off|blast[ \\t]*off))?"
         guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
         func toInt(_ s: String) -> Int? {
             let l = s.lowercased()
@@ -1232,7 +1360,7 @@ class TextFormatter {
         let intWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
         let decWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine)"
         // Don't fire when followed by a scale word — money pre-pass already handled that.
-        let pat = "(?i)\\b(\(intWord)(?:\\s+\(intWord))*)\\s+point\\s+(\(decWord)(?:\\s+\(decWord))*)(?!\\s*(?:million|billion|thousand|\\bk\\b|\\bm\\b|\\bb\\b))"
+        let pat = "(?i)\\b(\(intWord)(?:[ \\t]+\(intWord))*)[ \\t]+point[ \\t]+(\(decWord)(?:[ \\t]+\(decWord))*)(?![ \\t]*(?:million|billion|thousand|\\bk\\b|\\bm\\b|\\bb\\b))"
         guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
         var result = text
         let ns = result as NSString
@@ -1263,12 +1391,12 @@ class TextFormatter {
         ]
         var result = text
         for (unit, abbr) in subs {
-            let pat = #"(\d+(?:\.\d+)?)\s+"# + NSRegularExpression.escapedPattern(for: unit) + #"\b"#
+            let pat = #"(\d+(?:\.\d+)?)[ \t]+"# + NSRegularExpression.escapedPattern(for: unit) + #"\b"#
             guard let rx = try? NSRegularExpression(pattern: pat, options: .caseInsensitive) else { continue }
             result = rx.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "$1\(abbr)")
         }
         // Seconds: only abbreviate when decimal (2.5s not 3s — "3 seconds" is natural prose).
-        if let rx = try? NSRegularExpression(pattern: #"(\d+\.\d+)\s+seconds?\b"#, options: .caseInsensitive) {
+        if let rx = try? NSRegularExpression(pattern: #"(\d+\.\d+)[ \t]+seconds?\b"#, options: .caseInsensitive) {
             result = rx.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "$1s")
         }
         return result
@@ -1280,7 +1408,7 @@ class TextFormatter {
         var result = text
         // Pattern after number folding ran: digit(s) optionally followed by
         // ":digit(s)" or " thirty/fifteen/etc", then space, then am/pm.
-        let pat = #"(\d{1,2})(?:[:\s](\d{1,2}))?\s+(a\.?m\.?|p\.?m\.?)\b"#
+        let pat = #"(\d{1,2})(?:[: \t](\d{1,2}))?[ \t]+(a\.?m\.?|p\.?m\.?)\b"#
         guard let regex = try? NSRegularExpression(pattern: pat, options: .caseInsensitive) else {
             return result
         }
@@ -1315,8 +1443,22 @@ class TextFormatter {
             var sawAny = false
 
             while runEnd < matches.count {
+                if runEnd > i {
+                    let previousEnd = NSMaxRange(matches[runEnd - 1].range)
+                    let gap = nsText.substring(with: NSRange(location: previousEnd,
+                                                             length: matches[runEnd].range.location - previousEnd))
+                    if gap.contains(where: \.isNewline) { break }
+                }
                 let word = nsText.substring(with: matches[runEnd].range).lowercased()
                 if word == "and" && sawAny {
+                    // A conjunction belongs to a number only when another
+                    // number follows on the same line. Otherwise keep it.
+                    guard runEnd + 1 < matches.count else { break }
+                    let nextWord = nsText.substring(with: matches[runEnd + 1].range).lowercased()
+                    let nextGap = nsText.substring(with: NSRange(location: NSMaxRange(matches[runEnd].range),
+                        length: matches[runEnd + 1].range.location - NSMaxRange(matches[runEnd].range)))
+                    guard !nextGap.contains(where: \.isNewline),
+                          Self.unitMap[nextWord] != nil || Self.tensMap[nextWord] != nil || Self.scaleMap[nextWord] != nil else { break }
                     runEnd += 1
                     continue
                 }
@@ -1383,7 +1525,7 @@ class TextFormatter {
     private func convertCurrency(_ text: String) -> String {
         var result = text
         for (word, symbol) in currencyMap {
-            let pattern = #"(\d+(?:[.,]\d+)?)\s+"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#
+            let pattern = #"(\d+(?:[.,]\d+)?)[ \t]+"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#
             guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
             let ns = result as NSString
             let matches = regex.matches(in: result, range: NSRange(location: 0, length: ns.length))
@@ -1407,11 +1549,11 @@ class TextFormatter {
     private func convertPercent(_ text: String) -> String {
         var result = text
         // Pre-pass: "point N" with no leading digit → "0.N"
-        if let rx = try? NSRegularExpression(pattern: #"\bpoint\s+(\d+)\s+percent\b"#, options: .caseInsensitive) {
+        if let rx = try? NSRegularExpression(pattern: #"\bpoint[ \t]+(\d+)[ \t]+percent\b"#, options: .caseInsensitive) {
             let r = NSRange(result.startIndex..., in: result)
             result = rx.stringByReplacingMatches(in: result, range: r, withTemplate: "0.$1 percent")
         }
-        guard let rx = try? NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)\s+percent\b"#, options: .caseInsensitive) else {
+        guard let rx = try? NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)[ \t]+percent\b"#, options: .caseInsensitive) else {
             return result
         }
         let r = NSRange(result.startIndex..., in: result)
@@ -1436,7 +1578,7 @@ class TextFormatter {
         ]
         var result = text
         for (word, abbr) in mags {
-            let pattern = #"([$€£¥])(\d+(?:\.\d+)?)\s+"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#
+            let pattern = #"([$€£¥])(\d+(?:\.\d+)?)[ \t]+"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#
             guard let rx = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
             let r = NSRange(result.startIndex..., in: result)
             result = rx.stringByReplacingMatches(in: result, range: r, withTemplate: "$1$2\(abbr)")
@@ -1465,7 +1607,7 @@ class TextFormatter {
     private func wrapSpokenQuotes(_ text: String) -> String {
         var result = text
         // Greedy non-greedy: match "quote ... end quote" / "unquote" / "close quote".
-        let pattern = #"(?i)\bquote\s+(.+?)\s+(?:end\s+quote|unquote|close\s+quote)\b"#
+        let pattern = #"(?i)\bquote[ \t]+(.+?)[ \t]+(?:end[ \t]+quote|unquote|close[ \t]+quote)\b"#
         guard let rx = try? NSRegularExpression(pattern: pattern) else { return result }
         let ns = result as NSString
         let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
@@ -1493,7 +1635,7 @@ class TextFormatter {
     private func wrapSpokenParens(_ text: String) -> String {
         var result = text
         // "paren X close paren" / "paren X end paren" / "paren X paren close"
-        let pattern = #"(?i)\bparen\s+(.+?)\s+(?:close\s+paren|end\s+paren|paren\s+close)\b"#
+        let pattern = #"(?i)\bparen[ \t]+(.+?)[ \t]+(?:close[ \t]+paren|end[ \t]+paren|paren[ \t]+close)\b"#
         if let rx = try? NSRegularExpression(pattern: pattern) {
             let ns = result as NSString
             let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
@@ -1504,7 +1646,7 @@ class TextFormatter {
             }
         }
         // "in parens X" — wrap the following clause up to sentence-ish terminator.
-        if let rx = try? NSRegularExpression(pattern: #"(?i)\bin\s+parens?\s+([^.,;!?\n]+)"#) {
+        if let rx = try? NSRegularExpression(pattern: #"(?i)\bin[ \t]+parens?[ \t]+([^.,;!?\n]+)"#) {
             let ns = result as NSString
             let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
             for m in matches.reversed() {
@@ -1635,15 +1777,8 @@ class TextFormatter {
             with: " ",
             options: .regularExpression
         )
-        // Collapse 3+ consecutive newlines down to exactly 2 (one blank line
-        // separating paragraphs). Allows topic-shift / list / quoted-message
-        // passes to safely emit `\n\n` without compounding into walls of blank
-        // lines.
-        result = result.replacingOccurrences(
-            of: #"\n{3,}"#,
-            with: "\n\n",
-            options: .regularExpression
-        )
+        // Repeated explicit commands and existing blank lines are meaningful.
+        // Pause/command duplicates are resolved at their origin in formatSegments.
         result = result.replacingOccurrences(of: " .", with: ".")
         result = result.replacingOccurrences(of: " ,", with: ",")
         result = result.replacingOccurrences(of: " ?", with: "?")
@@ -1695,7 +1830,7 @@ class TextFormatter {
     // processed by Swift — the regex engine would receive them literally and ICU
     // doesn't understand `\u{xxxx}` (it uses `\uXXXX`). Use the literal character.
     private static let rxAcronymRun = try! NSRegularExpression(
-        pattern: #"\b([A-Z])(?:\s+([A-Z])){1,}\b(?!['’])"#
+        pattern: #"\b([A-Z])(?:[ \t]+([A-Z])){1,}\b(?!['’])"#
     )
 
     /// Strip internal whitespace from runs of 2+ single uppercase letters.
@@ -1929,6 +2064,13 @@ class TextFormatter {
         )
         for token in tokens {
             guard !token.isEmpty else { continue }
+            // A newline inside a space-delimited token ends the repetition
+            // window. Repeated material on separate lines may be deliberate.
+            if token.contains(where: \.isNewline) {
+                result.append(token)
+                lastCore = ""
+                continue
+            }
             let core = token.trimmingCharacters(in: strip).lowercased()
             if core.isEmpty || core != lastCore {
                 result.append(token)
@@ -1954,12 +2096,21 @@ class TextFormatter {
         var result: [String] = []
         var i = 0
         while i < tokens.count {
-            if i + 2 * n <= tokens.count {
+            if i + 2 * n <= tokens.count,
+               !tokens[i..<(i + 2 * n)].contains(where: { $0.contains(where: \.isNewline) }) {
                 var matches = true
                 for k in 0..<n {
                     if core(tokens[i + k]) != core(tokens[i + n + k]) {
                         matches = false
                         break
+                    }
+                }
+                if matches, config.interpretVoiceCommands {
+                    let repeated = tokens[i..<(i + 2 * n)].joined(separator: " ")
+                    if Self.lineBreakCommand.firstMatch(in: repeated, range: NSRange(repeated.startIndex..., in: repeated)) != nil {
+                        // Include both phrases: a sliding match on "line new"
+                        // inside three "new line" commands is still layout.
+                        matches = false
                     }
                 }
                 if matches {
@@ -2478,8 +2629,9 @@ class TextFormatter {
         let words = text.split { $0.isWhitespace }
         guard words.count >= 120 else { return text }
 
-        // If transitional breaks already inserted paragraphs, don't re-split.
-        guard !text.contains("\n\n") else { return text }
+        // Existing line breaks are deliberate structure, including a single
+        // newline in a long address, list or manually arranged passage.
+        guard !text.contains(where: \.isNewline) else { return text }
 
         // Split into sentences. We find boundaries: a [.!?] followed by one+
         // whitespace characters, followed by an uppercase letter. We keep the
@@ -2488,7 +2640,7 @@ class TextFormatter {
 
         // Regex: terminal punct + whitespace + uppercase — the uppercase letter
         // starts the NEXT sentence. We split at the whitespace gap.
-        guard let rx = try? NSRegularExpression(pattern: #"([.!?])\s+(?=[A-Z])"#) else {
+        guard let rx = try? NSRegularExpression(pattern: #"([.!?])[ \t]+(?=[A-Z])"#) else {
             return text
         }
 
@@ -2565,6 +2717,7 @@ class TextFormatter {
     private static let salutationStarters: Set<String> = ["dear", "hi", "hello", "hey"]
 
     private func formatSalutation(_ text: String) -> String {
+        guard !text.contains(where: \.isNewline) else { return text }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return text }
 
@@ -2864,11 +3017,11 @@ class TextFormatter {
     /// Single shared regex set, compiled once.
     private static let rxTimeDigitWithSuffix = try! NSRegularExpression(
         // 1=hour, 2=optional colon-or-space minutes, 3=am/pm
-        pattern: #"(?i)\b(\d{1,2})(?:\s*[:\s]\s*(\d{2}))?\s*(a\.?\s*m\.?|p\.?\s*m\.?)\b"#
+        pattern: #"(?i)\b(\d{1,2})(?:[ \t]*[: \t][ \t]*(\d{2}))?[ \t]*(a\.?[ \t]*m\.?|p\.?[ \t]*m\.?)\b"#
     )
     private static let rxTimeDigitWord = try! NSRegularExpression(
         // 1=hour, 2=minute-word (thirty / fifteen / forty.?five / forty-five), 3=am/pm
-        pattern: #"(?i)\b(\d{1,2})\s+(thirty|fifteen|forty[\s\-]?five|forty)\s+(a\.?\s*m\.?|p\.?\s*m\.?)\b"#
+        pattern: #"(?i)\b(\d{1,2})[ \t]+(thirty|fifteen|forty[ \t\-]?five|forty)[ \t]+(a\.?[ \t]*m\.?|p\.?[ \t]*m\.?)\b"#
     )
 
     /// Normalize digit-form times of day in the post-fold text.
@@ -2893,11 +3046,11 @@ class TextFormatter {
         // context to avoid mangling random 3-4 digit numbers (zip codes,
         // amounts, etc.). Run BEFORE the digit+suffix pass so "at 730 pm"
         // becomes "at 7:30 pm" → eventually "7:30 PM".
-        let timeContextPrefix = #"(?i)(\b(?:at|around|by|about|near|past|after|before|until|till|approximately|roughly)\s+)"#
+        let timeContextPrefix = #"(?i)(\b(?:at|around|by|about|near|past|after|before|until|till|approximately|roughly)[ \t]+)"#
         // Hour 1-9 + minutes 00-59 (3 digits): "730", "915", "1030 ambiguous".
         // Use 3-digit then 4-digit; the 4-digit form covers 10xx-12xx.
-        let threeDigit = timeContextPrefix + #"([1-9])([0-5]\d)\b(?!\s*(?:am|pm|a\.m|p\.m|st|nd|rd|th|%|dollars|bucks|kg|lb|mph|ml|°|degrees))"#
-        let fourDigit  = timeContextPrefix + #"(1[0-2])([0-5]\d)\b(?!\s*(?:am|pm|a\.m|p\.m|st|nd|rd|th|%|dollars|bucks|kg|lb|mph|ml|°|degrees))"#
+        let threeDigit = timeContextPrefix + #"([1-9])([0-5]\d)\b(?![ \t]*(?:am|pm|a\.m|p\.m|st|nd|rd|th|%|dollars|bucks|kg|lb|mph|ml|°|degrees))"#
+        let fourDigit  = timeContextPrefix + #"(1[0-2])([0-5]\d)\b(?![ \t]*(?:am|pm|a\.m|p\.m|st|nd|rd|th|%|dollars|bucks|kg|lb|mph|ml|°|degrees))"#
         for pattern in [fourDigit, threeDigit] {
             if let rx = try? NSRegularExpression(pattern: pattern, options: []) {
                 let ns = result as NSString
@@ -3090,19 +3243,19 @@ class TextFormatter {
         var t = text
         // "X bucks" / "X dollars" → "$X"
         t = t.replacingOccurrences(
-            of: #"\b(\d+(?:\.\d+)?)\s+(bucks|dollars)\b"#,
+            of: #"\b(\d+(?:\.\d+)?)[ \t]+(bucks|dollars)\b"#,
             with: "$$$1",
             options: [.regularExpression, .caseInsensitive]
         )
         // "X millimeter" / "X millimeters" / "X mm" → "Xmm"
         t = t.replacingOccurrences(
-            of: #"\b(\d+(?:\.\d+)?)\s+(millimeters?|mm)\b"#,
+            of: #"\b(\d+(?:\.\d+)?)[ \t]+(millimeters?|mm)\b"#,
             with: "$1mm",
             options: [.regularExpression, .caseInsensitive]
         )
         // "X percent" → "X%"
         t = t.replacingOccurrences(
-            of: #"\b(\d+(?:\.\d+)?)\s+percent\b"#,
+            of: #"\b(\d+(?:\.\d+)?)[ \t]+percent\b"#,
             with: "$1%",
             options: [.regularExpression, .caseInsensitive]
         )
@@ -3121,7 +3274,7 @@ class TextFormatter {
         // replied yes." would greedily consume the entire input as the message
         // body. Expanded to include `!?\u{2026}` terminators.
         // Raw string `#"..."#` does NOT process `\u{...}` — use literal char.
-        let pattern = #"(?i)\b(send|tell|text|email|message|dm)\s+([A-Z][a-z]+|him|her|them)\s+(?:a\s+message\s+)?(?:saying|that\s+says?|telling\s+them)\s+(.+?)(?=$|[.!?…]\s+[A-Z]|\n)"#
+        let pattern = #"(?i)\b(send|tell|text|email|message|dm)[ \t]+([A-Z][a-z]+|him|her|them)[ \t]+(?:a[ \t]+message[ \t]+)?(?:saying|that[ \t]+says?|telling[ \t]+them)[ \t]+(.+?)(?=$|[.!?…][ \t]+[A-Z]|\n)"#
         guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return t }
         let ns = t as NSString
         let matches = re.matches(in: t, options: [], range: NSRange(location: 0, length: ns.length))
@@ -3174,7 +3327,7 @@ class TextFormatter {
         // Pattern: <trigger> <token>(,| and)( <token>){2,}
         // For each match, backtick-quote the tokens.
         for trigger in triggers {
-            let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: trigger))\\b\\s+((?:[a-z][a-z0-9_]*(?:\\s+[a-z][a-z0-9_]*)?\\s*[,]\\s*){2,}(?:[a-z][a-z0-9_]*(?:\\s+[a-z][a-z0-9_]*)?))"
+            let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: trigger))\\b[ \\t]+((?:[a-z][a-z0-9_]*(?:[ \\t]+[a-z][a-z0-9_]*)?[ \\t]*[,][ \\t]*){2,}(?:[a-z][a-z0-9_]*(?:[ \\t]+[a-z][a-z0-9_]*)?))"
             guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
             let ns = t as NSString
             let matches = re.matches(in: t, options: [], range: NSRange(location: 0, length: ns.length))
@@ -3257,7 +3410,7 @@ class TextFormatter {
             "okay so ", "ok so ", "alright so ", "right so ",
         ]
         for shift in shifts {
-            let pattern = "([.!?\u{2026}])\\s+(?i)\(NSRegularExpression.escapedPattern(for: shift))"
+            let pattern = "([.!?\u{2026}])[ \\t]+(?i)\(NSRegularExpression.escapedPattern(for: shift))"
             guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
             let ns = t as NSString
             let out = NSMutableString(string: t)

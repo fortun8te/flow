@@ -5927,8 +5927,10 @@ extension AppDelegate: NSWindowDelegate {
                     ? RecordingCoordinator.strippingTrailingStopWord(from: raw) : raw
                 let submitEnabled = UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled")
                     && (UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true)
+                let commandText = textFormatter.config.interpretVoiceCommands
+                    ? TextFormatter.interpretLineBreakCommands(text) : text
                 return DictationTextPreparation.Prepared(rawText: raw,
-                    command: TrailingPressEnter.parse(text, enabled: submitEnabled), rejection: nil)
+                    command: TrailingPressEnter.parse(commandText, enabled: submitEnabled), rejection: nil)
             } ?? DictationTextPreparation.prepare(segments: segments, formatter: textFormatter,
                 pressEnterEnabled: UserDefaults.standard.bool(forKey: "voice.pressEnterCommandEnabled"),
                 autoPaste: UserDefaults.standard.object(forKey: "autoPaste") as? Bool ?? true,
@@ -6051,14 +6053,24 @@ extension AppDelegate: NSWindowDelegate {
             var editedBySection = false
             var finalText: String
             var cleanupRoute = "skipped-level-off"
-            if cleanupForTask == "none" || !polishEnabledByUser {
+            if DictationLayout.isBreakOnly(formatted) {
+                // A spoken layout command is an insertion even though it has no
+                // words. It needs no model request and is never "no speech".
+                finalText = formatted
+                cleanupRoute = "skipped-layout-command"
+                traceFallback = "layout-command"
+                traceModelWillRun = false
+                traceEngine = "rules"
+                traceEngineReady = false
+            } else if cleanupForTask == "none" || !polishEnabledByUser {
                 vlog("[VOICE] Polish skipped (cleanupLevel=none or polishEnabled=false) — rule-based only")
                 finalText = formatted
             } else if skipPolish {
                 vlog("[VOICE] Short clip — skipping LLM polish (rule-based only)")
                 cleanupRoute = "skipped-short-clip"
                 finalText = formatted
-            } else if !recognizedT2 && (graniteTranscript != nil || moonshineTranscript != nil) {
+            } else if !recognizedT2 && !formatted.contains(where: \.isNewline)
+                        && (graniteTranscript != nil || moonshineTranscript != nil) {
                 // Triple-model path: Qwen3 merges Parakeet v2 + Granite 4.0 + Moonshine Tiny outputs.
                 cleanupRoute = "triple-merge"
                 run.update {
@@ -6140,6 +6152,7 @@ extension AppDelegate: NSWindowDelegate {
                 // Long dictations try the PC first (RemoteCleanup); its time counts inside the same budgets below.
                 let remoteStarted = ContinuousClock.now
                 if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
+                   !formatted.contains(where: \.isNewline),
                    longProse || shortBudget >= 0.15,
                    let pcText = await RemoteCleanup.cleanedText(formatted, cleanupLevel: cleanupForTask,
                         userVocabulary: userVocab.isEmpty ? nil : userVocab, personalityStyle: personalityForTask,
@@ -6148,11 +6161,17 @@ extension AppDelegate: NSWindowDelegate {
                     cleanupRoute = "remote-pc"
                     run.model("cleanupEngine", "remote-pc")
                     finalText = pcText
-                } else if !recognizedT2, polishContext != .code, Qwen3Polisher.isEnabled,
-                   longProse || formatted.contains(where: \.isNewline) {
+                } else if polishContext != .code, Qwen3Polisher.isEnabled,
+                   (!recognizedT2 && longProse) || formatted.contains(where: \.isNewline) {
                     editedBySection = true
                     cleanupRoute = "sections"
                     let ranges = DictationTextPreparation.cleanupSections(in: formatted)
+                    if ranges.isEmpty {
+                        traceEngine = "rules"
+                        traceEngineReady = false
+                        traceModelWillRun = false
+                        traceFallback = "preserved-layout"
+                    }
                     let budget = longProse ? DictationDeadline.sectionBudgetSeconds(count: ranges.count) : shortBudget
                     let deadline = remoteStarted + .seconds(budget)
                     let result = await DictationTextPreparation.cleanSections(in: formatted, ranges: ranges, deadline: deadline,
@@ -6230,7 +6249,8 @@ extension AppDelegate: NSWindowDelegate {
             // Qwen3 ever returns "" we'd paste nothing at the cursor while
             // the user thinks their dictation succeeded. Fall back to the
             // pre-polish formatted text.
-            if WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
+            if !DictationLayout.isBreakOnly(formatted),
+               WhisperNowCleanupDecision.isConfirmedNoSpeech(polished: finalText, formatted: formatted) {
                 // WhisperNow tuned answered EMPTY for hesitation sounds only: treat it like no speech.
                 vlog("[VOICE] WhisperNow tuned: no speech — nothing to paste")
                 run.update { $0.outcome = "no-speech" }
@@ -6251,7 +6271,9 @@ extension AppDelegate: NSWindowDelegate {
             let postCleanupTimer = PipelineTimer()
             finalText = T2CleanupOptions.finalizedTranscript(candidate: finalText, preparedASR: formatted,
                 level: cleanupForTask, recognizedT2: usesModelTranscript)
+                .map { DictationLayout.preservingLineBreaks(in: $0, from: formatted) }
                 ?? DictationTextPreparation.finalize(polished: finalText, formatted: formatted)
+            finalText = DictationLayout.restoringBoundaryBreaks(in: finalText, from: formatted)
             run.stage("finalize", text: finalText)
             // Fail-proof word pass after every engine: hesitations, stutters, list markup.
             finalText = DictationFinalPass.apply(finalText)
@@ -6269,7 +6291,7 @@ extension AppDelegate: NSWindowDelegate {
             }
             // Real-word pass (tinyfix): their/there, its/it's, then/than in English sentences. Off with cleanup.
             var lockedWordRanges: [NSRange] = []
-            if polishEnabledByUser && cleanupForTask != "none" {
+            if polishEnabledByUser && cleanupForTask != "none" && !DictationLayout.isBreakOnly(finalText) {
                 let repairTimer = PipelineTimer()
                 let input = finalText
                 let isCode = polishContext == .code
@@ -6283,7 +6305,8 @@ extension AppDelegate: NSWindowDelegate {
             }
             // tinynext recheck of Parakeet's low-confidence words: a word changes only when a near word reads
             // clearly better in context (LowConfidenceRecheck). Off with cleanup and in code. Falls back to text.
-            if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code {
+            if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code
+                && !DictationLayout.isBreakOnly(finalText) {
                 let repairTimer = PipelineTimer()
                 let input = finalText
                 let locks = lockedWordRanges
@@ -6304,7 +6327,8 @@ extension AppDelegate: NSWindowDelegate {
                 finalText = ProperNounVocabulary.applyPreferredSpelling(finalText, terms: preferredWords)
                 run.stage("vocabulary", text: finalText)
             }
-            if polishEnabledByUser && cleanupForTask != "none" {
+            if polishEnabledByUser && cleanupForTask != "none" && textFormatter.config.detectParagraphs
+                && !DictationLayout.isBreakOnly(finalText) {
                 finalText = polishContext == .code
                     ? DictationParagraphs.format(finalText)
                     : DictationParagraphs.formatDictation(finalText, isEmail: polishContext == .email)

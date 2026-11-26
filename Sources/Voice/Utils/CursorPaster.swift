@@ -428,7 +428,7 @@ class CursorPaster {
     /// (it is also in history). This wins over keeping the user's old clipboard.
     @discardableResult
     static func keepForManualPaste(_ text: String, pasteboard: NSPasteboard = .general) -> Bool {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || DictationLayout.isBreakOnly(text) else { return false }
         if pasteboard.string(forType: .string) == text { return true }
         return DictationPasteboard.write(text, to: pasteboard)
     }

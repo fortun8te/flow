@@ -19,13 +19,22 @@ struct LastTranscriptStoreTests {
         #expect(store.shouldHandlePasteLast(isRecording: false))
     }
 
-    @Test("Empty or whitespace-only results never replace a remembered transcript")
+    @Test("Empty results or horizontal padding never replace a remembered transcript")
     func ignoresBlank() {
         var store = LastTranscriptStore()
         store.remember("Keep me.")
         store.remember("")
-        store.remember("   \n ")
+        store.remember("   \t ")
         #expect(store.text == "Keep me.")
+    }
+
+    @Test("A standalone line-break command is the latest pasteable dictation")
+    func remembersLayoutCommand() {
+        var store = LastTranscriptStore()
+        store.remember("Older text.")
+        store.remember("\n\n")
+        #expect(store.text == "\n\n")
+        #expect(store.shouldHandlePasteLast(isRecording: false))
     }
 
     @Test("Never handled while a recording is in progress")

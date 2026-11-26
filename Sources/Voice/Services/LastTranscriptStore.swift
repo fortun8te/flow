@@ -9,11 +9,13 @@
 import Foundation
 
 struct LastTranscriptStore {
-    /// The most recent non-empty final text. Empty or whitespace-only results never replace it.
+    /// The most recent final text, including an explicit line-break command.
+    /// Empty results and horizontal model padding never replace it.
     private(set) var text: String?
 
     mutating func remember(_ finalText: String) {
-        guard !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || DictationLayout.isBreakOnly(finalText) else { return }
         text = finalText
     }
 

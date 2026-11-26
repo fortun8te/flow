@@ -1642,7 +1642,7 @@ class RecordingCoordinator {
         var iterations = 0
         while iterations < 8, let range = matchTrailingStopWord(in: result, stopWord: stopWord) {
             result = String(result[..<range.lowerBound])
-                .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.,!?;:"))
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \t.,!?;:"))
             iterations += 1
             if result.isEmpty { break }
         }

@@ -19,6 +19,17 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = {
+    "DictationLayoutBoundaryTests": (
+        "Sources/Voice/Services/DictationLayout.swift",
+        "Sources/Voice/Services/DictationFinalPass.swift",
+        "Sources/Voice/Services/LastTranscriptStore.swift",
+    ),
+    "DictationFinalPassLayoutTests": "Sources/Voice/Services/DictationFinalPass.swift",
+    "TextFormatterLineBreakTests": (
+        "Sources/Voice/Utils/TextFormatter.swift",
+        "Sources/Voice/Services/DictationFinalPass.swift",
+    ),
+    "PolishPostprocessorLineBreakTests": "Sources/Voice/Services/PolishLayoutPreservation.swift",
     "SmartInsertionTests": "Sources/Voice/Utils/SmartInsertion.swift",
     "PasteReadbackTests": "Sources/Voice/Utils/PasteReadback.swift",
     "CorrectionEvidenceTests": "Sources/Voice/Services/CorrectionEvidence.swift",

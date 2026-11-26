@@ -15,7 +15,7 @@ enum SmartInsertion {
         }
         guard let field, let edit else {
             let base = !preFormatted && (code || messaging) ? withoutFinalPeriod(text) : text
-            return boundarySpaced(base, after: rememberedEnd)
+            return boundarySpaced(base, after: rememberedEnd, allowBlocks: !code)
         }
 
         let before = field[..<edit.lowerBound]
@@ -68,9 +68,22 @@ enum SmartInsertion {
             }
         }
 
+        let startsBlock = !code && !insideLiteral && !insideContraction
+            && isBlockLine(body.prefix(while: { !$0.isNewline }))
+        let lastLine = String(body.reversed().prefix(while: { !$0.isNewline }).reversed())
+        let continuationIndent = lastLine.prefix(while: { $0 == " " || $0 == "\t" })
+        let blockContinuation = startsBlock && body.contains(where: \.isNewline)
+            && (continuationIndent.count >= 2 || continuationIndent.contains("\t"))
+        let rightContent = after.drop(while: isHorizontalSpace).first
+        // Existing sentence/quote punctuation belongs to the replacement's
+        // last line; moving it onto an empty line would orphan it.
+        let adjacentClosing = rightContent.map { closing.contains($0) || $0 == "\"" || $0 == "'" } ?? false
+        let endsBlock = !code && !insideLiteral && !insideContraction && !adjacentClosing
+            && (isBlockLine(lastLine) || blockContinuation)
+
         // Keep punctuation already outside the replacement. Overlapping runs
         // retain the longer run, so an ellipsis stays three dots, not four.
-        if let last = body.last, let right, ".,!?;:…".contains(right) {
+        if !endsBlock, let last = body.last, let right, ".,!?;:…".contains(right) {
             if right == last {
                 let overlap = min(body.reversed().prefix(while: { $0 == last }).count,
                                   after.prefix(while: { $0 == last }).count)
@@ -98,12 +111,25 @@ enum SmartInsertion {
                 && !connector.contains(last) && !connector.contains($0) && !joinsRight && !insideLiteral && !insideContraction
                 && !rightClosesQuote
         } ?? false
-        return (prefix ? " " : "") + body + (suffix ? " " : "")
+        // A list/heading/fence needs its own line. Spaces cannot separate a
+        // pasted '- item' from 'Tasks:' or from text after the selection. Only
+        // the payload changes; the existing field remains one undoable edit.
+        guard startsBlock || endsBlock else {
+            return (prefix ? " " : "") + body + (suffix ? " " : "")
+        }
+        let lineBreak = field.last(where: \.isNewline).map(String.init) ?? "\n"
+        let leftHasText = before.reversed().prefix(while: { !$0.isNewline }).contains { !$0.isWhitespace }
+        let rightHasText = after.prefix(while: { !$0.isNewline }).contains { !$0.isWhitespace }
+        let leading = startsBlock && leftHasText && !leftOpensQuote ? lineBreak : (prefix ? " " : "")
+        let trailing = endsBlock && rightHasText && !rightClosesQuote ? lineBreak : (suffix ? " " : "")
+        return leading + body + trailing
     }
 
-    static func boundarySpaced(_ text: String, after previousEnd: Character?) -> String {
+    static func boundarySpaced(_ text: String, after previousEnd: Character?, allowBlocks: Bool = true) -> String {
         guard let previousEnd, let first = text.first else { return text }
         let endsWordOrSentence = previousEnd.isLetter || previousEnd.isNumber || ".!?:;…)]}”’»›\"".contains(previousEnd)
+        if allowBlocks, endsWordOrSentence, !"\"'“‘”’".contains(previousEnd),
+           isBlockLine(text.prefix(while: { !$0.isNewline })) { return "\n" + text }
         guard endsWordOrSentence, !previousEnd.isWhitespace, !first.isWhitespace,
               !first.isPunctuation, !first.isSymbol else { return text }
         return " " + text
@@ -123,6 +149,14 @@ enum SmartInsertion {
 
     private static func isHorizontalSpace(_ character: Character) -> Bool {
         character.isWhitespace && !character.isNewline && character != "\t"
+    }
+
+    private static let blockStart = try! NSRegularExpression(
+        pattern: #"^[ \t]*(?:(?:[-+*•>]|#{1,6}|[0-9]{1,3}[.)])[ \t]+|`{3,}|~{3,})"#)
+
+    private static func isBlockLine<S: Sequence>(_ line: S) -> Bool where S.Element == Character {
+        let text = String(line)
+        return blockStart.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
     }
 
     private static let lowercaseStarters: Set<String> = [

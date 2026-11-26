@@ -60,4 +60,17 @@ struct StopWordSafetyTests {
             #expect(!prepared.command.text.lowercased().contains("halt"))
         }
     }
+
+    @Test("A spoken stop does not erase the preceding requested line break")
+    func voiceStopKeepsLayout() {
+        withStopWord("halt") {
+            #expect(RecordingCoordinator.strippingTrailingStopWord(from: "Hello.\n\nHalt.") == "Hello.\n\n")
+            #expect(RecordingCoordinator.strippingTrailingStopWord(from: "Hello.\r\nHalt.") == "Hello.\r\n")
+            let segments = [TranscriptSegment(speaker: "You", text: "Hello new line halt", startTime: 0, endTime: 1)]
+            let prepared = DictationTextPreparation.prepare(segments: segments, formatter: TextFormatter(),
+                                                            pressEnterEnabled: false, autoPaste: false,
+                                                            endedByVoiceStop: true)
+            #expect(prepared.command.text == "Hello\n")
+        }
+    }
 }

@@ -491,12 +491,12 @@ public enum PolishPostprocessor {
         // cloud prompt: model is told to put the salutation on its own line,
         // but it occasionally produces an inline form. Runs before
         // force-paragraph-breaks so the newline counter sees it.
-        let es = Self.normalizeEmailSalutation(current)
+        let es = options.isMessagingContext ? current : Self.normalizeEmailSalutation(current)
         recordIfChanged(current, es, rule: "email-salutation", into: &changes)
         current = es
 
-        // Force paragraph breaks on long outputs. If the result is >80 words
-        // and contains fewer than 2 newlines, insert breaks at the strongest
+        // Force paragraph breaks on long unformatted prose. If the result is
+        // >80 words and has no existing lines, insert breaks at the strongest
         // available topic-shift markers (period + capital letter starting a
         // new clause). The LLM keeps emitting walls of text despite the prompt
         // telling it not to — this is the safety net.
@@ -1043,35 +1043,19 @@ public enum PolishPostprocessor {
         let cleanLast = lastWord.lowercased()
             .trimmingCharacters(in: CharacterSet.punctuationCharacters)
         guard cutoffWords.contains(cleanLast) else { return text }
-        // Strip the trailing period (and any whitespace after).
-        let stripped = String(trimmed[..<lastDot])
-        // Preserve original trailing whitespace pattern if present.
-        if text.hasSuffix("\n") {
-            return stripped + "\n"
-        }
-        return stripped
+        // Remove only the period. The trimmed view is for classification;
+        // editing it would discard leading/trailing blank lines and CRLF.
+        guard let originalDot = text.lastIndex(where: { !$0.isWhitespace }) else { return text }
+        var result = text
+        result.remove(at: originalDot)
+        return result
     }
 
 
     // MARK: - Pass 5: Whitespace normalization
 
     static func whitespacePass(_ text: String) -> String {
-        var s = text
-        // Collapse multiple spaces into one (but preserve newlines).
-        if let rx = try? NSRegularExpression(pattern: "[ \t]{2,}") {
-            let r = NSRange(location: 0, length: (s as NSString).length)
-            s = rx.stringByReplacingMatches(in: s, options: [], range: r, withTemplate: " ")
-        }
-        // Trim trailing whitespace on each line.
-        s = s.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .joined(separator: "\n")
-        // Collapse 3+ newlines to 2 (preserve paragraph breaks).
-        if let rx = try? NSRegularExpression(pattern: "\n{3,}") {
-            let r = NSRange(location: 0, length: (s as NSString).length)
-            s = rx.stringByReplacingMatches(in: s, options: [], range: r, withTemplate: "\n\n")
-        }
-        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        PolishLayoutPreservation.whitespacePass(text)
     }
 
     // MARK: - Code fencing for dictated identifiers
@@ -1246,22 +1230,9 @@ public enum PolishPostprocessor {
     ]
 
     static func spokenPunctuationPass(_ text: String) -> String {
-        var s = text
-
-        // --- Structural commands (always convert; multi-word first) ---
-        // Order matters: "new paragraph" before "new line"/"line", etc.
-        // Consume surrounding horizontal whitespace so we get "a\n\nb", not
-        // "a \n\n b" (the latter leaves stray leading spaces on each line).
-        let structural: [(String, String)] = [
-            (#"[^\S\n]*\bnew\s+paragraph\b[^\S\n]*"#, "\n\n"),
-            (#"[^\S\n]*\bnext\s+paragraph\b[^\S\n]*"#, "\n\n"),
-            (#"[^\S\n]*\bnew\s+line\b[^\S\n]*"#, "\n"),
-            (#"[^\S\n]*\bnext\s+line\b[^\S\n]*"#, "\n"),
-            (#"[^\S\n]*\bline\s+break\b[^\S\n]*"#, "\n"),
-        ]
-        for (pat, rep) in structural {
-            s = replaceRegex(s, pattern: pat, options: [.caseInsensitive]) { _ in rep }
-        }
+        // Share the quote/mention-aware layout commands with raw tuned-model
+        // preparation. A command never consumes an existing line separator.
+        var s = TextFormatter.interpretLineBreakCommands(text)
 
         // --- Glue symbols: consume surrounding spaces so they bind to
         // neighboring tokens ("user underscore id" → "user_id", "a forward
@@ -1431,50 +1402,7 @@ public enum PolishPostprocessor {
     // (…), and numeric/clock colons (3:30).
 
     static func punctuationSpacingPass(_ text: String) -> String {
-        var s = text
-
-        // 1. Remove space(s) BEFORE , ; : ! ? . — but not inside a newline run.
-        //    "word ," → "word,". Negative: don't pull a period off a decimal
-        //    (there's never a space before a decimal point anyway).
-        s = replaceRegex(s, pattern: #"[^\S\n]+([,;:!?])"#, options: []) { g in g[1] }
-        // Period: same, but guard ellipsis (handled as its own char) — a lone
-        // "." preceded by space collapses.
-        s = replaceRegex(s, pattern: #"[^\S\n]+(\.)(?!\.)"#, options: []) { g in g[1] }
-
-        // 2. Ensure ONE space after sentence punctuation . ! ? when a sentence
-        //    clearly ended and the next one starts. To avoid mangling dotted
-        //    identifiers (Foo.Bar, U.S.A, README.MD, v1.2) the period rule
-        //    requires: a full lowercase WORD before the dot whose FIRST letter
-        //    is also lowercase (so "home.She" splits but "Foo.Bar" — leading
-        //    cap — does not), the dot, then an uppercase+lowercase start. This
-        //    leaves CamelCase/acronym/file/version dotted tokens intact while
-        //    still fixing run-together sentences. `!`/`?` are unambiguous
-        //    sentence terminals, so they only need a lowercase letter before.
-        s = replaceRegex(s, pattern: #"(?<![A-Za-z])([a-z][a-z]+)\.([A-Z][a-z])"#, options: []) { g in "\(g[1]). \(g[2])" }
-        s = replaceRegex(s, pattern: #"([a-z])([!?])([A-Z])"#, options: []) { g in "\(g[1])\(g[2]) \(g[3])" }
-        // 3. Ensure ONE space after a comma/semicolon/colon when followed by a
-        //    letter (missing-space-after-comma: "a,b" → "a, b"). Skip when
-        //    followed by a digit (could be "3,500" thousands or "3:30" time).
-        s = replaceRegex(s, pattern: #"([,;])([A-Za-z])"#, options: []) { g in "\(g[1]) \(g[2])" }
-
-        // 4. Collapse any horizontal double-spaces introduced above (NOT \n).
-        s = replaceRegex(s, pattern: #"[^\S\n]{2,}"#, options: []) { _ in " " }
-
-        // 5. No space before a closing paren/bracket; no space after an opening one.
-        s = replaceRegex(s, pattern: #"\(\s+"#, options: []) { _ in "(" }
-        s = replaceRegex(s, pattern: #"[^\S\n]+\)"#, options: []) { _ in ")" }
-
-        // 6. Trim trailing horizontal whitespace on each line + overall ends.
-        s = s.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { line -> String in
-                var l = String(line)
-                while l.hasSuffix(" ") || l.hasSuffix("\t") { l.removeLast() }
-                while l.hasPrefix(" ") || l.hasPrefix("\t") { l.removeFirst() }
-                return l
-            }
-            .joined(separator: "\n")
-
-        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        PolishLayoutPreservation.punctuationSpacingPass(text)
     }
 
     // MARK: - Pass 6: Standalone i capitalization
@@ -3746,53 +3674,13 @@ public enum PolishPostprocessor {
     // Safety net: if the LLM produced one giant paragraph despite the prompt
     // asking for breaks, deterministically split at the strongest available
     // topic boundary. Heuristic:
-    //   - >80 words AND <2 \n\n boundaries → must split
+    //   - >80 words and no existing line breaks
     //   - Splits at sentence boundaries (period + space + capital letter)
     //   - Prefers boundaries near 1/3 and 2/3 of the text
     //   - Skips if the text is structured (already has bullets / numbered list)
 
     static func forceParagraphBreaks(_ text: String) -> String {
-        let wordCount = text.split(separator: " ").count
-        guard wordCount > 80 else { return text }
-        // If already split into ≥2 paragraphs, leave alone.
-        let existingBreaks = text.components(separatedBy: "\n\n").count - 1
-        if existingBreaks >= 2 { return text }
-        // If output is already structured (bullets / numbered list), leave alone.
-        if text.contains("\n- ") || text.contains("\n1. ") || text.contains("\n* ") {
-            return text
-        }
-        // Find all sentence boundaries (period + space + capital letter).
-        let pattern = #"(?<=[.!?])\s+(?=[A-Z])"#
-        guard let rx = try? NSRegularExpression(pattern: pattern) else { return text }
-        let ns = text as NSString
-        let matches = rx.matches(in: text, range: NSRange(location: 0, length: ns.length))
-        guard matches.count >= 2 else { return text }
-
-        // Pick break points at roughly 1/3 and 2/3 of the text.
-        let targets: [Double] = wordCount > 160 ? [0.33, 0.66] : [0.5]
-        let totalLen = ns.length
-        var breakPoints: [Int] = []
-        for target in targets {
-            let targetPos = Int(Double(totalLen) * target)
-            // Find the match closest to target position.
-            let closest = matches.min(by: { abs($0.range.location - targetPos) < abs($1.range.location - targetPos) })
-            if let m = closest, !breakPoints.contains(m.range.location) {
-                breakPoints.append(m.range.location)
-            }
-        }
-        breakPoints.sort(by: >)
-        var s = text
-        for loc in breakPoints {
-            let nsCurrent = s as NSString
-            let r = NSRange(location: loc, length: 1)
-            if r.location + r.length <= nsCurrent.length {
-                s = nsCurrent.replacingCharacters(in: r, with: "\n\n")
-            }
-        }
-        if !breakPoints.isEmpty {
-            print("[VOICE-POST] force-paragraph-breaks: inserted \(breakPoints.count) breaks")
-        }
-        return s
+        PolishLayoutPreservation.forceParagraphBreaks(text)
     }
 
     // MARK: - Honorifics
@@ -3838,16 +3726,6 @@ public enum PolishPostprocessor {
     /// that shape and rewrites the trailing whitespace after the comma to
     /// `\n\n` so the output is always a properly structured email.
     public static func normalizeEmailSalutation(_ text: String) -> String {
-        // If the text starts with "Hi <name>," or "Hello <name>," etc., and
-        // the next char is a space (not \n), inject "\n\n" after the comma.
-        let pattern = #"^(Hi|Hello|Hey|Dear|Good morning|Good afternoon|Good evening)\s+[A-Z][A-Za-z]+(?:\s+and\s+[A-Z][A-Za-z]+)?,\s+"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return text }
-        let range = NSRange(text.startIndex..., in: text)
-        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return text }
-        // Replace the trailing whitespace after the comma with \n\n
-        let salutationEnd = match.range.upperBound
-        let cleaned = String(text[text.startIndex..<text.index(text.startIndex, offsetBy: salutationEnd)])
-            .trimmingCharacters(in: .whitespaces) + "\n\n" + String(text[text.index(text.startIndex, offsetBy: salutationEnd)...])
-        return cleaned
+        PolishLayoutPreservation.normalizeEmailSalutation(text)
     }
 }

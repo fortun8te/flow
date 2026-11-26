@@ -34,6 +34,19 @@ final class DictationTextPreparationTests: XCTestCase {
         XCTAssertEqual(DictationTextPreparation.finalize(polished: "   ", formatted: "A synthetic line."), "A synthetic line.")
     }
 
+    @MainActor func testLayoutCommandSurvivesFinalizeAndDeliveryWithoutPolish() {
+        for source in ["\n", "\n\n", "\nNext line.\n"] {
+            XCTAssertEqual(DictationTextPreparation.finalize(polished: source.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                            formatted: source), source)
+            let intent = DictationTextPreparation.delivery(autoCopy: false, autoPaste: true, skipPolish: true,
+                formatted: source, final: source, fieldContextProvided: false,
+                command: .init(text: source, shouldSubmit: false))
+            XCTAssertTrue(intent.shouldPaste)
+            XCTAssertTrue(intent.preFormatted)
+            XCTAssertFalse(intent.shouldSubmit)
+        }
+    }
+
     func testDelayedPasteRefusesToFollowTheUserToAnotherApp() {
         XCTAssertTrue(CursorPaster.canPasteInApp(captured: "com.example.editor", current: "com.example.editor"))
         XCTAssertFalse(CursorPaster.canPasteInApp(captured: "com.example.editor", current: "com.example.chat"))
@@ -221,6 +234,15 @@ final class DictationTextPreparationTests: XCTestCase {
         }
         XCTAssertFalse(result.timedOut)
         XCTAssertEqual(result.text, "They are ready tomorrow.\n\n  Do not send archive-2.txt.\n\nKeep page 15.")
+    }
+
+    @MainActor func testSectionCleanupCannotSplitAnItemAndKeepsExactSeparators() async {
+        let source = "\r\n1. Keep the backup.  \r\n\r\n  They is ready.\r\n"
+        let result = await DictationTextPreparation.cleanSections(
+            in: source, ranges: DictationTextPreparation.cleanupSections(in: source), deadline: .now + .seconds(1)) {
+                $0.hasPrefix("1.") ? "1. Keep\nthe backup." : "They are ready."
+            }
+        XCTAssertEqual(result.text, "\r\n1. Keep the backup.  \r\n\r\n  They are ready.\r\n")
     }
 
     @MainActor func testSectionReviewOverlapsNextCleanupAndKeepsItsOwnOriginal() async {
