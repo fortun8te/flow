@@ -1,6 +1,6 @@
 # Training and evaluation
 
-This document describes the training, dataset and evaluation scripts in this repository, what each one needs, and what privacy rules apply. The scripts are not a turnkey pipeline. They expect data that you produce from your own dictation, and that data must stay private.
+This document describes the training, dataset and evaluation scripts in this repository, what each one needs, and what privacy rules apply. The reviewed-data export, local replay and candidate gate described below form an offline evaluation loop. Model training and native application validation remain separate steps. They need your own data and hardware; private dictation must stay private.
 
 ## Privacy rules first
 
@@ -29,7 +29,98 @@ Output goes to a `--out` path you choose, for example `samples/typing.jsonl`. Th
 
 ### Run-record export
 
-`scripts/export_flow_runs.py` turns run records (see [DATA.md](DATA.md)) into training pairs. Its output is private, and it defaults to a folder outside the repository.
+`scripts/export_flow_runs.py` separates observations from independently reviewed training targets. Its output is private and defaults to a folder outside the repository. A successful paste says only that text landed. It does not prove the cleanup was correct. Keeping an Opt+1 result or leaving text unchanged is likewise not a human label.
+
+| File | Purpose |
+| --- | --- |
+| `runs-joined.jsonl` | Full runs plus linked follow-ups, for local analysis |
+| `dictation-pairs.jsonl`, `opt1-pairs.jsonl` | Observations, proposed corrections, provenance, and explicit eligibility |
+| `stage-pairs.jsonl` | Model/rule output changes for diagnostics; always unsupervised |
+| `review-queue.jsonl` | Unlabelled, undone, conflicting or quarantined observations |
+| `train.jsonl`, `valid.jsonl`, `test.jsonl` | Only explicit human-reviewed examples, grouped and deduplicated |
+| `split-lock.json` | Persistent text-family membership and split assignment |
+| `manifest.json` | File hashes/counts, dataset identity, label counts and malformed-input diagnostics |
+
+Without a reviewed-label file the supervised files are empty. This is intentional. Schema-2 scoped corrections carry `feedbackSource: "observed-edit"`, `targetScope: "pasted-span"` and the corrected insertion span in `editedText`. The exporter exposes that span as `proposedTarget`; it still needs review. Legacy field-wide edits are never used as targets. Undo/rejection invalidates supervision even if a reviewed label exists. Conflicting run IDs and conflicting targets for the same normalized input are excluded.
+
+```sh
+python3 scripts/export_flow_runs.py --out "$HOME/flow-train/runs"
+```
+
+Review the source and the proposed target, then create a private JSONL label file. Each line must contain the run's `id`, its exact `inputHash` copied from the export, a reviewed full-span `target`, `source: "human-reviewed"`, and `scope: "pasted-span"` for dictation or `"selection"` for Opt+1. Do not use the entire document surrounding a dictation as its target. An invented example of the shape is:
+
+```json
+{"id":"example-run","inputHash":"COPY_THE_EXPORTED_INPUT_HASH","target":"The violet kettle is on shelf 2.","source":"human-reviewed","scope":"pasted-span","mustContain":["violet kettle","shelf 2"],"mustNotContain":["copper kettle"]}
+```
+
+`mustContain` and `mustNotContain` are optional literal lists. Use them for protected names, identifiers and requirements that automated heuristics cannot infer. They must agree with the reviewed target and become part of the case hash. An altered label cannot silently reuse predictions for the earlier case.
+
+```sh
+python3 scripts/export_flow_runs.py \
+  --labels "$HOME/flow-train/reviewed-labels.jsonl" \
+  --out "$HOME/flow-train/runs"
+```
+
+Each export rebuilds the snapshot instead of appending training rows. Repeating it after an Undo removes that target from the current corpus. Retain the complete reviewed-label file between exports; omitting it produces an observation-only snapshot. Files are replaced atomically with mode 0600 in a 0700 output directory. The manifest is written last, and evaluators verify the supervised file hashes before consuming them.
+
+Malformed JSON/UTF-8/schema, unreadable files, unknown record kinds, or files that change during reading block supervised export. A damaged line might contain an Undo, so skipping it cannot safely preserve an earlier positive label. The exporter writes diagnostic observations, empties all three supervised files (including a previous export), marks the manifest blocked and returns a failure exit code. Freeze a complete source snapshot or wait for the app's write to finish, repair any corruption without dropping feedback, then rerun. The replay and comparison tools refuse blocked snapshots.
+
+### Stable training and evaluation splits
+
+The split policy assigns about 80% of text families to training, 10% to validation and 10% to final testing. It groups case/spacing/punctuation variants of the input, identical corrected targets, runs sharing a recording identity, and any connected families. Repeated copies of the same example receive one training row rather than additional weight. The same target with several ASR-error variants stays in one split. Existing records supply `audioPath`; imports can supply `audioSHA256`, `sourceRecordingID` or `recordingID` (directly or in settings). The exporter hashes those identifiers and never opens audio files. Copies or renamed audio files need the same content hash or stable source recording id to be recognized as one recording.
+
+Always reuse the output directory and preserve `split-lock.json`. Historical family links remain in the lock even after source logs rotate. If new evidence connects a previously trained family to a held-out family, the connected component is quarantined. The exporter does not silently turn trained text into a clean evaluation case. Deleting the lock from an existing snapshot fails closed.
+
+Export uses a nonblocking process lock for the whole output transaction, so concurrent exporters cannot overwrite each other's split history. A second writer gets a clear error and must rerun after the first finishes. `.export.lock` stays in place; its presence alone is normal, and the OS releases ownership when a process exits or crashes. Do not delete it while an exporter is running. The previous manifest's split-lock hash is checked before reusing history; an edited/reset lock must be restored with its matching snapshot. Export runs on macOS/Linux. A missing source directory fails before changing any export.
+
+This catches exact/normalized overlap, not all semantic paraphrases or overlap with a base model's pretraining. Review new evaluation families for near-duplicates, keep a separate fresh chronological release set, and keep the final test set out of prompt search, parameter tuning, teacher generation and training. The candidate gate cannot prove that an external training process respected these boundaries.
+
+### Replay a candidate locally
+
+`scripts/run_flow_candidate.py` replays the frozen reviewed cases against an already-running local OpenAI-compatible cleanup server. It sends only the raw input and the supplied system prompt, never the reviewed target. It does not launch a server, install weights, change Flow settings, or retry a failed request. Only loopback endpoints are allowed; HTTP redirects and proxy routing are disabled.
+
+```sh
+python3 scripts/run_flow_candidate.py \
+  --dataset-dir "$HOME/flow-train/runs" --split valid \
+  --endpoint http://127.0.0.1:8080/v1/chat/completions \
+  --model local-cleanup \
+  --artifact "$HOME/models/baseline.gguf" \
+  --prompt "$HOME/flow-train/cleanup-system.txt" \
+  --runtime-id "server-build-EXACT; quant-Q8; Mac-model-EXACT; flags-EXACT" \
+  --out "$HOME/flow-train/baseline.jsonl"
+```
+
+Load the candidate using your normal local engine, then repeat with its actual artifact, prompt and runtime identity and a different output path. For sharded models, supply a manifest containing hashes of every shard as `--artifact`. The artifact must match what the server loaded; an HTTP endpoint alone cannot verify that. Use comparable hardware, engine flags, background load and warm/cold state for both runs. Repeat latency measurements before deployment if the budget is close.
+
+Every prediction records the immutable configuration digest, case hash, output, measured latency and any failure. The configuration digest covers the supplied artifact, prompt, runtime identity, temperature, token limit and timeout. The companion manifest records the complete dataset and prediction-file hashes. Timeout, truncated or malformed replies stay in the output as failures; they are not dropped from the denominator. These timings cover the HTTP cleanup call, not the complete ASR-to-paste path.
+
+### Compare and decide whether to keep a change
+
+```sh
+python3 scripts/flow_hillclimb.py \
+  --dataset-dir "$HOME/flow-train/runs" --split valid \
+  --baseline "$HOME/flow-train/baseline.jsonl" \
+  --candidate "$HOME/flow-train/candidate.jsonl" \
+  --out "$HOME/flow-train/candidate-report.json"
+```
+
+The comparison fails on stale, duplicate, missing or extra predictions, non-finite latency, mismatched case hashes, mismatched complete dataset identities (including app/settings context), or mixed configuration identities. It measures token-edit distance to the independent target, exact-match rate, paired wins/losses, and p50/p95 latency. Default review eligibility requires all of these:
+
+- At least 50 independent text families, not 50 repeats of one example.
+- At least a 2% relative reduction in aggregate token-edit error.
+- A one-sided paired sign-test result at or below 0.05 across independent families.
+- No empty/runtime failures or detected changes to ordered numbers, negation count, URLs, emails, inline code, or the reviewed literal constraints.
+- No new error on a case where the baseline already exactly matched the reviewed target; aggregate wins cannot outweigh damaging those cases.
+- Candidate p95 cleanup latency no more than 10% above the baseline.
+- No aggregate error regression in an app or editing mode with at least ten cases.
+
+The thresholds are initial screening policy, not a measured claim about Flow quality. Every report includes the exact policy. Small samples or tied quality cannot pass. These deterministic checks do not establish semantic equivalence: negation scope, relationships between entities, unannotated names, and many meaning changes still need human review. Token-edit distance also penalizes some harmless alternative phrasings. Review the reported regression case IDs locally and evaluate the actual editing contract.
+
+The report records the baseline as `rollbackCandidateID`, the candidate/configuration identity, dataset identity and prediction hashes. It reports `eligibleForReview` and always leaves `promoted: false`; nothing changes the installed model. Preserve the model artifact and configuration for both baseline and candidate. A rejected candidate leaves the baseline in use.
+
+Use validation to select among prompt/rule/parameter/model variants, then freeze one candidate and run the held-out test once before release. Repeatedly testing variants on the final test leaks evaluation information. Also run the Swift regression suite, replay end-to-end native dictations, and check guard/fallback/paste behavior and real hardware latency before changing Flow's default. A better standalone cleanup score does not establish better application behavior.
+
+This loop makes collection useful over time: collect observed corrections and failures, review a batch, regenerate a versioned corpus, train or change one component, compare it with the current baseline, and keep only a verified improvement. Collection by itself does not train a model or guarantee improvement.
 
 ### Evaluation and preparation scripts (`scripts/`)
 
@@ -67,9 +158,10 @@ python3 -m unittest discover -s Tests
 python3 -m unittest discover -s training/t2
 python3 -m unittest discover -s bench
 python3 -m unittest discover -s Tests/PolishEval
+python3 scripts/test_portable_swift.py --swiftc /path/to/swiftc
 ```
 
-The end-to-end polish replay uses the debug Flow executable. Some tests need optional fixtures or models and report a skip when those are absent.
+The portable Swift command checks Foundation-only logic on a machine with Swift installed; it does not replace building/testing the macOS app. The end-to-end polish replay uses the debug Flow executable. Some tests need optional fixtures or models and report a skip when those are absent.
 
 ## Hardware notes
 

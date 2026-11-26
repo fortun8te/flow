@@ -35,7 +35,7 @@ If you are exploring the code, start with the [documentation index](docs/README.
 ## Features
 
 - **Push-to-talk dictation.** Hold the fn key (or a configured hotkey) to talk; release to paste at the cursor. A double tap locks recording; a further tap stops it. See `Sources/Voice/Services/HotkeyService.swift` and `Sources/Voice/Services/FnKeyTap.swift`.
-- **Paste with a readback check.** After pasting, Flow reads the field back through Accessibility and reports whether the text landed (`Sources/Voice/Utils/PasteReadback.swift`).
+- **Context-aware paste with a readback check.** Flow adjusts spacing around the current selection, respects punctuation and partial words, then reads the field back through Accessibility to check delivery (`Sources/Voice/Utils/SmartInsertion.swift` and `PasteReadback.swift`).
 - **On-device speech recognition.** Parakeet TDT 0.6B v3 through FluidAudio is the default. Other engines are listed in `Sources/Voice/Services/SpeechModelCatalog.swift`. See [docs/ENGINE.md](docs/ENGINE.md).
 - **Layered cleanup.** A local cleanup model tidies punctuation, fillers and self-corrections. Each output must pass a content guard (numbers, names, links, negations, coverage) before it is used.
 - **Rule passes.** Filler and stutter removal, real-word homophone fixes, typo repair, low-confidence rechecks and American spelling. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -102,6 +102,7 @@ Run records are local and can contain transcript text. [Data and privacy](docs/D
 - [Decision models](docs/DECISION-MODELS.md) covers the guards, decisions, and thresholds.
 - [Data and privacy](docs/DATA.md) covers local storage, settings, and what leaves the Mac with optional cloud cleanup.
 - [Training and evaluation](docs/TRAINING.md) covers the benchmark and dataset scripts.
+- [Custom model plan](docs/CUSTOM-MODEL-PLAN.md) compares a specialist correction ranker with cleanup fine-tuning, including data needs, training estimates and evaluation gates.
 - [Contributing](CONTRIBUTING.md) covers builds, tests, and the use of invented fixtures.
 
 ## Licence
