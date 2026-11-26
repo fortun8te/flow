@@ -195,13 +195,24 @@ enum ASRVocabularyBoost {
 actor ASRVocabularyBooster {
     static let shared = ASRVocabularyBooster()
 
+    private struct Snapshot {
+        let key: String
+        let session: VocabularyBoostingSession
+        let knownOther: Set<String>
+    }
+    private struct Request {
+        let key: String
+        let terms: [String]
+        let thresholds: VocabularyBoostingSession.Thresholds
+    }
+
     private var ctcModels: CtcModels?
-    private var ctcLoad: Task<CtcModels, Error>?
-    private var buildingSession = false
-    private var session: VocabularyBoostingSession?
-    private var sessionKey: String?
-    private var retryAfter: ContinuousClock.Instant?
-    private var knownOther: Set<String> = []
+    private var ctcLoad: Task<CtcModels?, Never>?
+    private var encoderRetryAfter: ContinuousClock.Instant?
+    private var sessionBuild: (key: String, task: Task<Bool, Never>)?
+    private var snapshot: Snapshot?
+    private var sessionFailure: (key: String, retryAfter: ContinuousClock.Instant)?
+    private var rescoring = false
 
     /// Rescore one decode window. `tokenTimings` must be on the clock of `samples`.
     func rescore(text: String, tokenTimings: [TokenTiming]?, samples: [Float]) async -> ASRVocabularyBoost.Report {
@@ -211,75 +222,99 @@ actor ASRVocabularyBooster {
             .init(unboostedText: text, boostedText: boosted, replacements: replacements, ctcRan: ran,
                   milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000, rejected: rejected)
         }
-        guard let timings = tokenTimings, !timings.isEmpty, !samples.isEmpty,
-              let session = await currentSession() else { return report(text, [], ran: false) }
-        // Capture the matching guard vocabulary before rescore suspends.
-        let guardWords = knownOther
+        guard !Task.isCancelled, let timings = tokenTimings, !timings.isEmpty, !samples.isEmpty,
+              let request = currentRequest() else { return report(text, [], ran: false) }
+        if snapshot?.key != request.key {
+            let task = ensureSession(request)
+            // Let a cold/downloaded model load in the background, never on the
+            // paste deadline. A warm encoder can join a dictionary rebuild briefly.
+            if ctcModels != nil, let task {
+                _ = await DictationDeadline.run(seconds: 0.12) { await task.value }
+            }
+        }
+        guard !Task.isCancelled, !rescoring, let captured = snapshot, captured.key == request.key else {
+            return report(text, [], ran: false)
+        }
+        let session = captured.session
         guard session.hasCTCRescoringCandidates(text: text, tokenTimings: timings) else {
             return report(text, [], ran: false)
         }
+        // An actor can re-enter at the await. Do not let another dictation
+        // drive the same mutable rescoring session at the same time.
+        rescoring = true
+        defer { rescoring = false }
         guard let output = await session.rescore(text: text, tokenTimings: timings, audioSamples: samples),
-              output.wasModified else { return report(text, [], ran: true) }
+              !Task.isCancelled, output.wasModified else { return report(text, [], ran: true) }
         let replacements = output.replacements.filter(\.shouldReplace).map {
             "\($0.originalWord) → \($0.replacementWord ?? "")"
         }
-        let guarded = ASRVocabularyBoost.guardedText(unboosted: text, boosted: output.text, knownOther: guardWords)
+        let guarded = ASRVocabularyBoost.guardedText(unboosted: text, boosted: output.text, knownOther: captured.knownOther)
         let kept = replacements.filter { r in !guarded.rejected.contains { $0.hasPrefix(r.components(separatedBy: " → ")[0]) } }
         return report(guarded.text, kept, ran: true, rejected: guarded.rejected)
     }
 
     /// Loads the CTC model and session ahead of the first dictation.
-    func prewarm() async { _ = await currentSession() }
+    func prewarm() async {
+        guard let request = currentRequest(), let task = ensureSession(request) else { return }
+        _ = await task.value
+    }
 
-    /// Live preview never waits for a cold download; the final batch path
-    /// and preview use the same cached encoder on subsequent recordings.
     func cachedCTCModels() -> CtcModels? { ctcModels }
 
-    func prewarmCTCModels() async {
-        guard retryAfter.map({ $0 <= .now }) != false else { return }
-        do { _ = try await loadCTCModels(); retryAfter = nil }
-        catch { retryAfter = .now + .seconds(30) }
-    }
+    func prewarmCTCModels() async { _ = await loadCTCModels() }
 
-    private func loadCTCModels() async throws -> CtcModels {
+    private func loadCTCModels() async -> CtcModels? {
         if let ctcModels { return ctcModels }
-        if let ctcLoad { return try await ctcLoad.value }
-        let task = Task { try await CtcModels.downloadAndLoad() }
+        if let ctcLoad { return await ctcLoad.value }
+        guard encoderRetryAfter.map({ $0 <= .now }) != false else { return nil }
+        let task = Task { () -> CtcModels? in
+            defer { self.ctcLoad = nil }
+            do {
+                let loaded = try await CtcModels.downloadAndLoad()
+                self.ctcModels = loaded
+                self.encoderRetryAfter = nil
+                return loaded
+            } catch {
+                self.encoderRetryAfter = .now + .seconds(30)
+                return nil
+            }
+        }
         ctcLoad = task
-        defer { ctcLoad = nil }
-        let loaded = try await task.value
-        ctcModels = loaded
-        return loaded
+        return await task.value
     }
 
-    private func currentSession() async -> VocabularyBoostingSession? {
-        guard retryAfter.map({ $0 <= .now }) != false else { return nil }
+    private func currentRequest() -> Request? {
         let terms = ASRVocabularyBoost.trustedTerms()
         guard !terms.isEmpty else { return nil }
         let thresholds = ASRVocabularyBoost.thresholds()
         let key = terms.joined(separator: "\u{1F}") + "|\(thresholds.cbw ?? -99)|\(thresholds.minSimilarity ?? -99)"
-        if key == sessionKey, let session { return session }
-        // Actor reentrancy previously let a prewarm and two ASR windows all
-        // start the same download/build. A cold concurrent request keeps its ASR.
-        guard !buildingSession else { return nil }
-        buildingSession = true
-        defer { buildingSession = false }
-        do {
-            let ctcModels = try await loadCTCModels()
-            let vocabulary = CustomVocabularyContext(terms: terms.map(ASRVocabularyBoost.vocabularyTerm))
-            let made = try await VocabularyBoostingSession(vocabulary: vocabulary, ctcModels: ctcModels,
-                                                           thresholds: thresholds)
-            session = made
-            retryAfter = nil
-            sessionKey = key
-            knownOther = ASRVocabularyBoost.knownOtherWords(terms: terms)
-            print("[VOICE-VOCAB] batch boosting ready: \(terms.count) trusted terms")
-            return made
-        } catch {
-            // A temporary network/cache failure must not disable CTC until relaunch.
-            retryAfter = .now + .seconds(30)
-            print("[VOICE-VOCAB] batch boosting unavailable: \(error.localizedDescription)")
-            return nil
+        return Request(key: key, terms: terms, thresholds: thresholds)
+    }
+
+    private func ensureSession(_ request: Request) -> Task<Bool, Never>? {
+        if snapshot?.key == request.key { return nil }
+        if let sessionBuild { return sessionBuild.key == request.key ? sessionBuild.task : nil }
+        if let failure = sessionFailure, failure.key == request.key, failure.retryAfter > .now { return nil }
+        guard !rescoring else { return nil }
+        let task = Task { () -> Bool in
+            defer { self.sessionBuild = nil }
+            guard let models = await self.loadCTCModels() else { return false }
+            do {
+                let vocabulary = CustomVocabularyContext(terms: request.terms.map(ASRVocabularyBoost.vocabularyTerm))
+                let made = try await VocabularyBoostingSession(vocabulary: vocabulary, ctcModels: models,
+                                                               thresholds: request.thresholds)
+                self.snapshot = Snapshot(key: request.key, session: made,
+                                         knownOther: ASRVocabularyBoost.knownOtherWords(terms: request.terms))
+                self.sessionFailure = nil
+                print("[VOICE-VOCAB] batch boosting ready: \(request.terms.count) trusted terms")
+                return true
+            } catch {
+                self.sessionFailure = (request.key, .now + .seconds(30))
+                print("[VOICE-VOCAB] batch boosting unavailable")
+                return false
+            }
         }
+        sessionBuild = (request.key, task)
+        return task
     }
 }

@@ -642,7 +642,26 @@ final class TranscriptionService: TranscriptionEngine {
             let trailingOverlapHasSignal: Bool
         }
 
+        struct PendingBoost {
+            let index: Int
+            let start: Int
+            let length: Int
+            let trailingSignal: Bool
+            let decoded: ASRResult
+            let task: Task<ASRVocabularyBoost.Report, Never>
+        }
+        var pending: PendingBoost?
+        defer { pending?.task.cancel() }
+
         var outputs: [ChunkOut] = []
+        func appendOutput(_ result: ASRResult, index: Int, start: Int, length: Int, trailingSignal: Bool) {
+            let txt = result.text.trimmingCharacters(in: .whitespaces)
+            print("[VOICE-MERGE] chunk \(index) start=\(start) len=\(length) conf=\(String(format: "%.3f", result.confidence))")
+            if !txt.isEmpty {
+                outputs.append(ChunkOut(index: index, text: txt, confidence: result.confidence,
+                                        timings: result.tokenTimings, trailingOverlapHasSignal: trailingSignal))
+            }
+        }
         var chunkStart = 0
         var idx = 0
         var silentWindows = 0
@@ -685,29 +704,45 @@ final class TranscriptionService: TranscriptionEngine {
                 toDecode = slice
             }
 
-            var r = try await manager.transcribe(toDecode, decoderState: &decoderState, language: nil)
+            let decoded = try await manager.transcribe(toDecode, decoderState: &decoderState, language: nil)
             try Task.checkCancellation()
-            // Vocabulary boosting runs per window, before the seam merge, so the
-            // token timings stay on the window's own clock.
-            if let boost {
-                let report = await boost(toDecode, r)
+            // While TDT decoded this window, CTC rescored the preceding one.
+            // Only one CTC task may be outstanding; preserve source order.
+            if let previous = pending {
+                let job = previous.task
+                let report = await withTaskCancellationHandler {
+                    await job.value
+                } onCancel: { job.cancel() }
+                try Task.checkCancellation()
                 reports.append(report)
-                r = replacingText(of: r, with: report)
+                appendOutput(replacingText(of: previous.decoded, with: report),
+                             index: previous.index, start: previous.start,
+                             length: previous.length, trailingSignal: previous.trailingSignal)
+                pending = nil
             }
-            let txt = r.text.trimmingCharacters(in: .whitespaces)
-            print("[VOICE-MERGE] chunk \(idx) start=\(chunkStart) len=\(slice.count) conf=\(String(format: "%.3f", r.confidence))")
-            if !txt.isEmpty {
-                outputs.append(ChunkOut(
-                    index: idx,
-                    text: txt,
-                    confidence: r.confidence,
-                    timings: r.tokenTimings,
-                    trailingOverlapHasSignal: hasAcousticSignal(samples[max(end - overlapSamples, chunkStart)..<end])
-                ))
+            let trailingSignal = hasAcousticSignal(samples[max(end - overlapSamples, chunkStart)..<end])
+            if let boost {
+                let job = Task { await boost(toDecode, decoded) }
+                pending = PendingBoost(index: idx, start: chunkStart, length: slice.count,
+                                       trailingSignal: trailingSignal, decoded: decoded, task: job)
+            } else {
+                appendOutput(decoded, index: idx, start: chunkStart, length: slice.count, trailingSignal: trailingSignal)
             }
             if end == samples.count { break }
             chunkStart += stride
             idx += 1
+        }
+        if let previous = pending {
+            let job = previous.task
+            let report = await withTaskCancellationHandler {
+                await job.value
+            } onCancel: { job.cancel() }
+            try Task.checkCancellation()
+            reports.append(report)
+            appendOutput(replacingText(of: previous.decoded, with: report),
+                         index: previous.index, start: previous.start,
+                         length: previous.length, trailingSignal: previous.trailingSignal)
+            pending = nil
         }
         if silentWindows > 0 { print("[VOICE-MERGE] skipped \(silentWindows) digital-silence windows") }
 

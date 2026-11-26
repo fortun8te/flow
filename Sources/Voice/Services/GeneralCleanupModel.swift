@@ -104,7 +104,7 @@ actor GeneralCleanupModel {
 
     enum Failure: String, Error, Sendable {
         case notSelected, notInstalled, serverMissing, lowMemory, loadFailed, recentlyFailed, loading
-        case timeout, httpError, badReply, tokenLimit, invalidInput
+        case timeout, httpError, badReply, tokenLimit, invalidInput, busy, cancelled
     }
 
     private var server: Process?
@@ -112,6 +112,8 @@ actor GeneralCleanupModel {
     private var port = 0
     private var ready = false
     private var loadTask: Task<Bool, Never>?
+    private var loadGeneration: UUID?
+    private var inFlight = false
     private var failedUntil: [String: Date] = [:]
     private var idleStopTask: Task<Void, Never>?
 
@@ -123,11 +125,14 @@ actor GeneralCleanupModel {
     }()
 
     private nonisolated func setStatus(_ value: String, _ entry: Entry) {
+        guard Self.selectedEntry?.id == entry.id else { return }
         UserDefaults.standard.set(entry.id + "|" + value, forKey: Self.statusKey)
     }
 
     /// Starts the selected model's server in the background (no-op when it is warm or nothing is selected).
     func prepare() {
+        // A changed selection is applied after the current request releases its lease.
+        guard !inFlight else { return }
         guard let entry = Self.selectedEntry else {
             if server != nil { stop() }
             return
@@ -168,37 +173,44 @@ actor GeneralCleanupModel {
         setStatus("loading", entry)
         print("[VOICE] General cleanup: loading \(entry.name) on port \(freePort)")
         let started = Date()
+        let generation = UUID()
+        loadGeneration = generation
         let task = Task { [session] () -> Bool in
             var request = URLRequest(url: URL(string: "http://127.0.0.1:\(freePort)/health")!)
             request.timeoutInterval = 1
             let deadline = Date().addingTimeInterval(90)
-            while process.isRunning && Date() < deadline {
-                if Task.isCancelled { return false }
+            var healthy = false
+            while process.isRunning && Date() < deadline && !Task.isCancelled {
                 if let (_, response) = try? await session.data(for: request),
-                   (response as? HTTPURLResponse)?.statusCode == 200 { return true }
-                try? await Task.sleep(for: .milliseconds(200))
+                   (response as? HTTPURLResponse)?.statusCode == 200 {
+                    healthy = true
+                    break
+                }
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { break }
             }
-            return false
+            // Publish the state before the shared task completes. Previously a
+            // waiter could observe success while ready was still false.
+            return self.finishLoad(entry, generation: generation, healthy: healthy, started: started)
         }
         loadTask = task
-        Task { await self.finishLoad(entry, task: task, started: started) }
         return task
     }
 
-    private func finishLoad(_ entry: Entry, task: Task<Bool, Never>, started: Date) async {
-        let ok = await task.value
-        guard serverEntry == entry, loadTask == task else { return }
+    private func finishLoad(_ entry: Entry, generation: UUID, healthy: Bool, started: Date) -> Bool {
+        guard serverEntry == entry, loadGeneration == generation else { return false }
         loadTask = nil
-        if ok {
+        loadGeneration = nil
+        if healthy, server?.isRunning == true {
             ready = true
             failedUntil[entry.id] = nil
             setStatus("ready", entry)
             print("[VOICE] General cleanup: \(entry.name) ready in \(Int(Date().timeIntervalSince(started) * 1000))ms")
             scheduleIdleStop(entry)
-        } else {
-            stop()
-            fail(entry, "model did not load")
+            return true
         }
+        stop()
+        fail(entry, "model did not load")
+        return false
     }
 
     private func fail(_ entry: Entry, _ reason: String) {
@@ -210,9 +222,10 @@ actor GeneralCleanupModel {
 
     private func scheduleIdleStop(_ entry: Entry) {
         idleStopTask?.cancel()
+        guard !inFlight, ready, serverEntry == entry else { return }
         idleStopTask = Task {
             do { try await Task.sleep(for: .seconds(entry.idleStop)) } catch { return }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, !self.inFlight, self.serverEntry == entry else { return }
             self.stop()
             // Without this the status stayed "ready" for a model that was no longer loaded.
             self.setStatus("idle", entry)
@@ -222,6 +235,7 @@ actor GeneralCleanupModel {
     private func stop() {
         loadTask?.cancel()
         loadTask = nil
+        loadGeneration = nil
         idleStopTask?.cancel()
         idleStopTask = nil
         if server?.isRunning == true { server?.terminate() }
@@ -232,11 +246,22 @@ actor GeneralCleanupModel {
     }
 
     /// Cleans one transcript with the selected general model. Any failure returns quickly so DOSE1 can take over.
-    func clean(_ transcript: String) async -> Result<WhisperNowTunedPolisher.Reply, Failure> {
-        guard let entry = Self.selectedEntry else { return .failure(.notSelected) }
+    func clean(_ transcript: String, entry requested: Entry? = nil) async -> Result<WhisperNowTunedPolisher.Reply, Failure> {
+        guard !Task.isCancelled else { return .failure(.cancelled) }
+        guard !inFlight else { return .failure(.busy) }
+        guard let entry = requested ?? Self.selectedEntry else { return .failure(.notSelected) }
         let input = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return .success(.empty) }
         guard input.count <= WhisperNowTunedPolisher.maximumInputCharacters else { return .failure(.invalidInput) }
+        // The one-slot llama server must not queue stale dictations. This also
+        // prevents a warmup/settings change from replacing a server mid-request.
+        inFlight = true
+        idleStopTask?.cancel()
+        defer {
+            inFlight = false
+            if Self.selectedEntry != entry { prepare() }
+            else { scheduleIdleStop(entry) }
+        }
         if !(serverEntry == entry && ready && server?.isRunning == true) {
             if let until = failedUntil[entry.id], until > Date() { return .failure(.recentlyFailed) }
             guard let task = ensureLoading(entry) else {
@@ -246,8 +271,9 @@ actor GeneralCleanupModel {
             // A cold model takes 5 to 20 s to load. The dictation waits briefly, then DOSE1 takes it while the
             // model keeps loading for the next one.
             let waited = await DictationDeadline.run(seconds: entry.coldWait) { await task.value }
-            guard waited == true, ready else {
-                setStatus("fallback: still loading", entry)
+            guard !Task.isCancelled else { return .failure(.cancelled) }
+            guard waited == true, ready, serverEntry == entry, server?.isRunning == true else {
+                if loadTask != nil { setStatus("fallback: still loading", entry) }
                 return .failure(.loading)
             }
         }
@@ -255,7 +281,10 @@ actor GeneralCleanupModel {
     }
 
     private func complete(_ input: String, entry: Entry) async -> Result<WhisperNowTunedPolisher.Reply, Failure> {
-        scheduleIdleStop(entry)
+        guard !Task.isCancelled else { return .failure(.cancelled) }
+        guard ready, serverEntry == entry, let activeServer = server, activeServer.isRunning, port > 0 else {
+            return .failure(.loadFailed)
+        }
         let words = input.split(whereSeparator: \.isWhitespace).count
         let limit = entry.timeout(words: words)
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
@@ -273,6 +302,8 @@ actor GeneralCleanupModel {
         let started = Date()
         do {
             let (data, response) = try await session.data(for: request)
+            guard !Task.isCancelled else { return .failure(.cancelled) }
+            guard server === activeServer, serverEntry == entry else { return .failure(.loadFailed) }
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return .failure(.httpError) }
             do {
                 let reply = try WhisperNowTunedPolisher.parseReply(data)
@@ -284,6 +315,7 @@ actor GeneralCleanupModel {
                 return .failure(failure == .tokenLimit ? .tokenLimit : .badReply)
             } catch { return .failure(.badReply) }
         } catch {
+            if Task.isCancelled { return .failure(.cancelled) }
             if (error as? URLError)?.code == .timedOut {
                 setStatus("fallback: too slow", entry)
                 return .failure(.timeout)

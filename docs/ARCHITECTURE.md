@@ -78,3 +78,7 @@ A companion app can drive Flow over distributed notifications and read Flow's st
 - Run records have their own switch, `flow.saveRunRecords` (default on). See [DATA.md](DATA.md).
 - API keys live in the Keychain (`SecretStore.swift`, `KeychainAccess`).
 - The database and audio files live under `~/Library/Application Support/Voice/`, with audio pruned by size (`StorageService.pruneAudioBySize`).
+
+### Concurrent model ownership
+
+General cleanup admits one request per llama-server and publishes model readiness before its shared startup task completes. A settings change cannot tear down an active request. Batch CTC builds are keyed by the exact dictionary and settings; cold loads do not block final recognition, and a warm dictionary rebuild can be joined for up to 120 ms. Each CTC decode retains its own guard vocabulary. Multi-window dictation overlaps the next TDT decode with the preceding CTC rescore while preserving the original window order and keeping at most one outstanding CTC task.

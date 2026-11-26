@@ -2870,7 +2870,8 @@ final class Qwen3Polisher {
         // A general model chosen in Companion goes first. Its answer passes the same content guard; on any failure,
         // timeout or guard trip DOSE1 cleans this dictation as before (24 Nov 2026).
         if let general = GeneralCleanupModel.selectedEntry {
-            let generalReply = await GeneralCleanupModel.shared.clean(text)
+            let generalReply = await GeneralCleanupModel.shared.clean(text, entry: general)
+            guard !Task.isCancelled else { return text }
             let generalMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
             if case .success(let reply) = generalReply {
                 let decision = await WhisperNowCleanupDecision.decide(source: text, reply: .success(reply)) { nil }
