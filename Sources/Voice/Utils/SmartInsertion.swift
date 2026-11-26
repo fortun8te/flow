@@ -58,8 +58,8 @@ enum SmartInsertion {
             .drop(while: { isHorizontalSpace($0) || closingQuotes.contains($0) }).first
         let continuesSentence = lastMeaningful.map { !$0.isNewline && !sentenceEnd.contains($0) } ?? false
         if !preFormatted && !insideLiteral && !insideContraction {
-            if messaging || code || continuesSentence { body = withoutFinalPeriod(body) }
-            if edit.isEmpty && !joinsLeft && !insideLiteral && (continuesSentence || (code && lastMeaningful != nil)),
+            if messaging || code || (continuesSentence && !body.contains(where: \.isNewline) && !isBlockLine(body)) { body = withoutFinalPeriod(body) }
+            if edit.isEmpty && !joinsLeft && !insideLiteral && !body.contains(where: \.isNewline) && !isBlockLine(body) && (continuesSentence || (code && lastMeaningful != nil)),
                let first = body.first, first.isUppercase {
                 let word = String(body.prefix(while: { $0.isLetter }))
                 // Title case alone does not tell us whether this is a name.
