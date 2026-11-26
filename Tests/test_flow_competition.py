@@ -212,7 +212,7 @@ class CompetitionTests(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 sample.clear(); sample.update(original); sample[key] = value
                 self.write_capture("flow")
-                with self.assertRaisesRegex(ValueError, "monotonic"):
+                with self.assertRaisesRegex(ValueError, "monotonic|non-finite JSON"):
                     self.compare()
         sample.clear(); sample.update(original); del sample["keyReleasedNs"]; sample["latencyMs"] = 150
         self.write_capture("flow")
@@ -234,7 +234,8 @@ class CompetitionTests(unittest.TestCase):
 
     def test_repetitions_and_native_protocol_cannot_be_relaxed(self):
         for key, value in (("repetitions", 2), ("repetitions", True), ("measurement", "http-cleanup"),
-                           ("clock", "wall-clock"), ("initialState", "unknown"), ("timeoutMs", math.inf)):
+                           ("clock", "wall-clock"), ("initialState", "unknown"), ("timeoutMs", math.inf),
+                           ("schemaVersion", True)):
             protocol = {**self.protocol, key: value}
             with self.assertRaises(ValueError):
                 competition.validate_protocol(protocol)
@@ -313,6 +314,19 @@ class CompetitionTests(unittest.TestCase):
         self.assertLess(report["candidate"]["p95Ms"], self.protocol["maxP95Ms"])
         self.assertFalse(report["gates"]["p95WithinBudget"])
 
+    def test_rare_slice_latency_regression_cannot_hide_below_aggregate_p95(self):
+        self.audio_map[0]["slices"] = ["synthetic-long-dictation"]
+        self.match = self.freeze(); self.build_captures()
+        for sample in self.rows["flow"][0]["attempts"]:
+            sample["elapsedMs"] = 450
+        self.reclock(); self.write_capture("wispr"); self.write_capture("flow")
+        report = self.compare()
+        self.assertEqual(report["candidate"]["p95Ms"], 150)
+        self.assertTrue(report["gates"]["p95WithinBudget"])
+        self.assertFalse(report["gates"]["sliceP95WithinBudget"])
+        self.assertFalse(report["eligibleForReview"])
+        self.assertEqual(report["slices"][export.digest("synthetic-long-dictation")]["candidate"]["p95Ms"], 450)
+
     def test_overlap_or_nonpaired_capture_order_is_refused(self):
         self.rows["flow"][0]["attempts"][0].update(keyReleasedNs=0, completedNs=150000000)
         self.write_capture("flow")
@@ -327,6 +341,24 @@ class CompetitionTests(unittest.TestCase):
                     sample["completedNs"] += 7200 * 1000000000
             self.write_capture(product)
         with self.assertRaisesRegex(ValueError, "capture wall time"):
+            self.compare()
+
+    def test_individually_valid_capture_windows_must_share_a_possible_clock_origin(self):
+        self.metadata["flow"].update(startedAt="2026-01-01T05:00:00Z", completedAt="2026-01-01T06:00:00Z")
+        self.write_capture("flow")
+        with self.assertRaisesRegex(ValueError, "wall-clock windows"):
+            self.compare()
+
+    def test_equivalent_capture_timezones_share_the_same_clock_origin(self):
+        self.metadata["flow"].update(startedAt="2026-01-01T03:00:00+02:00", completedAt="2026-01-01T04:00:00+02:00")
+        self.write_capture("flow")
+        self.assertTrue(self.compare()["eligibleForReview"])
+
+    def test_unrepresentable_monotonic_events_are_refused_without_overflow(self):
+        sample = self.rows["flow"][0]["attempts"][0]
+        sample.update(keyReleasedNs=10 ** 400, completedNs=10 ** 400 + 150000000)
+        self.write_capture("flow")
+        with self.assertRaisesRegex(ValueError, "monotonic"):
             self.compare()
 
     def test_late_failed_attempt_cannot_avoid_timeout_classification(self):
@@ -385,6 +417,35 @@ class CompetitionTests(unittest.TestCase):
         self.metadata["wispr"]["identity"]["modelName"] = ["Canto2"]
         self.write_capture("wispr")
         with self.assertRaisesRegex(ValueError, "identity"):
+            self.compare()
+
+    def test_rehashed_match_cannot_drop_mandatory_slices_or_relabel_slice_hashes(self):
+        original = copy.deepcopy(self.match)
+        app_slice = export.digest("app:synthetic-private-app")
+        for mutation in ("drop-app", "rename", "duplicate", "unused"):
+            with self.subTest(mutation=mutation):
+                self.match = copy.deepcopy(original)
+                if mutation == "drop-app":
+                    for row in self.match["cases"]:
+                        row["sliceIDs"].remove(app_slice)
+                    del self.match["sliceDefinitions"][app_slice]
+                elif mutation == "rename":
+                    self.match["sliceDefinitions"][app_slice] = "app:unrelated"
+                elif mutation == "duplicate":
+                    self.match["cases"][0]["sliceIDs"].append(app_slice)
+                else:
+                    self.match["sliceDefinitions"][export.digest("unused")] = "unused"
+                self.match["matchID"] = export.digest(export.canonical({k: v for k, v in self.match.items() if k != "matchID"}))
+                with self.assertRaisesRegex(ValueError, "slice"):
+                    self.compare()
+
+    def test_one_case_capture_does_not_accept_boolean_workload_counts(self):
+        self.cases = self.cases[:1]
+        self.audio_map = self.audio_map[:1]
+        self.write_dataset(); self.match = self.freeze(); self.build_captures()
+        self.metadata["flow"]["cases"] = True
+        self.write_capture("flow")
+        with self.assertRaisesRegex(ValueError, "workload"):
             self.compare()
 
     def test_changed_frozen_match_or_unreviewed_dataset_is_refused(self):

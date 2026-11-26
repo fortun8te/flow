@@ -9,7 +9,6 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -17,7 +16,7 @@ import re
 import stat
 import statistics
 
-from export_flow_runs import canonical, digest, write_private
+from export_flow_runs import canonical, digest, strict_json_loads, write_private
 from flow_hillclimb import aggregate, load_dataset, parse_jsonl, positive_number, score, sign_test
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -61,11 +60,12 @@ def stable_file(path, keep=False):
 
 
 def json_file(path):
-    return json.loads(stable_file(path, keep=True)[1])
+    return strict_json_loads(stable_file(path, keep=True)[1])
 
 
 def validate_protocol(protocol):
-    require(isinstance(protocol, dict) and protocol.get("schemaVersion") == 1, "unsupported native protocol")
+    require(isinstance(protocol, dict) and type(protocol.get("schemaVersion")) is int
+            and protocol["schemaVersion"] == 1, "unsupported native protocol")
     require(protocol.get("measurement") == "key-release-to-verified-insertion"
             and protocol.get("clock") == "monotonic_ns" and nonempty(protocol.get("clockSessionID")),
             "native end-to-end monotonic event timing required; HTTP cleanup timing is not accepted")
@@ -85,6 +85,16 @@ def dictation_cases(manifest, cases):
     selected = sorted((case for case in cases if case.get("kind") == "dictation"), key=lambda item: item["id"])
     require(selected and all(nonempty(case.get("groupID")) for case in selected), "reviewed dictation families are required")
     return selected
+
+
+def required_slices(case):
+    """Derive mandatory cohorts from the reviewed case, not capture declarations."""
+    values = ["kind:dictation", "app:" + (case.get("app") or "unknown")]
+    if case.get("mustContain") or case.get("mustNotContain"):
+        values.append("protected-literals")
+    if case.get("requireExactLayout") is True:
+        values.append("reviewed-exact-layout")
+    return values
 
 
 def freeze(manifest, cases, split, audio_map, protocol, base=Path(".")):
@@ -116,11 +126,7 @@ def freeze(manifest, cases, split, audio_map, protocol, base=Path(".")):
         timestamp(review.get("reviewedAt"))
         slices = row.get("slices", [])
         require(isinstance(slices, list) and all(nonempty(value) for value in slices), "slice labels must be strings")
-        slices = slices + ["kind:dictation", "app:" + (case.get("app") or "unknown")]
-        if case.get("mustContain") or case.get("mustNotContain"):
-            slices.append("protected-literals")
-        if case.get("requireExactLayout") is True:
-            slices.append("reviewed-exact-layout")
+        slices = slices + required_slices(case)
         slice_names.update({digest(value): value for value in slices})
         frozen.append({"id": case["id"], "caseHash": case["caseHash"], **hashes,
                        "textFamilyID": digest(case["groupID"]), "sliceIDs": sorted({digest(value) for value in slices}),
@@ -133,7 +139,8 @@ def freeze(manifest, cases, split, audio_map, protocol, base=Path(".")):
 
 
 def validate_match(match, manifest, cases):
-    require(isinstance(match, dict) and match.get("schemaVersion") == 1, "unsupported frozen match")
+    require(isinstance(match, dict) and type(match.get("schemaVersion")) is int
+            and match["schemaVersion"] == 1, "unsupported frozen match")
     require(match.get("matchID") == digest(canonical({key: value for key, value in match.items() if key != "matchID"})),
             "frozen match hash mismatch")
     validate_protocol(match.get("protocol"))
@@ -144,8 +151,9 @@ def validate_match(match, manifest, cases):
     frozen = match.get("cases")
     require(isinstance(frozen, list) and len(frozen) == len(cases), "match must cover every dictation case")
     definitions = match.get("sliceDefinitions")
-    require(isinstance(definitions, dict) and all(isinstance(key, str) and SHA256.fullmatch(key) and nonempty(value)
+    require(isinstance(definitions, dict) and all(isinstance(key, str) and nonempty(value) and key == digest(value)
                                                for key, value in definitions.items()), "match slice definitions invalid")
+    used_slices = set()
     for case, binding in zip(cases, frozen):
         require(isinstance(binding, dict) and binding.get("id") == case["id"] and binding.get("caseHash") == case["caseHash"]
                 and binding.get("textFamilyID") == digest(case["groupID"]), "match case/family identity changed")
@@ -153,6 +161,12 @@ def validate_match(match, manifest, cases):
                     ("audioSHA256", "contextSHA256", "vocabularySHA256", "audioReviewSHA256")), "match evidence hash missing")
         require(isinstance(binding.get("sliceIDs"), list) and binding["sliceIDs"]
                 and all(isinstance(value, str) and value in definitions for value in binding["sliceIDs"]), "match slices missing")
+        selected = set(binding["sliceIDs"])
+        require(len(selected) == len(binding["sliceIDs"])
+                and {digest(value) for value in required_slices(case)} <= selected,
+                "match must retain each mandatory reviewed-case slice exactly once")
+        used_slices.update(selected)
+    require(used_slices == definitions.keys(), "match contains unused slice definitions")
     return cases
 
 
@@ -173,8 +187,8 @@ def load_capture(path, match, product):
     content_hash, contents, _ = stable_file(path, keep=True)
     manifest_path = Path(str(path) + ".manifest.json")
     metadata_hash, data, _ = stable_file(manifest_path, keep=True)
-    metadata = json.loads(data)
-    require(isinstance(metadata, dict) and metadata.get("schemaVersion") == 1
+    metadata = strict_json_loads(data)
+    require(isinstance(metadata, dict) and type(metadata.get("schemaVersion")) is int and metadata["schemaVersion"] == 1
             and metadata.get("capturesSHA256") == content_hash, "complete capture manifest/hash required")
     identity = metadata.get("identity")
     require(isinstance(identity, dict) and identity.get("product") == product
@@ -215,7 +229,7 @@ def load_capture(path, match, product):
             require(isinstance(sample, dict) and type(sample.get("sampleIndex")) is int and sample["sampleIndex"] == index,
                     "missing, duplicate or reordered sample index")
             released, completed = sample.get("keyReleasedNs"), sample.get("completedNs")
-            require(type(released) is int and released >= 0 and type(completed) is int and completed > released
+            require(type(released) is int and type(completed) is int and 0 <= released < completed < 2 ** 64
                     and positive_number(sample.get("elapsedMs"))
                     and math.isclose(sample["elapsedMs"], (completed - released) / 1_000_000, rel_tol=1e-9, abs_tol=1e-6),
                     "elapsed time must match retained monotonic key-release/completion events")
@@ -228,16 +242,25 @@ def load_capture(path, match, product):
             require(outcome == "timeout" or sample["elapsedMs"] <= protocol["timeoutMs"], "late completion must retain a timeout outcome")
             human_review(sample, row, match)
         captures[identifier] = row
-    require(captures.keys() == expected.keys() and metadata.get("cases") == len(expected)
-            and metadata.get("attempts") == len(expected) * protocol["repetitions"], "capture workload is incomplete")
+    require(captures.keys() == expected.keys() and type(metadata.get("cases")) is int and metadata["cases"] == len(expected)
+            and type(metadata.get("attempts")) is int
+            and metadata["attempts"] == len(expected) * protocol["repetitions"], "capture workload is incomplete")
     attempts = [sample for row in captures.values() for sample in row["attempts"]]
     total_ms = sum(sample["elapsedMs"] for sample in attempts)
     span_ms = (max(sample["completedNs"] for sample in attempts) - min(sample["keyReleasedNs"] for sample in attempts)) / 1000000
     require(max(total_ms, span_ms) <= (end - start).total_seconds() * 1000 + 1, "event durations/span exceed declared capture wall time")
+    # A common monotonic clock must admit a common mapping into both declared
+    # wall-clock windows. Individually plausible morning/evening captures cannot
+    # be relabelled as interleaved rounds from the same session.
+    def utc_ns(value):
+        delta = value.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return ((delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds) * 1000
+    clock_bounds = (utc_ns(start) - min(sample["keyReleasedNs"] for sample in attempts),
+                    utc_ns(end) - max(sample["completedNs"] for sample in attempts))
     return {"rows": captures, "systemID": metadata["systemID"], "captureSHA256": content_hash,
             "manifestSHA256": metadata_hash, "modelAttribution": attribution,
             "canto2Claimed": re.sub(r"[\s_-]+", "", (identity.get("modelName") or "").casefold()) == "canto2",
-            "protectedInputs": protected_inputs}
+            "protectedInputs": protected_inputs, "clockOriginBoundsNs": clock_bounds}
 
 
 def independent_families(bindings):
@@ -280,6 +303,9 @@ def metrics(rows):
 def compare(match, cases, baseline, candidate):
     protocol, bindings = match["protocol"], match["cases"]
     require(baseline["systemID"] != candidate["systemID"], "systems require distinct immutable identities")
+    require(max(run["clockOriginBoundsNs"][0] for run in (baseline, candidate))
+            <= min(run["clockOriginBoundsNs"][1] for run in (baseline, candidate)) + 1000000,
+            "shared monotonic events contradict the declared capture wall-clock windows")
     # Both products share one clock session. Enforce actual alternating paired
     # order, not merely an asserted order or independent morning/evening runs.
     previous_end = -1
@@ -303,17 +329,25 @@ def compare(match, cases, baseline, candidate):
                                                                candidate["rows"][case["id"]]["attempts"]))
     human_safe = reviewed and all(new["meaningPreserved"] and (not old["readyToSend"] or new["readyToSend"])
                                  for old_row, new_row in zip(before, after) for old, new in zip(old_row["reviews"], new_row["reviews"]))
+    # Build memberships once; scanning the entire corpus again for every cohort
+    # becomes quadratic when personal vocabularies introduce many narrow slices.
+    memberships = defaultdict(list)
+    for index, row in enumerate(bindings):
+        for identifier in row["sliceIDs"]:
+            memberships[identifier].append(index)
     slices = {}
-    for identifier in sorted({value for row in bindings for value in row["sliceIDs"]}):
-        indices = [index for index, row in enumerate(bindings) if identifier in row["sliceIDs"]]
+    for identifier, indices in sorted(memberships.items()):
         slices[identifier] = {"baseline": metrics([before[index] for index in indices]),
                               "candidate": metrics([after[index] for index in indices])}
+    def latency_within_budget(old, new):
+        return new["p95Ms"] <= protocol["maxP95Ms"] and new["p95Ms"] <= old["p95Ms"] * POLICY["maxP95LatencyRatio"]
     gates = {"enoughIndependentFamilies": len(families) >= POLICY["minIndependentFamilies"],
              "completeBlindHumanReview": reviewed, "qualityImproved": improvement >= POLICY["minRelativeImprovement"],
              "pairedEvidence": probability <= POLICY["maxOneSidedSignP"], "noCriticalFailures": b["criticalCases"] == 0,
              "preservesPreviousExactOutputs": preserves_exact, "noHumanRegression": human_safe,
              "noSliceRegression": all(item["candidate"]["tokenErrorRate"] <= item["baseline"]["tokenErrorRate"] for item in slices.values()),
-             "p95WithinBudget": b["p95Ms"] <= protocol["maxP95Ms"] and b["p95Ms"] <= a["p95Ms"] * POLICY["maxP95LatencyRatio"]}
+             "sliceP95WithinBudget": all(latency_within_budget(item["baseline"], item["candidate"]) for item in slices.values()),
+             "p95WithinBudget": latency_within_budget(a, b)}
     root = Path(__file__).resolve().parents[1]
     evaluator_sources = {name: stable_file(root / name)[0] for name in (
         "scripts/flow_competition.py", "scripts/flow_hillclimb.py", "scripts/export_flow_runs.py", "bench/text_metrics.py")}
