@@ -76,3 +76,7 @@ S1-mini is used for English recognition normalisation only. It is not a general 
 - Swift dependencies are pinned in `Package.resolved`. FluidAudio is pinned exactly at 0.18.3.
 - Model manifests in `Sources/Voice/Resources/ModelManifests/` pin each model's repository and revision and its cache path.
 - The app requires macOS 26 and Swift tools 6.2 (`Package.swift`).
+
+### Auxiliary local model recovery
+
+TinyFix, TinyNext and the frequency lexicon may be installed under `~/Library/Application Support/Voice/Models/TinyFix`; bundled vocabulary/tokenizer files are used when absent from the external directory. TinyFix, TinyNext and CTC retry transient load failures after a bounded backoff without relaunching Flow. The run log distinguishes missing/cold auxiliary resources, no candidates, and model-scored candidates. TinyNext bounds activation storage by token rows; Opt+1 uses the selected installed typing model, keeps its server alive during inference, avoids per-chunk tokenization delays, and preserves original text in failed chunks.

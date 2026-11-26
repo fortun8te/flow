@@ -12,12 +12,12 @@ final class TinyNextScorer: @unchecked Sendable {
     private let lock = NSLock()
     private var model: Model?
     private var loading = false
-    private var failed = false
+    private var retryAfter: ContinuousClock.Instant?
 
     /// Loads the weights once, off the calling thread. Safe to call many times.
     func prewarm() {
         lock.lock()
-        let start = model == nil && !loading && !failed
+        let start = model == nil && !loading && (retryAfter.map { $0 <= .now } ?? true)
         if start { loading = true }
         lock.unlock()
         guard start else { return }
@@ -28,7 +28,7 @@ final class TinyNextScorer: @unchecked Sendable {
         let loaded = Self.resourceDirectory().flatMap { Model(directory: $0) }
         lock.lock()
         model = loaded
-        failed = loaded == nil
+        retryAfter = loaded == nil ? .now + .seconds(30) : nil
         loading = false
         lock.unlock()
     }
@@ -37,7 +37,7 @@ final class TinyNextScorer: @unchecked Sendable {
     func ready(wait: Bool = false) -> Model? {
         lock.lock()
         if let model { lock.unlock(); return model }
-        if failed { lock.unlock(); return nil }
+        if let retryAfter, retryAfter > .now { lock.unlock(); return nil }
         if wait && !loading {
             loading = true
             lock.unlock()
@@ -49,11 +49,20 @@ final class TinyNextScorer: @unchecked Sendable {
         // Another thread is loading: wait for it briefly.
         for _ in 0..<200 {
             usleep(10_000)
-            lock.lock(); let m = model; let f = failed; let l = loading; lock.unlock()
+            if Task.isCancelled { return nil }
+            lock.lock(); let m = model; let l = loading; lock.unlock()
             if let m { return m }
-            if f || !l { return nil }
+            if !l { return nil }
         }
         return nil
+    }
+
+    var readiness: String {
+        lock.lock(); defer { lock.unlock() }
+        if model != nil { return "ready" }
+        if loading { return "loading" }
+        if let retryAfter, retryAfter > .now { return "retry-backoff" }
+        return "cold"
     }
 
     static func resourceDirectory() -> URL? {
@@ -90,7 +99,9 @@ final class TinyNextScorer: @unchecked Sendable {
             guard data.count > 28, data.prefix(4) == Data("TNX1".utf8) else { return nil }
             offset = 4
             guard let v = u32(), let d = u32(), let l = u32(), let h = u32(), let f = u32(), let count = u32(),
-                  count == 2 + l * 6, d % h == 0 else { return nil }
+                  v > 0, v <= 100_000, d > 0, d <= 4096, l > 0, l <= 64,
+                  h > 0, h <= d, f > 0, f <= 32768,
+                  count == 2 + l * 6, d % h == 0, (d / h) % 2 == 0 else { return nil }
             vocabSize = v; dim = d; layerCount = l; heads = h; ffn = f; headDim = d / h
             func tensor(rows: Int, cols: Int) -> [Float]? {
                 guard let kind = u32() else { return nil }
@@ -309,9 +320,38 @@ final class TinyNextScorer: @unchecked Sendable {
             return result
         }
 
-        /// Log-probability of each text, scored together.
+        /// Bound temporary logits/activation storage by the token rows, not just the number of candidates.
+        /// Sequences have independent attention, so splitting a batch preserves their scores.
         func score(_ texts: [String]) -> [Float] {
-            logProbabilities(texts.map { tokenizer.encode($0) })
+            var results: [Float] = []
+            var batch: [[Int32]] = []
+            var rows = 0
+            func flush() {
+                guard !batch.isEmpty else { return }
+                if Task.isCancelled { results += Array(repeating: .nan, count: batch.count) }
+                else { results += logProbabilities(batch) }
+                batch.removeAll(keepingCapacity: true)
+                rows = 0
+            }
+            // A single context is already limited to maxPositions. Keep the
+            // normal short-candidate batch fast, but don't allocate huge logits.
+            let rowLimit = max(Self.maxPositions, min(1024, 4_000_000 / vocabSize))
+            for text in texts {
+                if Task.isCancelled { return Array(repeating: .nan, count: texts.count) }
+                let tokens = Array(tokenizer.encode(text).prefix(Self.maxPositions - 1))
+                let size = tokens.count
+                if !batch.isEmpty && rows + size > rowLimit { flush() }
+                // A mismatched tokenizer must never index past the weight matrix.
+                if tokens.contains(where: { $0 < 0 || Int($0) >= vocabSize }) {
+                    flush()
+                    results.append(.nan)
+                } else {
+                    batch.append(tokens)
+                    rows += size
+                }
+            }
+            flush()
+            return results
         }
     }
 
@@ -327,8 +367,8 @@ final class TinyNextScorer: @unchecked Sendable {
             pattern: #"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#)
 
         init?(directory: URL) {
-            guard let vocab = try? String(contentsOf: directory.appendingPathComponent("tinynext-vocab.txt"), encoding: .utf8),
-                  let merges = try? String(contentsOf: directory.appendingPathComponent("tinynext-merges.txt"), encoding: .utf8)
+            guard let vocab = try? String(contentsOf: RealWordFixer.resourceFile("tinynext-vocab.txt", in: directory), encoding: .utf8),
+                  let merges = try? String(contentsOf: RealWordFixer.resourceFile("tinynext-merges.txt", in: directory), encoding: .utf8)
             else { return nil }
             var ids: [String: Int32] = [:]
             for (i, token) in vocab.split(separator: "\n", omittingEmptySubsequences: false).enumerated() where !token.isEmpty {

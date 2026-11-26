@@ -69,7 +69,7 @@ final class RealWordFixer: @unchecked Sendable {
 
     private let lock = NSLock()
     private var loaded: TinyFixModel?
-    private var loadFailed = false
+    private var retryAfter: ContinuousClock.Instant?
     private var loading = false
 
     /// Directory with tinyfix.bin, wrong-word-vocab.txt and wrong-word-confusions.txt.
@@ -81,6 +81,11 @@ final class RealWordFixer: @unchecked Sendable {
         let fm = FileManager.default
         if let override = ProcessInfo.processInfo.environment["FLOW_TINYFIX_DIR"],
            fm.fileExists(atPath: URL(fileURLWithPath: override).appendingPathComponent(filename).path) { return URL(fileURLWithPath: override) }
+        // Keep separately installed weights outside the signed app bundle.
+        if let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let installed = support.appendingPathComponent("Voice/Models/TinyFix", isDirectory: true)
+            if fm.isReadableFile(atPath: installed.appendingPathComponent(filename).path) { return installed }
+        }
         var roots: [URL] = []
         if let r = Bundle.main.resourceURL { roots.append(r) }
         roots.append(Bundle.main.bundleURL)
@@ -98,14 +103,33 @@ final class RealWordFixer: @unchecked Sendable {
             let direct = root.appendingPathComponent("TinyFix")
             if fm.fileExists(atPath: direct.appendingPathComponent(filename).path) { return direct }
         }
+        #if SWIFT_PACKAGE
+        if let root = Bundle.module.resourceURL?.appendingPathComponent("TinyFix"),
+           fm.isReadableFile(atPath: root.appendingPathComponent(filename).path) { return root }
+        #endif
         return nil
+    }
+
+    /// Tokenizer/vocabulary resources may remain in the app while the weights are installed separately.
+    static func resourceFile(_ filename: String, in directory: URL) -> URL {
+        let direct = directory.appendingPathComponent(filename)
+        if FileManager.default.isReadableFile(atPath: direct.path) { return direct }
+        return resourceDirectory(containing: filename)?.appendingPathComponent(filename) ?? direct
+    }
+
+    var readiness: String {
+        lock.lock(); defer { lock.unlock() }
+        if loaded != nil { return "ready" }
+        if loading { return "loading" }
+        if let retryAfter, retryAfter > .now { return "retry-backoff" }
+        return "cold"
     }
 
     /// Loads the weights once, off the main thread. Safe to call many times (for example at key down).
     func prewarm() {
         guard Self.isEnabled else { return }
         lock.lock()
-        let start = loaded == nil && !loadFailed && !loading
+        let start = loaded == nil && !loading && (retryAfter.map { $0 <= .now } ?? true)
         if start { loading = true }
         lock.unlock()
         guard start else { return }
@@ -116,7 +140,7 @@ final class RealWordFixer: @unchecked Sendable {
         let model = Self.resourceDirectory().flatMap { TinyFixModel(directory: $0) }
         lock.lock()
         loaded = model
-        loadFailed = model == nil
+        retryAfter = model == nil ? .now + .seconds(30) : nil
         loading = false
         lock.unlock()
     }
@@ -126,19 +150,21 @@ final class RealWordFixer: @unchecked Sendable {
     func model(wait: Bool) -> TinyFixModel? {
         lock.lock()
         if let loaded { lock.unlock(); return loaded }
-        if loadFailed { lock.unlock(); return nil }
+        if let retryAfter, retryAfter > .now { lock.unlock(); return nil }
         if loading {
             lock.unlock()
             guard wait else { return nil }
             // Another thread is loading: wait for it (tests only; the app never waits).
-            while true {
+            for _ in 0..<1000 {
+                if Task.isCancelled { return nil }
                 usleep(2_000)
                 lock.lock()
                 if !loading { let m = loaded; lock.unlock(); return m }
                 lock.unlock()
             }
+            return nil
         }
-        guard wait else { lock.unlock(); return nil }
+        guard wait else { lock.unlock(); prewarm(); return nil }
         loading = true
         lock.unlock()
         load()
@@ -647,8 +673,8 @@ final class TinyFixModel: @unchecked Sendable {
 
     init?(directory: URL) {
         guard let blob = try? Data(contentsOf: directory.appendingPathComponent("tinyfix.bin")),
-              let vocabText = try? String(contentsOf: directory.appendingPathComponent("wrong-word-vocab.txt"), encoding: .utf8),
-              let confusionText = try? String(contentsOf: directory.appendingPathComponent("wrong-word-confusions.txt"), encoding: .utf8),
+              let vocabText = try? String(contentsOf: RealWordFixer.resourceFile("wrong-word-vocab.txt", in: directory), encoding: .utf8),
+              let confusionText = try? String(contentsOf: RealWordFixer.resourceFile("wrong-word-confusions.txt", in: directory), encoding: .utf8),
               let tensors = Self.parse(blob) else { return nil }
         let vocab = vocabText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let vocabulary = vocab.last == "" ? Array(vocab.dropLast()) : vocab

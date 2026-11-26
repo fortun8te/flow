@@ -6,6 +6,15 @@ import Testing
 /// the tokens the selection should take (22 Nov 2026).
 @Suite("Opt+1 streamed progress")
 struct Opt1TypoFixProgressTests {
+    @Test("Chunk splitting preserves whitespace-only selections and leading/trailing blank paragraphs")
+    func chunksRoundTrip() {
+        for text in ["  ", "\n\n", " \n\n  alpha\n\nbeta\n\n ", "a\n\nb\n\nc\n\nd\n\n"] {
+            let chunks = TypoFixModel.chunks(text)
+            #expect(chunks.count <= 3)
+            #expect(chunks.map { $0.lead + $0.body + $0.trail }.joined() == text)
+        }
+    }
+
     @Test("A streamed reply collects text, stops at [DONE] and keeps the finish reason")
     func streamedReplyCollectsText() throws {
         var stream = StreamedReply()

@@ -176,6 +176,13 @@ final class TypoRepair: @unchecked Sendable {
 
     var isReady: Bool { lock.lock(); defer { lock.unlock() }; return lexiconStorage != nil }
 
+    var readiness: String {
+        lock.lock(); defer { lock.unlock() }
+        if lexiconStorage != nil { return "ready" }
+        if loading { return "loading" }
+        return Date() < retryLexiconAfter ? "retry-backoff" : "cold"
+    }
+
     /// Letters and digits only, lowercased: "Wispr Flow" -> "wisprflow".
     static func key(_ s: String) -> String {
         String(s.lowercased().unicodeScalars.filter { ($0.value >= 97 && $0.value <= 122) || ($0.value >= 48 && $0.value <= 57) }

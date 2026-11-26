@@ -25,6 +25,8 @@ actor TypoFixModel {
     private var port = 0
     private var starting: Task<Bool, Never>?
     private var idleStop: Task<Void, Never>?
+    private var serverReady = false
+    private var editing = false
 
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -40,10 +42,12 @@ actor TypoFixModel {
               NSClassFromString("XCTestCase") == nil,
               !UserDefaults.standard.bool(forKey: "voice.opt1TypoModelOff"),
               !Qwen3Polisher.evalCloudOnly else { return false }
-        return ReviewPolishModel.detailedModelFile != nil && WhisperNowTunedPolisher.serverBinary() != nil
+        return ReviewPolishModel.typoFixModelFile != nil && WhisperNowTunedPolisher.serverBinary() != nil
     }
 
-    var isRunning: Bool { server?.isRunning == true && port > 0 && starting == nil }
+    var isRunning: Bool {
+        serverReady && server?.isRunning == true && port > 0 && serverModel == ReviewPolishModel.typoFixModelFile
+    }
 
     func prepareInBackground() {
         guard Self.isAvailable else { return }
@@ -53,14 +57,20 @@ actor TypoFixModel {
     /// Starts (or joins the start of) the server; true once it answers.
     func prepare() async -> Bool {
         guard Self.isAvailable else { return false }
-        if isRunning, serverModel == ReviewPolishModel.typoFixModelFile { scheduleIdleStop(); return true }
-        if let starting { return await starting.value }
+        if editing { return isRunning }
+        if isRunning { scheduleIdleStop(); return true }
+        if let starting {
+            let ok = await starting.value
+            return ok && isRunning
+        }
+        idleStop?.cancel()
+        idleStop = nil
         let task = Task { await self.start() }
         starting = task
         let ok = await task.value
         starting = nil
-        if ok { scheduleIdleStop() }
-        return ok
+        if ok, isRunning { scheduleIdleStop(); return true }
+        return false
     }
 
     private func scheduleIdleStop() {
@@ -68,6 +78,7 @@ actor TypoFixModel {
         idleStop = Task {
             do { try await Task.sleep(for: Self.idleLifetime) } catch { return }
             guard !Task.isCancelled else { return }
+            guard !self.editing, self.starting == nil else { return }
             self.stop()
         }
     }
@@ -94,8 +105,11 @@ actor TypoFixModel {
                 await withTaskGroup(of: Void.self) { group in
                     for _ in 0..<Self.slots { group.addTask { _ = try? await self.complete("ok", port: freePort, timeout: 20) } }
                 }
+                guard server === process, process.isRunning, !Task.isCancelled else { return false }
+                serverReady = true
                 return true
             }
+            guard !Task.isCancelled, server === process else { return false }
             try? await Task.sleep(for: .milliseconds(150))
         }
         stop()
@@ -105,6 +119,8 @@ actor TypoFixModel {
     func stop() {
         if server?.isRunning == true { server?.terminate() }
         server = nil
+        serverModel = nil
+        serverReady = false
         port = 0
     }
 
@@ -112,10 +128,16 @@ actor TypoFixModel {
     /// `progress` (when given) gets the share done across every chunk: streamed tokens / expected tokens.
     func edit(_ text: String, deadline: ContinuousClock.Instant,
               progress: (@Sendable (Double) -> Void)? = nil) async -> String? {
-        guard isRunning else { return nil }
-        // A newly picked model loads for the next edit; this one still uses the running server.
-        if serverModel != ReviewPolishModel.typoFixModelFile { prepareInBackground() }
-        scheduleIdleStop()
+        guard !editing, !Task.isCancelled, Self.isAvailable, isRunning else { return nil }
+        editing = true
+        idleStop?.cancel()
+        idleStop = nil
+        // Never tear down an active inference because a model setting changed.
+        defer {
+            editing = false
+            if serverModel != ReviewPolishModel.typoFixModelFile { prepareInBackground() }
+            else { scheduleIdleStop() }
+        }
         let port = self.port
         let chunks = Self.chunks(text)
         func seconds() -> Double {
@@ -129,11 +151,11 @@ actor TypoFixModel {
             for (i, chunk) in chunks.enumerated() {
                 group.addTask {
                     guard !chunk.body.isEmpty else { meter?.expect(i, tokens: 0); return (i, "") }
-                    if let meter {
-                        let tokens = await self.tokenCount(chunk.body, port: port)
-                        meter.expect(i, tokens: tokens ?? Self.estimatedTokens(chunk.body))
-                    }
-                    let out = try? await self.complete(chunk.body, port: port, timeout: max(0.2, seconds()),
+                    // Progress estimation must not delay inference on every chunk.
+                    meter?.expect(i, tokens: Self.estimatedTokens(chunk.body))
+                    let remaining = seconds()
+                    guard remaining > 0.2, !Task.isCancelled else { return (i, nil) }
+                    let out = try? await self.complete(chunk.body, port: port, timeout: remaining,
                                                        onToken: meter.map { meter in { meter.streamed(i) } })
                     return (i, out?.trimmingCharacters(in: .whitespacesAndNewlines))
                 }
@@ -142,7 +164,9 @@ actor TypoFixModel {
             for await (i, out) in group { collected[i] = out }
             return collected
         }
-        guard results.allSatisfy({ $0 != nil }) else { return nil }
+        guard !Task.isCancelled else { return nil }
+        // Keep successful chunks; a failed or empty model response must not erase the original.
+        guard zip(chunks, results).contains(where: { !$0.0.body.isEmpty && $0.1?.isEmpty == false }) else { return nil }
         if let meter {
             let totals = meter.totals()
             PillWorkTiming.recordTokenRatio(input: totals.input, output: totals.streamed)
@@ -150,7 +174,10 @@ actor TypoFixModel {
                                                    "ratio": String(format: "%.3f", meter.ratio)])
         }
         var out = ""
-        for (chunk, result) in zip(chunks, results) { out += chunk.lead + (result ?? "") + chunk.trail }
+        for (chunk, result) in zip(chunks, results) {
+            let body = result.flatMap { $0.isEmpty && !chunk.body.isEmpty ? nil : $0 } ?? chunk.body
+            out += chunk.lead + body + chunk.trail
+        }
         return out
     }
 
@@ -198,8 +225,11 @@ actor TypoFixModel {
         var result: [(String, String, String)] = []
         for (i, piece) in pieces.enumerated() {
             let lead = String(piece.prefix { $0.isWhitespace })
-            let trimmedEnd = String(piece.reversed().prefix { $0.isWhitespace }.reversed())
-            let body = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Trim the suffix only after removing the prefix: a whitespace-only
+            // piece otherwise counts every character twice.
+            let rest = piece.dropFirst(lead.count)
+            let trimmedEnd = String(rest.reversed().prefix { $0.isWhitespace }.reversed())
+            let body = String(rest.dropLast(trimmedEnd.count))
             result.append((lead, body, trimmedEnd + (i < separators.count ? separators[i] : "")))
         }
         return result

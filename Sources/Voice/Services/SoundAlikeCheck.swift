@@ -47,9 +47,20 @@ enum SoundAlikeCheck {
     /// Production entry point. Without the model the text comes back unchanged (and loading starts).
     static func check(_ text: String, protectedTerms: [String] = [], learned: Set<String>? = nil,
                       config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
-        guard hasCandidates(text), let scorer = TinyNextScorer.shared.ready(wait: wait) else { return (text, []) }
+        guard !Task.isCancelled else { return (text, []) }
+        guard hasCandidates(text) else {
+            FlowRunCollector.current?.decision("soundalike", "skipped", reason: "no-candidates")
+            return (text, [])
+        }
+        guard let scorer = TinyNextScorer.shared.ready(wait: wait) else {
+            FlowRunCollector.current?.decision("soundalike", "skipped", reason: TinyNextScorer.shared.readiness)
+            return (text, [])
+        }
         let found = decisions(text, protectedTerms: protectedTerms, learned: learned ?? AutoDictionary.shared.liveSoundAlikes(),
                               config: config, scorer: { scorer.score($0) })
+        guard !Task.isCancelled else { return (text, []) }
+        if !found.isEmpty { FlowRunCollector.current?.model("soundalike", "tinynext") }
+        FlowRunCollector.current?.decision("soundalike", found.isEmpty ? "no-eligible-candidates" : "scored", reason: "\(found.count) candidates")
         return apply(text, decisions: found, config: config)
     }
 
@@ -85,7 +96,7 @@ enum SoundAlikeCheck {
         struct Job { let index: Int; let range: NSRange; let word: String; let options: [String]; let starts: Bool }
         var jobs: [Job] = []
         for (i, r) in words.enumerated() {
-            if jobs.count >= config.maxChecks { break }
+            if Task.isCancelled || jobs.count >= config.maxChecks { break }
             let word = ns.substring(with: r)
             let key = word.lowercased().replacingOccurrences(of: "’", with: "'")
             guard let group = groups.first(where: { $0.contains(key) }), key != "two",
@@ -123,8 +134,9 @@ enum SoundAlikeCheck {
         guard scores.count == texts.count else { return [] }
         var out: [Decision] = []
         for (job, span) in zip(jobs, spans) {
+            guard scores[span].allSatisfy(\.isFinite) else { continue }
             let base = scores[span.lowerBound]
-            let best = (1..<span.count).max { scores[span.lowerBound + $0] < scores[span.lowerBound + $1] }!
+            guard let best = (1..<span.count).max(by: { scores[span.lowerBound + $0] < scores[span.lowerBound + $1] }) else { continue }
             let replacement = job.options[best - 1]
             let learned = learned.contains(AutoDictionary.key(job.word, replacement))
             out.append(Decision(start: job.range.location, end: job.range.upperBound, original: job.word,

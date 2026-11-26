@@ -110,7 +110,7 @@ enum DictationReferee {
         let fixer = RealWordFixer.shared
         guard fixer.model(wait: wait) != nil else {
             fixer.prewarm()
-            return (text, [], Verdict(judge: .realWords, probability: 1, action: .skip, reason: "model loading"))
+            return (text, [], Verdict(judge: .realWords, probability: 1, action: .skip, reason: fixer.readiness))
         }
         let result = fixer.fix(text, mode: mode, protectedTerms: protectedTerms ?? Self.protectedTerms(), wait: wait)
         guard !result.fixes.isEmpty else {
@@ -139,8 +139,11 @@ enum DictationReferee {
 
     /// CPU model scoring is independent of the UI actor. Preserve stage order
     /// but let new recording events and audio UI proceed while the model scores.
-    static func background<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
-        let task = Task.detached(priority: .userInitiated) { work() }
+    static func background<T: Sendable>(collector: FlowRunCollector? = nil, _ work: @escaping @Sendable () -> T) async -> T {
+        let activeCollector = collector ?? FlowRunCollector.current
+        let task = Task.detached(priority: .userInitiated) {
+            FlowRunCollector.$current.withValue(activeCollector) { work() }
+        }
         return await withTaskCancellationHandler {
             await task.value
         } onCancel: {
@@ -152,9 +155,12 @@ enum DictationReferee {
     /// its/it's, then/than ...) in English sentences. Never waits for the model; code fields are skipped.
     static func dictationPass(_ text: String, isCode: Bool) -> String {
         let start = DispatchTime.now().uptimeNanoseconds
+        guard !Task.isCancelled else { return text }
         let result = realWords(text, mode: .dictation, isCode: isCode)
+        FlowRunCollector.current?.decision("tinyfix", result.verdict.action.rawValue, reason: result.verdict.reason)
+        if result.verdict.action != .skip { FlowRunCollector.current?.model("tinyfix", "tinyfix") }
         trace(result.fixes, mode: .dictation, ms: Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
-        guard !isCode, RealWordFixer.isEnabled else { return result.text }
+        guard !isCode, RealWordFixer.isEnabled, !Task.isCancelled else { return result.text }
         return soundAlikes(result.text, skipping: Set(result.fixes.map { $0.replacement.lowercased() }))
     }
 

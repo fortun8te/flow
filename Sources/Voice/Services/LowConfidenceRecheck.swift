@@ -38,11 +38,24 @@ enum LowConfidenceRecheck {
     /// Production entry point: lexicon and model must already be loaded (or are loaded when `wait`).
     static func recheck(_ text: String, suspects: [String], protectedTerms: [String] = [],
                         config: Config = Config(), wait: Bool = false) -> (text: String, changes: [Decision]) {
-        guard !suspects.isEmpty,
-              let lexicon = TypoRepair.shared.lexicon(wait: wait),
-              let scorer = TinyNextScorer.shared.ready(wait: wait) else { return (text, []) }
+        guard !Task.isCancelled else { return (text, []) }
+        guard !suspects.isEmpty else {
+            FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "no-asr-suspects")
+            return (text, [])
+        }
+        guard let lexicon = TypoRepair.shared.lexicon(wait: wait) else {
+            FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "lexicon-" + TypoRepair.shared.readiness)
+            return (text, [])
+        }
+        guard let scorer = TinyNextScorer.shared.ready(wait: wait) else {
+            FlowRunCollector.current?.decision("low-confidence", "skipped", reason: "tinynext-" + TinyNextScorer.shared.readiness)
+            return (text, [])
+        }
         let found = decisions(text, suspects: suspects, protectedTerms: protectedTerms,
                               lexicon: lexicon, scorer: scorer, config: config)
+        guard !Task.isCancelled else { return (text, []) }
+        if !found.isEmpty { FlowRunCollector.current?.model("low-confidence", "tinynext") }
+        FlowRunCollector.current?.decision("low-confidence", found.isEmpty ? "no-eligible-candidates" : "scored", reason: "\(found.count) candidates")
         return apply(text, decisions: found, margin: config.margin)
     }
 

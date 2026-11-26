@@ -6608,7 +6608,7 @@ extension AppDelegate: NSWindowDelegate {
                 let started = CFAbsoluteTimeGetCurrent()
                 let input = finalText
                 let isCode = polishContext == .code
-                finalText = await DictationReferee.background {
+                finalText = await DictationReferee.background(collector: run) {
                     DictationReferee.dictationPass(input, isCode: isCode)
                 }
                 guard !Task.isCancelled, !work.isCancelled else { return }
@@ -6619,7 +6619,7 @@ extension AppDelegate: NSWindowDelegate {
             if polishEnabledByUser && cleanupForTask != "none" && polishContext != .code {
                 let started = CFAbsoluteTimeGetCurrent()
                 let input = finalText
-                let recheck = await DictationReferee.background {
+                let recheck = await DictationReferee.background(collector: run) {
                     LowConfidenceRecheck.recheck(input, suspects: parakeetSuspectsAgg, protectedTerms: userVocab)
                 }
                 guard !Task.isCancelled, !work.isCancelled else { return }

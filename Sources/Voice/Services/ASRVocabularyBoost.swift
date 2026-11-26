@@ -200,7 +200,7 @@ actor ASRVocabularyBooster {
     private var buildingSession = false
     private var session: VocabularyBoostingSession?
     private var sessionKey: String?
-    private var unavailable = false
+    private var retryAfter: ContinuousClock.Instant?
     private var knownOther: Set<String> = []
 
     /// Rescore one decode window. `tokenTimings` must be on the clock of `samples`.
@@ -236,9 +236,9 @@ actor ASRVocabularyBooster {
     func cachedCTCModels() -> CtcModels? { ctcModels }
 
     func prewarmCTCModels() async {
-        guard !unavailable else { return }
-        do { _ = try await loadCTCModels() }
-        catch { unavailable = true }
+        guard retryAfter.map({ $0 <= .now }) != false else { return }
+        do { _ = try await loadCTCModels(); retryAfter = nil }
+        catch { retryAfter = .now + .seconds(30) }
     }
 
     private func loadCTCModels() async throws -> CtcModels {
@@ -253,7 +253,7 @@ actor ASRVocabularyBooster {
     }
 
     private func currentSession() async -> VocabularyBoostingSession? {
-        guard !unavailable else { return nil }
+        guard retryAfter.map({ $0 <= .now }) != false else { return nil }
         let terms = ASRVocabularyBoost.trustedTerms()
         guard !terms.isEmpty else { return nil }
         let thresholds = ASRVocabularyBoost.thresholds()
@@ -270,13 +270,14 @@ actor ASRVocabularyBooster {
             let made = try await VocabularyBoostingSession(vocabulary: vocabulary, ctcModels: ctcModels,
                                                            thresholds: thresholds)
             session = made
+            retryAfter = nil
             sessionKey = key
             knownOther = ASRVocabularyBoost.knownOtherWords(terms: terms)
             print("[VOICE-VOCAB] batch boosting ready: \(terms.count) trusted terms")
             return made
         } catch {
-            // Do not retry on every dictation; the next launch tries again.
-            unavailable = true
+            // A temporary network/cache failure must not disable CTC until relaunch.
+            retryAfter = .now + .seconds(30)
             print("[VOICE-VOCAB] batch boosting unavailable: \(error.localizedDescription)")
             return nil
         }
